@@ -1,0 +1,53 @@
+# Build artifacts
+*.test
+/run
+/wit
+
+# Reference repos (external git repos)
+/__old/
+
+# Rust build directories
+testbed/*/target/
+
+# Nested git repos
+testbed/calculator-src/.git/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# Qodana analysis
+.qodana/
+.qodana-new/
+
+# Profiling
+*.prof
+*.pprof
+*.out
+coverage.out
+
+# NPM (testbed dependencies)
+testbed/node_modules/
+
+# Large demo files (keep in testbed, ignore duplicates)
+/demo_python.wasm
+
+# Debug artifacts
+asyncify/debug_*.wat
+
+# Backup files
+*.backup
+*.bak
+*~
+
+# Claude Code
+.claude.json.backup
+.claude/
+.claude.json
+
+# Generated cache/config directories
+.cache/
+.config/

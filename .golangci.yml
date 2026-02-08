@@ -1,0 +1,176 @@
+version: "2"
+
+run:
+  allow-parallel-runners: true
+linters:
+  default: none
+  enable:
+    - asciicheck
+    - bodyclose
+    - copyloopvar
+    - dogsled
+    - errcheck
+    - errorlint
+    - gocritic
+    - goprintffuncname
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - nakedret
+    - noctx
+    - nolintlint
+    - revive
+    - staticcheck
+    - tparallel
+    - unconvert
+    - unused
+    - whitespace
+  settings:
+    dupl:
+      threshold: 100
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+    goconst:
+      min-len: 2
+      min-occurrences: 3
+    godot:
+      scope: declarations
+      capital: true
+    govet:
+      enable-all: true
+      disable:
+        - shadow
+    lll:
+      line-length: 120
+    misspell:
+      locale: US
+    nolintlint:
+      require-specific: true
+      require-explanation: false
+    staticcheck:
+      checks: ["all"]
+    wsl:
+      allow-assign-and-anything: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+    rules:
+      - linters:
+          - dupl
+          - funlen
+          - gocognit
+          - scopelint
+        path: _test\.go
+      - linters:
+          - errcheck
+        path: _test\.go
+      - linters:
+          - errcheck
+        path: bench_test\.go
+      - linters:
+          - errcheck
+        path: fuzz_test\.go
+      - linters:
+          - gosec
+        path: _test\.go
+      - linters:
+          - revive
+        text: "unused-parameter"
+        path: _test\.go
+      - linters:
+          - govet
+        text: "unusedwrite"
+        path: _test\.go
+      - linters:
+          - errcheck
+        text: "Error return value of.*Close.*is not checked"
+      - linters:
+          - errcheck
+        text: "Error return value of.*Remove.*is not checked"
+      - linters:
+          - gosec
+        text: "G101"
+      - linters:
+          - gosec
+        text: "G103"
+      - linters:
+          - gosec
+        text: "G115"
+      - linters:
+          - gosec
+        text: "G301"
+      - linters:
+          - gosec
+        text: "G304"
+      - linters:
+          - gosec
+        text: "G306"
+      - linters:
+          - gosec
+        text: "G104"
+      - linters:
+          - gosec
+        text: "G602"
+      - linters:
+          - gocritic
+        text: "captLocal"
+      - linters:
+          - gocritic
+        text: "ifElseChain"
+      - linters:
+          - gocritic
+        text: "exitAfterDefer"
+      - linters:
+          - revive
+        text: "unexported-return"
+      - linters:
+          - revive
+        text: "var-naming: avoid package names"
+      - linters:
+          - revive
+        text: "unused-parameter"
+      - linters:
+          - revive
+        text: "redefines-builtin-id"
+      - linters:
+          - revive
+        text: "empty-block"
+      - linters:
+          - errorlint
+        text: "type assertion"
+      - linters:
+          - staticcheck
+        text: "SA9003"
+      - linters:
+          - staticcheck
+        text: "SA1012"
+        path: _test\.go
+      - linters:
+          - errcheck
+        path: "cmd/"
+    paths:
+      - .github
+      - .git
+      - __old
+      - third_party$
+      - builtin$
+      - examples$
+      - testbed$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - .github
+      - .git
+      - third_party$
+      - builtin$
+      - examples$
+      - testbed$
+issues:
+  fix: false
