@@ -850,6 +850,14 @@ func (i *WazeroInstance) GetExportedFunction(name string) api.Function {
 	return i.getExportedFunction(name)
 }
 
+// MemorySize returns the current linear memory size in bytes, or 0 if no memory.
+func (i *WazeroInstance) MemorySize() uint32 {
+	if i.memory == nil {
+		return 0
+	}
+	return i.memory.Size()
+}
+
 // prepareCallContext injects linker instance into context if available.
 // This is needed for host handlers to resolve the correct instance when
 // called from synthetic shim modules that don't have instanceID suffix.
@@ -1205,8 +1213,16 @@ func (m *WazeroModule) buildTypedHostFunc(wrapper *LowerWrapper) api.GoModuleFun
 	return wrapper.BuildRawFunc()
 }
 
-// Compile-time check that WazeroMemory implements wasmruntime.Memory
+func (m *WazeroMemory) Size() uint32 {
+	if m.mem == nil {
+		return 0
+	}
+	return m.mem.Size()
+}
+
+// Compile-time check that WazeroMemory implements wasmruntime.Memory and MemorySizer
 var _ wasmruntime.Memory = (*WazeroMemory)(nil)
+var _ wasmruntime.MemorySizer = (*WazeroMemory)(nil)
 
 // Compile-time check that wazeroAllocator implements wasmruntime.Allocator
 var _ wasmruntime.Allocator = (*wazeroAllocator)(nil)

@@ -14,6 +14,11 @@ type Memory interface {
 	WriteU64(offset uint32, value uint64) error
 }
 
+// MemorySizer provides the current size of WASM linear memory in bytes.
+type MemorySizer interface {
+	Size() uint32
+}
+
 // Allocator allocates memory in WASM linear memory
 type Allocator interface {
 	Alloc(size, align uint32) (uint32, error)
