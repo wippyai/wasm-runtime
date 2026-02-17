@@ -82,6 +82,45 @@ func TestComponent_Minimal_Compute(t *testing.T) {
 	}
 }
 
+func TestInstance_MemorySize(t *testing.T) {
+	ctx := context.Background()
+
+	wasmBytes, err := os.ReadFile("../testbed/minimal.wasm")
+	if err != nil {
+		t.Fatalf("read wasm: %v", err)
+	}
+
+	rt, err := New(ctx)
+	if err != nil {
+		t.Fatalf("create runtime: %v", err)
+	}
+	defer rt.Close(ctx)
+
+	host := &MinimalHost{}
+	if err := rt.RegisterHost(host); err != nil {
+		t.Fatalf("register host: %v", err)
+	}
+
+	mod, err := rt.LoadComponent(ctx, wasmBytes)
+	if err != nil {
+		t.Fatalf("load component: %v", err)
+	}
+
+	inst, err := mod.Instantiate(ctx)
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	defer inst.Close(ctx)
+
+	size := inst.MemorySize()
+	if size == 0 {
+		t.Error("expected non-zero memory size for component with memory")
+	}
+	if size%65536 != 0 {
+		t.Errorf("memory size %d should be a multiple of page size (65536)", size)
+	}
+}
+
 // NOTE: This test duplicates testbed/testbed_test.go:TestMinimal_ComputeUsingHost.
 // Consider consolidating to testbed package for E2E tests.
 func TestComponent_Minimal_ComputeUsingHost(t *testing.T) {

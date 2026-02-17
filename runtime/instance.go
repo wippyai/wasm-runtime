@@ -80,6 +80,11 @@ func (i *Instance) RunAsync(ctx context.Context, name string, args ...uint64) ([
 	return i.wazeroInstance.RunAsync(ctx, name, args...)
 }
 
+// MemorySize returns the current linear memory size in bytes, or 0 if no memory.
+func (i *Instance) MemorySize() uint32 {
+	return i.wazeroInstance.MemorySize()
+}
+
 // GetExportedFunction returns the raw wazero api.Function, or nil if not found.
 func (i *Instance) GetExportedFunction(name string) any {
 	fn := i.wazeroInstance.GetExportedFunction(name)

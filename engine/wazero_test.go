@@ -170,6 +170,108 @@ func TestWazeroEngine_MemoryLimit(t *testing.T) {
 	defer inst.Close(ctx)
 }
 
+func TestWazeroInstance_MemorySize(t *testing.T) {
+	ctx := context.Background()
+
+	eng, err := NewWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("NewWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+
+	t.Run("one_page", func(t *testing.T) {
+		wasmBytes := []byte{
+			0x00, 0x61, 0x73, 0x6d,
+			0x01, 0x00, 0x00, 0x00,
+			0x05, 0x03, 0x01, 0x00, 0x01, // memory min=1
+		}
+
+		mod, err := eng.LoadModule(ctx, wasmBytes)
+		if err != nil {
+			t.Fatalf("LoadModule: %v", err)
+		}
+
+		inst, err := mod.Instantiate(ctx)
+		if err != nil {
+			t.Fatalf("Instantiate: %v", err)
+		}
+		defer inst.Close(ctx)
+
+		size := inst.MemorySize()
+		if size != 65536 {
+			t.Errorf("expected 65536 bytes (1 page), got %d", size)
+		}
+	})
+
+	t.Run("two_pages", func(t *testing.T) {
+		wasmBytes := []byte{
+			0x00, 0x61, 0x73, 0x6d,
+			0x01, 0x00, 0x00, 0x00,
+			0x05, 0x03, 0x01, 0x00, 0x02, // memory min=2
+		}
+
+		mod, err := eng.LoadModule(ctx, wasmBytes)
+		if err != nil {
+			t.Fatalf("LoadModule: %v", err)
+		}
+
+		inst, err := mod.Instantiate(ctx)
+		if err != nil {
+			t.Fatalf("Instantiate: %v", err)
+		}
+		defer inst.Close(ctx)
+
+		size := inst.MemorySize()
+		if size != 131072 {
+			t.Errorf("expected 131072 bytes (2 pages), got %d", size)
+		}
+	})
+
+	t.Run("nil_memory", func(t *testing.T) {
+		inst := &WazeroInstance{}
+		size := inst.MemorySize()
+		if size != 0 {
+			t.Errorf("expected 0 for nil memory, got %d", size)
+		}
+	})
+}
+
+func TestWazeroMemory_Size(t *testing.T) {
+	ctx := context.Background()
+
+	eng, err := NewWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("NewWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+
+	wasmBytes := []byte{
+		0x00, 0x61, 0x73, 0x6d,
+		0x01, 0x00, 0x00, 0x00,
+		0x05, 0x03, 0x01, 0x00, 0x03, // memory min=3
+	}
+
+	mod, err := eng.LoadModule(ctx, wasmBytes)
+	if err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+
+	inst, err := mod.Instantiate(ctx)
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	defer inst.Close(ctx)
+
+	if inst.memory == nil {
+		t.Fatal("expected memory to be set")
+	}
+
+	size := inst.memory.Size()
+	if size != 196608 {
+		t.Errorf("expected 196608 bytes (3 pages), got %d", size)
+	}
+}
+
 func TestMultiModuleWASIReuse(t *testing.T) {
 	ctx := context.Background()
 
