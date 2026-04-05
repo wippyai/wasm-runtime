@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/tetratelabs/wazero"
@@ -189,5 +190,59 @@ func TestWrapper_IntegerReadWrite(t *testing.T) {
 	}
 	if v64 != 0x123456789ABCDEF0 {
 		t.Errorf("ReadU64: expected 0x123456789ABCDEF0, got 0x%x", v64)
+	}
+}
+
+// nullAllocWASM is a module with cabi_realloc that always returns 0.
+// (module (memory 1) (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0)))
+var nullAllocWASM = []byte{
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x09, 0x01, 0x60, 0x04, 0x7f, 0x7f, 0x7f,
+	0x7f, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x10, 0x01, 0x0c,
+	0x63, 0x61, 0x62, 0x69, 0x5f, 0x72, 0x65, 0x61, 0x6c, 0x6c, 0x6f, 0x63, 0x00, 0x00, 0x0a, 0x06,
+	0x01, 0x04, 0x00, 0x41, 0x00, 0x0b,
+}
+
+func TestAllocatorWrapper_NullPointerReturnsError(t *testing.T) {
+	ctx := context.Background()
+	rt := wazero.NewRuntime(ctx)
+	defer rt.Close(ctx)
+
+	compiled, err := rt.CompileModule(ctx, nullAllocWASM)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	mod, err := rt.InstantiateModule(ctx, compiled, wazero.NewModuleConfig())
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	defer mod.Close(ctx)
+
+	fn := mod.ExportedFunction("cabi_realloc")
+	if fn == nil {
+		t.Fatal("cabi_realloc not found")
+	}
+
+	alloc := WrapAllocator(ctx, fn)
+	if alloc == nil {
+		t.Fatal("expected non-nil allocator")
+	}
+
+	// Non-zero size allocation returning ptr=0 should be an error
+	_, err = alloc.Alloc(64, 1)
+	if err == nil {
+		t.Fatal("expected error when cabi_realloc returns null for non-zero size")
+	}
+	if !strings.Contains(err.Error(), "null pointer") {
+		t.Errorf("error should mention null pointer, got: %v", err)
+	}
+
+	// Zero-size allocation returning ptr=0 is valid
+	ptr, err := alloc.Alloc(0, 1)
+	if err != nil {
+		t.Fatalf("zero-size alloc should succeed: %v", err)
+	}
+	if ptr != 0 {
+		t.Errorf("expected ptr=0 for zero-size, got %d", ptr)
 	}
 }
