@@ -1,4 +1,4 @@
-package types //nolint:revive // package name is used by internal consumers
+package types
 
 import "testing"
 
