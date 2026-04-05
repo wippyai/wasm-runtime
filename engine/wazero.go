@@ -661,21 +661,29 @@ func (m *WazeroModule) InstantiateWithConfig(ctx context.Context, cfg *InstanceC
 		wazInst.memory = &WazeroMemory{mem: mem}
 	}
 
-	// Cache allocator - try standard cabi_realloc first, then fallbacks
-	allocFnDef := instance.ExportedFunctionDefinitions()[CabiRealloc]
+	// Cache allocator - try standard cabi_realloc first, then fallbacks.
+	// Use the map key (export name) for ExportedFunction lookup, not
+	// FunctionDefinition.Name() which returns empty for anonymous modules
+	// instantiated with WithName("").
+	allExports := instance.ExportedFunctionDefinitions()
+	allocFnDef := allExports[CabiRealloc]
+	allocName := CabiRealloc
 	if allocFnDef == nil {
-		allocFnDef = instance.ExportedFunctionDefinitions()[legacyRealloc]
+		allocFnDef = allExports[legacyRealloc]
+		allocName = legacyRealloc
 	}
 	if allocFnDef == nil {
-		allocFnDef = instance.ExportedFunctionDefinitions()[legacyAlloc]
+		allocFnDef = allExports[legacyAlloc]
+		allocName = legacyAlloc
 	}
 	if allocFnDef == nil {
-		allocFnDef = instance.ExportedFunctionDefinitions()[simpleAlloc]
+		allocFnDef = allExports[simpleAlloc]
+		allocName = simpleAlloc
 	}
 
 	var isSimpleAlloc bool
 	if allocFnDef != nil {
-		wazInst.allocFn = instance.ExportedFunction(allocFnDef.Name())
+		wazInst.allocFn = instance.ExportedFunction(allocName)
 		paramCount := len(allocFnDef.ParamTypes())
 		isSimpleAlloc = paramCount < 4
 	}
@@ -1070,7 +1078,11 @@ func (a *wazeroAllocator) Alloc(size, align uint32) (uint32, error) {
 		if err != nil {
 			return 0, err
 		}
-		return uint32(a.stackBuf[0]), nil
+		ptr := uint32(a.stackBuf[0])
+		if ptr == 0 && size > 0 {
+			return 0, fmt.Errorf("allocator returned null pointer (size=%d)", size)
+		}
+		return ptr, nil
 	}
 	a.stackBuf[0] = 0
 	a.stackBuf[1] = 0
@@ -1080,7 +1092,11 @@ func (a *wazeroAllocator) Alloc(size, align uint32) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	return uint32(a.stackBuf[0]), nil
+	ptr := uint32(a.stackBuf[0])
+	if ptr == 0 && size > 0 {
+		return 0, fmt.Errorf("cabi_realloc returned null pointer (size=%d, align=%d)", size, align)
+	}
+	return ptr, nil
 }
 
 func (a *wazeroAllocator) Free(ptr, size, align uint32) {

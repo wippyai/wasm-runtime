@@ -130,7 +130,11 @@ func (a *AllocatorWrapper) Alloc(size, align uint32) (uint32, error) {
 	if len(results) == 0 {
 		return 0, fmt.Errorf("allocation returned no result")
 	}
-	return uint32(results[0]), nil
+	ptr := uint32(results[0])
+	if ptr == 0 && size > 0 {
+		return 0, fmt.Errorf("allocation returned null pointer (size=%d, align=%d)", size, align)
+	}
+	return ptr, nil
 }
 
 // Free deallocates memory using cabi_realloc.
