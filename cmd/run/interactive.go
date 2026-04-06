@@ -369,7 +369,7 @@ func (m *interactiveModel) View() string {
 
 	case stateInputArgs:
 		f := m.funcs[m.selected]
-		b.WriteString(fmt.Sprintf("Calling %s\n\n", funcStyle.Render(f.name)))
+		fmt.Fprintf(&b, "Calling %s\n\n", funcStyle.Render(f.name))
 		for i, input := range m.inputs {
 			b.WriteString(input.View())
 			b.WriteString(" ")
@@ -381,7 +381,7 @@ func (m *interactiveModel) View() string {
 
 	case stateShowResult:
 		f := m.funcs[m.selected]
-		b.WriteString(fmt.Sprintf("Result of %s:\n\n", funcStyle.Render(f.name)))
+		fmt.Fprintf(&b, "Result of %s:\n\n", funcStyle.Render(f.name))
 		if m.err != nil {
 			b.WriteString(errorStyle.Render(fmt.Sprintf("Error: %v", m.err)))
 		} else {

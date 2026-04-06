@@ -421,7 +421,7 @@ func (e *MissingImportsError) Error() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("missing %d host function(s):\n", len(e.Imports)))
+	fmt.Fprintf(&b, "missing %d host function(s):\n", len(e.Imports))
 
 	// Group by namespace for cleaner output
 	byNS := make(map[string][]string)
