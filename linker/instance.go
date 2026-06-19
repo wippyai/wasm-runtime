@@ -685,6 +685,21 @@ func (inst *Instance) createBridgeFrom(ctx context.Context, name string, source 
 		if err != nil {
 			return false, err
 		}
+		if source.virtual != nil && !inst.bridgeModules[name] {
+			// Virtual bridges re-export functions from a core instance via
+			// ForwardingWrapper, which captures concrete, per-instance
+			// api.Function values, so a bridge is only valid while the instance
+			// it was built from is alive. Ref-count it across the instances that
+			// share it and free it when the last one closes; the next
+			// instantiation then rebuilds a fresh bridge bound to its own core
+			// instead of reusing one left bound to a previous (now-closed)
+			// instance's core, which would trap on the first call. Guard on
+			// bridgeModules so a name reached twice in one instantiation adds a
+			// single ref, balanced with the one release on Close. Stateless
+			// host-only bridges resolve memory per call and stay shared.
+			inst.bridgeModules[name] = true
+			inst.pre.linker.addBridgeRefs(map[string]bool{name: true})
+		}
 	}
 
 	if source.virtual != nil && inst.virtualBridges != nil {
