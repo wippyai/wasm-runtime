@@ -14,6 +14,26 @@ import (
 
 type Decoder struct {
 	compiler *Compiler
+	options  DecodeOptions
+}
+
+// DecodeOptions controls optional result-shaping behavior. The zero value
+// preserves the default public API.
+type DecodeOptions struct {
+	// ByteListResult controls how WIT list<u8> values are represented.
+	// The default is ByteListResultBytes.
+	ByteListResult ByteListResultMode
+}
+
+type ByteListResultMode string
+
+const (
+	ByteListResultBytes        ByteListResultMode = "bytes"
+	ByteListResultBinaryString ByteListResultMode = "binary_string"
+)
+
+func (o DecodeOptions) byteListsAsBinaryString() bool {
+	return o.ByteListResult == ByteListResultBinaryString
 }
 
 func NewDecoder() *Decoder {
@@ -24,6 +44,17 @@ func NewDecoder() *Decoder {
 
 func NewDecoderWithCompiler(c *Compiler) *Decoder {
 	return &Decoder{compiler: c}
+}
+
+func NewDecoderWithCompilerAndOptions(c *Compiler, options DecodeOptions) *Decoder {
+	return &Decoder{compiler: c, options: options}
+}
+
+func (d *Decoder) WithOptions(options DecodeOptions) *Decoder {
+	if d == nil {
+		return NewDecoderWithCompilerAndOptions(NewCompiler(), options)
+	}
+	return &Decoder{compiler: d.compiler, options: options}
 }
 
 func (d *Decoder) DecodeResults(resultTypes []wit.Type, flat []uint64, mem Memory) ([]any, error) {
@@ -792,6 +823,9 @@ func (d *Decoder) liftList(l *wit.List, flat []uint64, mem Memory, path []string
 func (d *Decoder) liftEmptyList(typ wit.Type) any {
 	switch typ.(type) {
 	case wit.U8:
+		if d.options.byteListsAsBinaryString() {
+			return ""
+		}
 		return []uint8(nil)
 	case wit.S8:
 		return []int8(nil)
@@ -826,6 +860,9 @@ func (d *Decoder) liftByteList(typ wit.Type, addr uint32, length uint32, mem Mem
 
 	switch typ.(type) {
 	case wit.U8:
+		if d.options.byteListsAsBinaryString() {
+			return string(data), 2, nil
+		}
 		result := make([]uint8, length)
 		copy(result, data)
 		return result, 2, nil
@@ -1274,39 +1311,7 @@ func (d *Decoder) loadTypeDef(t *wit.TypeDef, addr uint32, mem Memory, path []st
 		if err != nil {
 			return nil, err
 		}
-
-		if length == 0 {
-			return []any{}, nil
-		}
-
-		if length > MaxListLength {
-			return nil, errors.New(errors.PhaseDecode, errors.KindOverflow).
-				Path(path...).
-				Detail("list length %d exceeds maximum %d", length, MaxListLength).
-				Build()
-		}
-
-		lc := d.compiler.layout
-		elemLayout := lc.Calculate(kind.Type)
-
-		// Dynamic path always returns []any for consistency
-		result := make([]any, length)
-		for i := uint32(0); i < length; i++ {
-			val, err := d.loadValue(kind.Type, dataAddr+i*elemLayout.Size, mem, nil)
-			if err != nil {
-				// Only build path on error
-				if path != nil {
-					elemPath := append(append([]string{}, path...), "["+strconv.FormatUint(uint64(i), 10)+"]")
-					return nil, errors.New(errors.PhaseDecode, errors.KindInvalidData).
-						Path(elemPath...).
-						Detail("failed to load element %d: %v", i, err).
-						Build()
-				}
-				return nil, err
-			}
-			result[i] = val
-		}
-		return result, nil
+		return d.loadListValue(kind, dataAddr, length, mem, path)
 
 	case *wit.Option:
 		disc, err := mem.ReadU8(addr)
@@ -1442,5 +1447,69 @@ func (d *Decoder) loadTypeDef(t *wit.TypeDef, addr uint32, mem Memory, path []st
 
 	default:
 		return nil, errors.Unsupported(errors.PhaseDecode, "TypeDef kind for load")
+	}
+}
+
+func (d *Decoder) loadListValue(l *wit.List, dataAddr uint32, length uint32, mem Memory, path []string) (any, error) {
+	if length == 0 {
+		if isU8Type(l.Type) {
+			if d.options.byteListsAsBinaryString() {
+				return "", nil
+			}
+			return []uint8(nil), nil
+		}
+		return []any{}, nil
+	}
+
+	if length > MaxListLength {
+		return nil, errors.New(errors.PhaseDecode, errors.KindOverflow).
+			Path(path...).
+			Detail("list length %d exceeds maximum %d", length, MaxListLength).
+			Build()
+	}
+
+	if isU8Type(l.Type) {
+		data, err := mem.Read(dataAddr, length)
+		if err != nil {
+			return nil, err
+		}
+		if d.options.byteListsAsBinaryString() {
+			return string(data), nil
+		}
+		result := make([]uint8, len(data))
+		copy(result, data)
+		return result, nil
+	}
+
+	lc := d.compiler.layout
+	elemLayout := lc.Calculate(l.Type)
+
+	result := make([]any, length)
+	for i := uint32(0); i < length; i++ {
+		val, err := d.loadValue(l.Type, dataAddr+i*elemLayout.Size, mem, nil)
+		if err != nil {
+			if path != nil {
+				elemPath := append(append([]string{}, path...), "["+strconv.FormatUint(uint64(i), 10)+"]")
+				return nil, errors.New(errors.PhaseDecode, errors.KindInvalidData).
+					Path(elemPath...).
+					Detail("failed to load element %d: %v", i, err).
+					Build()
+			}
+			return nil, err
+		}
+		result[i] = val
+	}
+	return result, nil
+}
+
+func isU8Type(typ wit.Type) bool {
+	switch t := typ.(type) {
+	case wit.U8:
+		return true
+	case *wit.TypeDef:
+		inner, ok := t.Kind.(wit.Type)
+		return ok && isU8Type(inner)
+	default:
+		return false
 	}
 }

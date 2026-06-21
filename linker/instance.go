@@ -189,10 +189,21 @@ func (w *boundModuleWrapper) ExportedFunction(name string) api.Function {
 	return w.Module.ExportedFunction(name)
 }
 
-// createBoundHandlerFromDef creates a handler that binds memory at call time.
-func createBoundHandlerFromDef(def resolve.HostFuncDef) api.GoModuleFunc {
+// createBoundHandlerFromDef creates a handler with an explicit memory/realloc binding.
+func createBoundHandlerFromDef(def resolve.HostFuncDef, boundMem api.Memory, boundAlloc api.Function) api.GoModuleFunc {
 	handler := def.GetHandler()
 	return func(ctx context.Context, caller api.Module, stack []uint64) {
+		if isValidMemory(boundMem) {
+			wrapped := &boundModuleWrapper{
+				Module:     caller,
+				boundMem:   boundMem,
+				boundAlloc: boundAlloc,
+				allocName:  "cabi_realloc",
+			}
+			handler(ctx, wrapped, stack)
+			return
+		}
+
 		// Try to find the instance: first by caller module name, then by context.
 		inst := lookupInstanceFromCaller(caller)
 		if inst == nil {
@@ -1493,8 +1504,8 @@ func (inst *Instance) collectVirtualExports(virt *VirtualInstance, namespace str
 			if src.Def == nil {
 				continue
 			}
-			// Create handler using registry lookup (same as shared handler)
-			boundHandler := createBoundHandlerFromDef(src.Def)
+			// Preserve the memory/realloc captured from this canon.lower.
+			boundHandler := createBoundHandlerFromDef(src.Def, src.Memory, src.Allocator)
 			exports = append(exports, bridge.Export{
 				Name:        entityName,
 				Fn:          boundHandler,

@@ -4197,6 +4197,94 @@ func TestCreateSharedMemoryHandler_NoInstanceFallback(t *testing.T) {
 	}
 }
 
+func TestCollectVirtualExports_BoundHostFuncUsesExplicitMemory(t *testing.T) {
+	ctx := context.Background()
+	rt := wazero.NewRuntime(ctx)
+	defer rt.Close(ctx)
+
+	boundBytes, err := wat.Compile(`(module
+		(memory (export "memory") 1)
+		(func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+			i32.const 64)
+	)`)
+	if err != nil {
+		t.Fatalf("compile bound module: %v", err)
+	}
+	boundCompiled, err := rt.CompileModule(ctx, boundBytes)
+	if err != nil {
+		t.Fatalf("compile bound wasm: %v", err)
+	}
+	boundMod, err := rt.InstantiateModule(ctx, boundCompiled, wazero.NewModuleConfig().WithName("bound"))
+	if err != nil {
+		t.Fatalf("instantiate bound module: %v", err)
+	}
+	defer boundMod.Close(ctx)
+	if ok := boundMod.Memory().Write(8, []byte{0xA5}); !ok {
+		t.Fatal("write bound memory marker")
+	}
+
+	callerBytes, err := wat.Compile(`(module
+		(memory (export "memory") 1)
+	)`)
+	if err != nil {
+		t.Fatalf("compile caller module: %v", err)
+	}
+	callerCompiled, err := rt.CompileModule(ctx, callerBytes)
+	if err != nil {
+		t.Fatalf("compile caller wasm: %v", err)
+	}
+	callerMod, err := rt.InstantiateModule(ctx, callerCompiled, wazero.NewModuleConfig().WithName("caller"))
+	if err != nil {
+		t.Fatalf("instantiate caller module: %v", err)
+	}
+	defer callerMod.Close(ctx)
+	if ok := callerMod.Memory().Write(8, []byte{0x5A}); !ok {
+		t.Fatal("write caller memory marker")
+	}
+
+	var sawMarker byte
+	var sawAllocator bool
+	def := &FuncDef{
+		Name:        "get-random-bytes",
+		ParamTypes:  []api.ValueType{api.ValueTypeI64, api.ValueTypeI32},
+		ResultTypes: nil,
+		Handler: func(ctx context.Context, mod api.Module, stack []uint64) {
+			data, ok := mod.Memory().Read(8, 1)
+			if !ok {
+				t.Fatal("handler could not read module memory")
+			}
+			sawMarker = data[0]
+			alloc := mod.ExportedFunction("cabi_realloc")
+			sawAllocator = alloc != nil
+		},
+	}
+
+	virt := NewVirtualInstance("wasi:random/random@0.2.3")
+	virt.Define("get-random-bytes", Entity{
+		Kind: EntityFunc,
+		Source: BoundHostFunc{
+			Def:       def,
+			Memory:    boundMod.Memory(),
+			Allocator: boundMod.ExportedFunction("cabi_realloc"),
+		},
+	})
+
+	inst := &Instance{}
+	exports := inst.collectVirtualExports(virt, "wasi:random/random@0.2.3")
+	if len(exports) != 1 {
+		t.Fatalf("got %d exports, want 1", len(exports))
+	}
+
+	exports[0].Fn(ctx, callerMod, []uint64{4, 32})
+
+	if sawMarker != 0xA5 {
+		t.Fatalf("handler read marker 0x%02x, want bound memory marker 0xA5", sawMarker)
+	}
+	if !sawAllocator {
+		t.Fatal("handler did not see bound allocator")
+	}
+}
+
 func BenchmarkWithInstance(b *testing.B) {
 	ctx := context.Background()
 	inst := &Instance{instanceID: 42}
