@@ -71,9 +71,9 @@ type CompileConfig struct {
 // InstanceConfig holds configuration for module instantiation
 type InstanceConfig struct {
 	Name            string
+	DecodeOptions   transcoder.DecodeOptions
 	AsyncifyImports []string
 	EnableAsyncify  bool
-	DecodeOptions   transcoder.DecodeOptions
 }
 
 func (e *WazeroEngine) LoadModule(ctx context.Context, wasmBytes []byte) (*WazeroModule, error) {
