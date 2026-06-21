@@ -1386,6 +1386,102 @@ func TestNewInstance_WithBridgeFromModule(t *testing.T) {
 	}
 }
 
+func TestNewInstance_RealModuleBridgeStaleAfterSourceClose(t *testing.T) {
+	ctx := context.Background()
+	rt := wazero.NewRuntime(ctx)
+	defer rt.Close(ctx)
+
+	l := New(rt, Options{})
+
+	mod0Bytes, err := wat.Compile(`(module
+		(global $g (mut i32) (i32.const 0))
+		(func $f (result i32)
+			global.get $g
+			i32.const 1
+			i32.add
+			global.set $g
+			global.get $g)
+		(export "func" (func $f))
+	)`)
+	if err != nil {
+		t.Fatalf("compile source wat: %v", err)
+	}
+	compiled0, err := rt.CompileModule(ctx, mod0Bytes)
+	if err != nil {
+		t.Fatalf("compile source: %v", err)
+	}
+	defer compiled0.Close(ctx)
+
+	mod1Bytes, err := wat.Compile(`(module
+		(import "source" "func" (func $imported (result i32)))
+		(func $call (result i32) (call $imported))
+		(export "call" (func $call))
+	)`)
+	if err != nil {
+		t.Fatalf("compile consumer wat: %v", err)
+	}
+	compiled1, err := rt.CompileModule(ctx, mod1Bytes)
+	if err != nil {
+		t.Fatalf("compile consumer: %v", err)
+	}
+	defer compiled1.Close(ctx)
+
+	instances := []component.CoreInstance{
+		{Parsed: &component.ParsedCoreInstance{
+			Kind:        component.CoreInstanceInstantiate,
+			ModuleIndex: 0,
+		}},
+		{Parsed: &component.ParsedCoreInstance{
+			Kind:        component.CoreInstanceInstantiate,
+			ModuleIndex: 1,
+			Args: []component.CoreInstanceArg{
+				{
+					Kind:          component.CoreInstantiateInstance,
+					Name:          "source",
+					InstanceIndex: 0,
+				},
+			},
+		}},
+	}
+
+	pre := &InstancePre{
+		linker:   l,
+		graph:    component.NewInstanceGraph(instances),
+		compiled: []wazero.CompiledModule{compiled0, compiled1},
+		component: &component.ValidatedComponent{
+			Raw: &component.Component{},
+		},
+	}
+
+	inst1, err := pre.NewInstance(ctx)
+	if err != nil {
+		t.Fatalf("first NewInstance: %v", err)
+	}
+	firstResult, err := inst1.Modules()[1].ExportedFunction("call").Call(ctx)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if len(firstResult) != 1 || firstResult[0] != 1 {
+		t.Fatalf("first call result = %v, want [1]", firstResult)
+	}
+	inst1.Close(ctx)
+
+	inst2, err := pre.NewInstance(ctx)
+	if err != nil {
+		t.Fatalf("second NewInstance: %v", err)
+	}
+	defer inst2.Close(ctx)
+
+	secondResult, err := inst2.Modules()[1].ExportedFunction("call").Call(ctx)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if len(secondResult) != 1 || secondResult[0] != 0 {
+		t.Fatalf("second call result = %v, want [0] from stale closed source bridge", secondResult)
+	}
+	t.Log("real-module synthetic bridge did not bind to the fresh second source instance")
+}
+
 func TestNewInstance_WithFromExports(t *testing.T) {
 	ctx := context.Background()
 	rt := wazero.NewRuntime(ctx)
