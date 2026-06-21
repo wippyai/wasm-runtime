@@ -251,6 +251,35 @@ func TestEncoder_List(t *testing.T) {
 	}
 }
 
+func TestEncoder_ListU8AcceptsRawStringBytes(t *testing.T) {
+	enc := NewEncoder()
+	dec := NewDecoder()
+	mem := newMockMemory(4096)
+	alloc := newMockAllocator(mem)
+	allocList := NewAllocationList()
+
+	listType := &wit.TypeDef{
+		Kind: &wit.List{Type: wit.U8{}},
+	}
+
+	input := string([]byte{0x00, 0xFF, 'P', 'D', 'F'})
+	flat, err := enc.EncodeParams([]wit.Type{listType}, []any{input}, mem, alloc, allocList)
+	if err != nil {
+		t.Fatalf("EncodeParams failed: %v", err)
+	}
+
+	results, err := dec.DecodeResults([]wit.Type{listType}, flat, mem)
+	if err != nil {
+		t.Fatalf("DecodeResults failed: %v", err)
+	}
+
+	got := results[0].([]uint8)
+	want := []uint8{0x00, 0xFF, 'P', 'D', 'F'}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
 func TestEncoder_Option(t *testing.T) {
 	enc := NewEncoder()
 	dec := NewDecoder()

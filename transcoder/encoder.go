@@ -20,8 +20,8 @@ const (
 
 // Safety limits to prevent DoS attacks and memory exhaustion.
 const (
-	MaxStringSize = abi.MaxStringSize // Maximum string size (16 MB)
-	MaxListLength = abi.MaxListLength // Maximum list length (1M elements)
+	MaxStringSize = abi.MaxStringSize // Maximum string size (1 GB)
+	MaxListLength = abi.MaxListLength // Maximum list length (128M elements)
 	MaxAlloc      = abi.MaxAlloc      // Maximum allocation size (1 GB)
 )
 
@@ -847,6 +847,12 @@ func (e *Encoder) flattenRecord(r *wit.Record, value any, mem Memory, alloc Allo
 }
 
 func (e *Encoder) flattenList(l *wit.List, value any, mem Memory, alloc Allocator, allocList *AllocationList, flat *[]uint64, path []string) error {
+	if _, ok := l.Type.(wit.U8); ok {
+		if s, ok := value.(string); ok {
+			return e.flattenByteString(s, mem, alloc, allocList, flat, path)
+		}
+	}
+
 	rv := reflect.ValueOf(value)
 	if rv.Kind() != reflect.Slice {
 		return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "slice")
@@ -976,6 +982,40 @@ func (e *Encoder) flattenList(l *wit.List, value any, mem Memory, alloc Allocato
 	}
 
 	*flat = append(*flat, uint64(dataAddr), uint64(length))
+	return nil
+}
+
+func (e *Encoder) flattenByteString(s string, mem Memory, alloc Allocator, allocList *AllocationList, flat *[]uint64, path []string) error {
+	dataLen := uint32(len(s))
+	if dataLen > MaxListLength {
+		return errors.New(errors.PhaseEncode, errors.KindOverflow).
+			Path(path...).
+			Detail("list length %d exceeds maximum %d", dataLen, MaxListLength).
+			Build()
+	}
+
+	if dataLen == 0 {
+		*flat = append(*flat, 0, 0)
+		return nil
+	}
+
+	dataAddr, err := alloc.Alloc(dataLen, 1)
+	if err != nil {
+		return errors.New(errors.PhaseEncode, errors.KindAllocation).
+			Path(path...).
+			Detail("failed to allocate %d bytes (align 1) for list data", dataLen).
+			Build()
+	}
+	if allocList != nil {
+		allocList.Add(dataAddr, dataLen, 1)
+	}
+
+	data := unsafe.Slice(unsafe.StringData(s), len(s))
+	if err := mem.Write(dataAddr, data); err != nil {
+		return err
+	}
+
+	*flat = append(*flat, uint64(dataAddr), uint64(dataLen))
 	return nil
 }
 
