@@ -1494,7 +1494,7 @@ func (e *Encoder) storeTypeDef(t *wit.TypeDef, value any, addr uint32, mem Memor
 			return mem.WriteU8(addr, 0)
 		}
 		rv := reflect.ValueOf(value)
-		if rv.Kind() == reflect.Ptr && rv.IsNil() {
+		if rv.Kind() == reflect.Pointer && rv.IsNil() {
 			return mem.WriteU8(addr, 0)
 		}
 		if err := mem.WriteU8(addr, 1); err != nil {
@@ -1503,7 +1503,7 @@ func (e *Encoder) storeTypeDef(t *wit.TypeDef, value any, addr uint32, mem Memor
 		innerLayout := e.compiler.layout.Calculate(kind.Type)
 		payloadOffset := alignTo(1, innerLayout.Align)
 		innerVal := value
-		if rv.Kind() == reflect.Ptr {
+		if rv.Kind() == reflect.Pointer {
 			innerVal = rv.Elem().Interface()
 		}
 		return e.storeValue(kind.Type, innerVal, addr+payloadOffset, mem, alloc, allocList, path)

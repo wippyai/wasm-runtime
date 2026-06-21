@@ -35,7 +35,7 @@ func (c *Compiler) Compile(witType wit.Type, goType reflect.Type) (*CompiledType
 	}
 
 	// Dereference pointer types, except for Option which expects pointer
-	if goType.Kind() == reflect.Ptr && !isOptionType(witType) {
+	if goType.Kind() == reflect.Pointer && !isOptionType(witType) {
 		goType = goType.Elem()
 	}
 
@@ -248,7 +248,7 @@ func (c *Compiler) compileRecord(r *wit.Record, goType reflect.Type, layout Layo
 			GoOffset:  goField.Offset,
 			WitOffset: recordLayout.FieldOffs[witField.Name],
 			Type:      fieldType,
-			IsPointer: goField.Type.Kind() == reflect.Ptr,
+			IsPointer: goField.Type.Kind() == reflect.Pointer,
 		})
 
 		flatCount += fieldType.FlatCount
@@ -449,7 +449,7 @@ func (c *Compiler) compileFlags(f *wit.Flags, goType reflect.Type, layout Layout
 }
 
 func (c *Compiler) compileOption(o *wit.Option, goType reflect.Type, layout LayoutInfo, path []string) (*CompiledType, error) {
-	if goType.Kind() != reflect.Ptr {
+	if goType.Kind() != reflect.Pointer {
 		return nil, errors.TypeMismatch(errors.PhaseCompile, path, goType.String(), "pointer")
 	}
 
@@ -569,7 +569,7 @@ func getResultOkGoType(goType reflect.Type, witType wit.Type) reflect.Type {
 			name := strings.ToLower(f.Name)
 			if name == "ok" || name == "value" {
 				// Dereference pointer - the field is *T but WIT type is T
-				if f.Type.Kind() == reflect.Ptr {
+				if f.Type.Kind() == reflect.Pointer {
 					return f.Type.Elem()
 				}
 				return f.Type
@@ -587,7 +587,7 @@ func getResultErrGoType(goType reflect.Type, witType wit.Type) reflect.Type {
 			name := strings.ToLower(f.Name)
 			if name == "err" || name == "error" {
 				// Dereference pointer - the field is *T but WIT type is T
-				if f.Type.Kind() == reflect.Ptr {
+				if f.Type.Kind() == reflect.Pointer {
 					return f.Type.Elem()
 				}
 				return f.Type
@@ -603,7 +603,7 @@ func getVariantCaseGoType(goType reflect.Type, caseName string, witType wit.Type
 			f := goType.Field(i)
 			if strings.EqualFold(f.Name, caseName) {
 				// Dereference pointer - the field is *T but WIT type is T
-				if f.Type.Kind() == reflect.Ptr {
+				if f.Type.Kind() == reflect.Pointer {
 					return f.Type.Elem()
 				}
 				return f.Type
