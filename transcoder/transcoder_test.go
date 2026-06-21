@@ -251,6 +251,180 @@ func TestEncoder_List(t *testing.T) {
 	}
 }
 
+func TestEncoder_ListU8AcceptsRawStringBytes(t *testing.T) {
+	enc := NewEncoder()
+	dec := NewDecoder()
+	mem := newMockMemory(4096)
+	alloc := newMockAllocator(mem)
+	allocList := NewAllocationList()
+
+	listType := &wit.TypeDef{
+		Kind: &wit.List{Type: wit.U8{}},
+	}
+
+	input := string([]byte{0x00, 0xFF, 'P', 'D', 'F'})
+	flat, err := enc.EncodeParams([]wit.Type{listType}, []any{input}, mem, alloc, allocList)
+	if err != nil {
+		t.Fatalf("EncodeParams failed: %v", err)
+	}
+
+	results, err := dec.DecodeResults([]wit.Type{listType}, flat, mem)
+	if err != nil {
+		t.Fatalf("DecodeResults failed: %v", err)
+	}
+
+	got := results[0].([]uint8)
+	want := []uint8{0x00, 0xFF, 'P', 'D', 'F'}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestDecoder_LoadValueNestedListU8PreservesBytes(t *testing.T) {
+	enc := NewEncoder()
+	dec := NewDecoder()
+	mem := newMockMemory(4096)
+	alloc := newMockAllocator(mem)
+	allocList := NewAllocationList()
+
+	byteList := &wit.TypeDef{
+		Kind: &wit.List{Type: wit.U8{}},
+	}
+	imageRecord := &wit.TypeDef{
+		Kind: &wit.Record{
+			Fields: []wit.Field{
+				{Name: "name", Type: wit.String{}},
+				{Name: "data", Type: byteList},
+			},
+		},
+	}
+	itemVariant := &wit.TypeDef{
+		Kind: &wit.Variant{
+			Cases: []wit.Case{
+				{Name: "markdown", Type: wit.String{}},
+				{Name: "image", Type: imageRecord},
+			},
+		},
+	}
+	itemList := &wit.TypeDef{
+		Kind: &wit.List{Type: itemVariant},
+	}
+	convertError := &wit.TypeDef{
+		Kind: &wit.Record{
+			Fields: []wit.Field{
+				{Name: "code", Type: wit.U8{}},
+				{Name: "message", Type: wit.String{}},
+			},
+		},
+	}
+	resultType := &wit.TypeDef{
+		Kind: &wit.Result{
+			OK:  itemList,
+			Err: convertError,
+		},
+	}
+
+	want := []byte{0x00, 0xFF, 'P', 'D', 'F'}
+	input := map[string]any{
+		"ok": []any{
+			map[string]any{
+				"image": map[string]any{
+					"name": "page-1.bin",
+					"data": want,
+				},
+			},
+		},
+	}
+
+	if err := enc.storeValue(resultType, input, 0, mem, alloc, allocList, nil); err != nil {
+		t.Fatalf("storeValue failed: %v", err)
+	}
+
+	gotAny, err := dec.LoadValue(resultType, 0, mem)
+	if err != nil {
+		t.Fatalf("LoadValue failed: %v", err)
+	}
+
+	gotResult := gotAny.(map[string]any)
+	gotItems := gotResult["ok"].([]any)
+	gotItem := gotItems[0].(map[string]any)
+	gotImage := gotItem["image"].(map[string]any)
+	gotData, ok := gotImage["data"].([]byte)
+	if !ok {
+		t.Fatalf("image data type = %T, want []byte", gotImage["data"])
+	}
+	if !reflect.DeepEqual(gotData, want) {
+		t.Fatalf("image data = %v, want %v", gotData, want)
+	}
+}
+
+func TestDecoder_LoadValueNestedListU8AsBinaryStringOption(t *testing.T) {
+	enc := NewEncoder()
+	dec := NewDecoderWithCompilerAndOptions(NewCompiler(), DecodeOptions{ByteListResult: ByteListResultBinaryString})
+	mem := newMockMemory(4096)
+	alloc := newMockAllocator(mem)
+	allocList := NewAllocationList()
+
+	byteList := &wit.TypeDef{
+		Kind: &wit.List{Type: wit.U8{}},
+	}
+	imageRecord := &wit.TypeDef{
+		Kind: &wit.Record{
+			Fields: []wit.Field{
+				{Name: "name", Type: wit.String{}},
+				{Name: "data", Type: byteList},
+			},
+		},
+	}
+	itemVariant := &wit.TypeDef{
+		Kind: &wit.Variant{
+			Cases: []wit.Case{
+				{Name: "markdown", Type: wit.String{}},
+				{Name: "image", Type: imageRecord},
+			},
+		},
+	}
+	itemList := &wit.TypeDef{
+		Kind: &wit.List{Type: itemVariant},
+	}
+	resultType := &wit.TypeDef{
+		Kind: &wit.Result{OK: itemList},
+	}
+
+	want := []byte{0x00, 0xFF, 'P', 'D', 'F'}
+	input := map[string]any{
+		"ok": []any{
+			map[string]any{
+				"image": map[string]any{
+					"name": "page-1.bin",
+					"data": want,
+				},
+			},
+		},
+	}
+
+	if err := enc.storeValue(resultType, input, 0, mem, alloc, allocList, nil); err != nil {
+		t.Fatalf("storeValue failed: %v", err)
+	}
+
+	gotAny, err := dec.LoadValue(resultType, 0, mem)
+	if err != nil {
+		t.Fatalf("LoadValue failed: %v", err)
+	}
+
+	gotResult := gotAny.(map[string]any)
+	gotItems := gotResult["ok"].([]any)
+	gotItem := gotItems[0].(map[string]any)
+	gotImage := gotItem["image"].(map[string]any)
+	gotData, ok := gotImage["data"].(string)
+	if !ok {
+		t.Fatalf("image data type = %T, want string", gotImage["data"])
+	}
+	if !reflect.DeepEqual([]byte(gotData), want) {
+		t.Fatalf("image data = %v, want %v", []byte(gotData), want)
+	}
+}
+
 func TestEncoder_Option(t *testing.T) {
 	enc := NewEncoder()
 	dec := NewDecoder()

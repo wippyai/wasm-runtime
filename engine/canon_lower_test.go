@@ -1,13 +1,16 @@
 package engine
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/tetratelabs/wazero/api"
 	"go.bytecodealliance.org/wit"
 
 	"github.com/wippyai/wasm-runtime/component"
+	"github.com/wippyai/wasm-runtime/wat"
 )
 
 // TestNewLowerWrapper tests wrapper creation
@@ -179,6 +182,85 @@ func TestLowerWrapper_BoolFastPaths(t *testing.T) {
 				t.Errorf("stack[0] = %d, want %d", stack[0], tc.wantStack)
 			}
 		})
+	}
+}
+
+func TestLowerWrapper_ListU8ResultUsesRetptr(t *testing.T) {
+	ctx := context.Background()
+
+	wasmBytes, err := wat.Compile(echoWAT)
+	if err != nil {
+		t.Fatalf("compile WAT: %v", err)
+	}
+
+	eng, err := NewWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("NewWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+
+	mod, err := eng.LoadModule(ctx, wasmBytes)
+	if err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+
+	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{Name: ""})
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	defer inst.Close(ctx)
+
+	listU8 := &wit.TypeDef{Kind: &wit.List{Type: wit.U8{}}}
+	def := &component.LowerDef{
+		Name:    "wasi:random/random@0.2.3#get-random-bytes",
+		Params:  []wit.Type{wit.U64{}},
+		Results: []wit.Type{listU8},
+	}
+
+	var called bool
+	w, err := NewLowerWrapper(def, func(_ context.Context, n uint64) []byte {
+		called = true
+		if n != 4 {
+			t.Errorf("handler len = %d, want 4", n)
+		}
+		return []byte{0x09, 0x08, 0x07, 0x06}
+	})
+	if err != nil {
+		t.Fatalf("NewLowerWrapper: %v", err)
+	}
+	if err := w.ValidateHandler(); err != nil {
+		t.Fatalf("ValidateHandler: %v", err)
+	}
+	if !w.usesRetptr() {
+		t.Fatal("list<u8> result must use retptr")
+	}
+
+	raw := w.BuildRawFunc()
+	retptr := uint32(32)
+	stack := []uint64{4, uint64(retptr)}
+	raw(ctx, inst.instance, stack)
+
+	if !called {
+		t.Fatal("handler was not called")
+	}
+
+	header, ok := inst.instance.Memory().Read(retptr, 8)
+	if !ok {
+		t.Fatalf("failed to read result header at %d", retptr)
+	}
+	dataPtr := binary.LittleEndian.Uint32(header[0:4])
+	dataLen := binary.LittleEndian.Uint32(header[4:8])
+	if dataLen != 4 {
+		t.Fatalf("result len = %d, want 4", dataLen)
+	}
+
+	got, ok := inst.instance.Memory().Read(dataPtr, dataLen)
+	if !ok {
+		t.Fatalf("failed to read result bytes at %d len %d", dataPtr, dataLen)
+	}
+	want := []byte{0x09, 0x08, 0x07, 0x06}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("result bytes = %v, want %v", got, want)
 	}
 }
 

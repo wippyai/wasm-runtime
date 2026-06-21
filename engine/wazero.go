@@ -71,6 +71,7 @@ type CompileConfig struct {
 // InstanceConfig holds configuration for module instantiation
 type InstanceConfig struct {
 	Name            string
+	DecodeOptions   transcoder.DecodeOptions
 	AsyncifyImports []string
 	EnableAsyncify  bool
 }
@@ -649,7 +650,7 @@ func (m *WazeroModule) InstantiateWithConfig(ctx context.Context, cfg *InstanceC
 		module:    m,
 		instance:  instance,
 		encoder:   m.encoder,
-		decoder:   m.decoder,
+		decoder:   m.decoderForConfig(cfg),
 		compiler:  m.compiler,
 		funcCache: make(map[string]api.Function),
 		liftCache: make(map[string]*cachedLift),
@@ -774,7 +775,7 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 		module:     m,
 		instance:   module,
 		encoder:    m.encoder,
-		decoder:    m.decoder,
+		decoder:    m.decoderForConfig(cfg),
 		compiler:   m.compiler,
 		funcCache:  make(map[string]api.Function),
 		liftCache:  make(map[string]*cachedLift),
@@ -814,6 +815,13 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 	}
 
 	return wazInst, nil
+}
+
+func (m *WazeroModule) decoderForConfig(cfg *InstanceConfig) *transcoder.Decoder {
+	if cfg == nil || cfg.DecodeOptions == (transcoder.DecodeOptions{}) {
+		return m.decoder
+	}
+	return m.decoder.WithOptions(cfg.DecodeOptions)
 }
 
 // WazeroInstance is a running WASM instance.

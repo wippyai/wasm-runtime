@@ -32,8 +32,22 @@ func (m *Module) Compile(ctx context.Context) error {
 	return m.wazeroModule.Compile(ctx, &engine.CompileConfig{})
 }
 
+// Close releases the runtime backing this module.
+// Call this only for modules that own an isolated runtime; modules loaded from a
+// shared Runtime should be released by closing that Runtime instead.
+func (m *Module) Close(ctx context.Context) error {
+	if m == nil || m.runtime == nil {
+		return nil
+	}
+	return m.runtime.Close(ctx)
+}
+
 func (m *Module) Instantiate(ctx context.Context) (*Instance, error) {
-	wazeroInstance, err := m.wazeroModule.InstantiateWithConfig(ctx, &engine.InstanceConfig{})
+	return m.InstantiateWithConfig(ctx, &engine.InstanceConfig{})
+}
+
+func (m *Module) InstantiateWithConfig(ctx context.Context, cfg *engine.InstanceConfig) (*Instance, error) {
+	wazeroInstance, err := m.wazeroModule.InstantiateWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, errors.Instantiation(err)
 	}
@@ -47,17 +61,9 @@ func (m *Module) Instantiate(ctx context.Context) (*Instance, error) {
 // InstantiateWithAsyncify creates an instance with asyncify transformation.
 // Use for components calling async host functions (e.g., WASI HTTP).
 func (m *Module) InstantiateWithAsyncify(ctx context.Context) (*Instance, error) {
-	wazeroInstance, err := m.wazeroModule.InstantiateWithConfig(ctx, &engine.InstanceConfig{
+	return m.InstantiateWithConfig(ctx, &engine.InstanceConfig{
 		EnableAsyncify: true,
 	})
-	if err != nil {
-		return nil, errors.Instantiation(err)
-	}
-
-	return &Instance{
-		module:         m,
-		wazeroInstance: wazeroInstance,
-	}, nil
 }
 
 type Export struct {

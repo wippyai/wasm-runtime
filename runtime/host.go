@@ -264,11 +264,11 @@ func tryExtractFunctionsViaReflection(h any) map[string]any {
 	}
 
 	result := results[0]
-	if !result.IsValid() || (result.Kind() == reflect.Ptr && result.IsNil()) {
+	if !result.IsValid() || (result.Kind() == reflect.Pointer && result.IsNil()) {
 		return nil
 	}
 
-	if result.Kind() == reflect.Ptr {
+	if result.Kind() == reflect.Pointer {
 		result = result.Elem()
 	}
 

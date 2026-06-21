@@ -1386,6 +1386,102 @@ func TestNewInstance_WithBridgeFromModule(t *testing.T) {
 	}
 }
 
+func TestNewInstance_RealModuleBridgeStaleAfterSourceClose(t *testing.T) {
+	ctx := context.Background()
+	rt := wazero.NewRuntime(ctx)
+	defer rt.Close(ctx)
+
+	l := New(rt, Options{})
+
+	mod0Bytes, err := wat.Compile(`(module
+		(global $g (mut i32) (i32.const 0))
+		(func $f (result i32)
+			global.get $g
+			i32.const 1
+			i32.add
+			global.set $g
+			global.get $g)
+		(export "func" (func $f))
+	)`)
+	if err != nil {
+		t.Fatalf("compile source wat: %v", err)
+	}
+	compiled0, err := rt.CompileModule(ctx, mod0Bytes)
+	if err != nil {
+		t.Fatalf("compile source: %v", err)
+	}
+	defer compiled0.Close(ctx)
+
+	mod1Bytes, err := wat.Compile(`(module
+		(import "source" "func" (func $imported (result i32)))
+		(func $call (result i32) (call $imported))
+		(export "call" (func $call))
+	)`)
+	if err != nil {
+		t.Fatalf("compile consumer wat: %v", err)
+	}
+	compiled1, err := rt.CompileModule(ctx, mod1Bytes)
+	if err != nil {
+		t.Fatalf("compile consumer: %v", err)
+	}
+	defer compiled1.Close(ctx)
+
+	instances := []component.CoreInstance{
+		{Parsed: &component.ParsedCoreInstance{
+			Kind:        component.CoreInstanceInstantiate,
+			ModuleIndex: 0,
+		}},
+		{Parsed: &component.ParsedCoreInstance{
+			Kind:        component.CoreInstanceInstantiate,
+			ModuleIndex: 1,
+			Args: []component.CoreInstanceArg{
+				{
+					Kind:          component.CoreInstantiateInstance,
+					Name:          "source",
+					InstanceIndex: 0,
+				},
+			},
+		}},
+	}
+
+	pre := &InstancePre{
+		linker:   l,
+		graph:    component.NewInstanceGraph(instances),
+		compiled: []wazero.CompiledModule{compiled0, compiled1},
+		component: &component.ValidatedComponent{
+			Raw: &component.Component{},
+		},
+	}
+
+	inst1, err := pre.NewInstance(ctx)
+	if err != nil {
+		t.Fatalf("first NewInstance: %v", err)
+	}
+	firstResult, err := inst1.Modules()[1].ExportedFunction("call").Call(ctx)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if len(firstResult) != 1 || firstResult[0] != 1 {
+		t.Fatalf("first call result = %v, want [1]", firstResult)
+	}
+	inst1.Close(ctx)
+
+	inst2, err := pre.NewInstance(ctx)
+	if err != nil {
+		t.Fatalf("second NewInstance: %v", err)
+	}
+	defer inst2.Close(ctx)
+
+	secondResult, err := inst2.Modules()[1].ExportedFunction("call").Call(ctx)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if len(secondResult) != 1 || secondResult[0] != 0 {
+		t.Fatalf("second call result = %v, want [0] from stale closed source bridge", secondResult)
+	}
+	t.Log("real-module synthetic bridge did not bind to the fresh second source instance")
+}
+
 func TestNewInstance_WithFromExports(t *testing.T) {
 	ctx := context.Background()
 	rt := wazero.NewRuntime(ctx)
@@ -4098,6 +4194,94 @@ func TestCreateSharedMemoryHandler_NoInstanceFallback(t *testing.T) {
 
 	if !handlerCalled {
 		t.Error("handler should be called even without instance")
+	}
+}
+
+func TestCollectVirtualExports_BoundHostFuncUsesExplicitMemory(t *testing.T) {
+	ctx := context.Background()
+	rt := wazero.NewRuntime(ctx)
+	defer rt.Close(ctx)
+
+	boundBytes, err := wat.Compile(`(module
+		(memory (export "memory") 1)
+		(func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+			i32.const 64)
+	)`)
+	if err != nil {
+		t.Fatalf("compile bound module: %v", err)
+	}
+	boundCompiled, err := rt.CompileModule(ctx, boundBytes)
+	if err != nil {
+		t.Fatalf("compile bound wasm: %v", err)
+	}
+	boundMod, err := rt.InstantiateModule(ctx, boundCompiled, wazero.NewModuleConfig().WithName("bound"))
+	if err != nil {
+		t.Fatalf("instantiate bound module: %v", err)
+	}
+	defer boundMod.Close(ctx)
+	if ok := boundMod.Memory().Write(8, []byte{0xA5}); !ok {
+		t.Fatal("write bound memory marker")
+	}
+
+	callerBytes, err := wat.Compile(`(module
+		(memory (export "memory") 1)
+	)`)
+	if err != nil {
+		t.Fatalf("compile caller module: %v", err)
+	}
+	callerCompiled, err := rt.CompileModule(ctx, callerBytes)
+	if err != nil {
+		t.Fatalf("compile caller wasm: %v", err)
+	}
+	callerMod, err := rt.InstantiateModule(ctx, callerCompiled, wazero.NewModuleConfig().WithName("caller"))
+	if err != nil {
+		t.Fatalf("instantiate caller module: %v", err)
+	}
+	defer callerMod.Close(ctx)
+	if ok := callerMod.Memory().Write(8, []byte{0x5A}); !ok {
+		t.Fatal("write caller memory marker")
+	}
+
+	var sawMarker byte
+	var sawAllocator bool
+	def := &FuncDef{
+		Name:        "get-random-bytes",
+		ParamTypes:  []api.ValueType{api.ValueTypeI64, api.ValueTypeI32},
+		ResultTypes: nil,
+		Handler: func(ctx context.Context, mod api.Module, stack []uint64) {
+			data, ok := mod.Memory().Read(8, 1)
+			if !ok {
+				t.Fatal("handler could not read module memory")
+			}
+			sawMarker = data[0]
+			alloc := mod.ExportedFunction("cabi_realloc")
+			sawAllocator = alloc != nil
+		},
+	}
+
+	virt := NewVirtualInstance("wasi:random/random@0.2.3")
+	virt.Define("get-random-bytes", Entity{
+		Kind: EntityFunc,
+		Source: BoundHostFunc{
+			Def:       def,
+			Memory:    boundMod.Memory(),
+			Allocator: boundMod.ExportedFunction("cabi_realloc"),
+		},
+	})
+
+	inst := &Instance{}
+	exports := inst.collectVirtualExports(virt, "wasi:random/random@0.2.3")
+	if len(exports) != 1 {
+		t.Fatalf("got %d exports, want 1", len(exports))
+	}
+
+	exports[0].Fn(ctx, callerMod, []uint64{4, 32})
+
+	if sawMarker != 0xA5 {
+		t.Fatalf("handler read marker 0x%02x, want bound memory marker 0xA5", sawMarker)
+	}
+	if !sawAllocator {
+		t.Fatal("handler did not see bound allocator")
 	}
 }
 
