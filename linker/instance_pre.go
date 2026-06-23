@@ -419,6 +419,19 @@ func (pre *InstancePre) resolveBindings() error {
 			return instError("compile", mi.InstanceIndex, "", "module index out of range", nil)
 		}
 
+		compiled := pre.compiled[mi.ModuleIndex]
+		imports := compiled.ImportedFunctions()
+
+		// A reactor start-shim's empty-module import is rewritten to RootModuleName;
+		// route its empty-named arg there too so it resolves as arg-provided.
+		importsRoot := false
+		for _, imp := range imports {
+			if modName, _, _ := imp.Import(); modName == RootModuleName {
+				importsRoot = true
+				break
+			}
+		}
+
 		// Collect module names provided by Args (other core instances or named modules).
 		// These imports are satisfied at instantiation time, not by host functions.
 		argsProvided := make(map[string]bool, len(mi.Args))
@@ -426,12 +439,12 @@ func (pre *InstancePre) resolveBindings() error {
 			name := arg.Name
 			if name == "" {
 				name = EmptyModuleName
+				if importsRoot {
+					name = RootModuleName
+				}
 			}
 			argsProvided[name] = true
 		}
-
-		compiled := pre.compiled[mi.ModuleIndex]
-		imports := compiled.ImportedFunctions()
 
 		for _, imp := range imports {
 			moduleName, funcName, _ := imp.Import()

@@ -405,6 +405,12 @@ func (inst *Instance) instantiateModule(
 		argName := arg.Name
 		if argName == "" {
 			argName = EmptyModuleName
+			// A reactor start-shim's empty-module import is rewritten to
+			// RootModuleName; route its provider bridge there too so it does not
+			// collide with the indirect-call shim's EmptyModuleName bridge.
+			if _, ok := expectedFuncs[RootModuleName]; ok {
+				argName = RootModuleName
+			}
 		}
 
 		var source *coreInstance
@@ -675,7 +681,7 @@ func (inst *Instance) createBridgeFrom(ctx context.Context, name string, source 
 				for _, exp := range exports {
 					builder.NewFunctionBuilder().
 						WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
-						Export(exp.Name)
+						Export(exportName(exp.Name))
 				}
 				return builder.Instantiate(ctx)
 			})
@@ -689,7 +695,7 @@ func (inst *Instance) createBridgeFrom(ctx context.Context, name string, source 
 			for _, exp := range exports {
 				builder.NewFunctionBuilder().
 					WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
-					Export(exp.Name)
+					Export(exportName(exp.Name))
 			}
 			return builder.Instantiate(ctx)
 		})
@@ -905,7 +911,7 @@ func (inst *Instance) createSynthBridgeFrom(ctx context.Context, name string, vi
 			for _, exp := range exports {
 				hostBuilder.NewFunctionBuilder().
 					WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
-					Export(exp.Name)
+					Export(exportName(exp.Name))
 			}
 			return hostBuilder.Instantiate(ctx)
 		})
@@ -948,7 +954,7 @@ func (inst *Instance) createSynthBridgeFrom(ctx context.Context, name string, vi
 	_, synthCreated, err := inst.pre.linker.getOrReplaceHostModule(ctx, name, validator, func() (api.Module, error) {
 		builder := newSynthModuleBuilder(hostModName)
 		for _, exp := range exports {
-			builder.addFunc(exp.Name, exp.ParamTypes, exp.ResultTypes)
+			builder.addFunc(exportName(exp.Name), exp.ParamTypes, exp.ResultTypes)
 		}
 
 		if tableSource != nil {
@@ -1075,7 +1081,7 @@ func (inst *Instance) createSynthBridgeFromModule(ctx context.Context, name stri
 			for _, exp := range exports {
 				builder.NewFunctionBuilder().
 					WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
-					Export(exp.Name)
+					Export(exportName(exp.Name))
 			}
 			return builder.Instantiate(ctx)
 		})
@@ -1106,7 +1112,7 @@ func (inst *Instance) createSynthBridgeFromModule(ctx context.Context, name stri
 
 		// Add functions for import from host module
 		for _, exp := range exports {
-			builder.addFunc(exp.Name, exp.ParamTypes, exp.ResultTypes)
+			builder.addFunc(exportName(exp.Name), exp.ParamTypes, exp.ResultTypes)
 		}
 
 		// Import memory from source module
