@@ -90,14 +90,14 @@ func TestRewriteEmptyModuleNames_ReplacesEmpty(t *testing.T) {
 
 func TestHasEmptyModuleNameImport_True(t *testing.T) {
 	wasm := buildModuleWithEmptyModuleNameImport()
-	if !hasEmptyModuleNameImport(wasm) {
+	if !hasEmptyImportName(wasm) {
 		t.Error("expected to detect empty module name import")
 	}
 }
 
 func TestHasEmptyModuleNameImport_False(t *testing.T) {
 	wasm := buildTestModuleWithGlobalImport("env", "var", 0x7f, false)
-	if hasEmptyModuleNameImport(wasm) {
+	if hasEmptyImportName(wasm) {
 		t.Error("expected no empty module name import")
 	}
 }
@@ -140,5 +140,23 @@ func TestRewriteEmptyModuleNames_PreservesOtherSections(t *testing.T) {
 	// Should still have export section (0x07)
 	if !bytes.Contains(result, []byte{0x07, 0x01, 0x00}) {
 		t.Error("expected export section preserved")
+	}
+}
+
+func TestRewriteEmptyModuleNames_ReplacesEmptyFieldName(t *testing.T) {
+	// Module with a single import ("", "") of a function (the reactor start-shim shape).
+	wasm := append([]byte{}, testMagicVersion...)
+	wasm = append(wasm, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00) // type () -> ()
+	importSection := []byte{0x01, 0x00, 0x00, 0x00, 0x00}   // count1, modlen0, namelen0, func, type0
+	wasm = append(wasm, 0x02)
+	wasm = append(wasm, EncodeULEB128(uint32(len(importSection)))...)
+	wasm = append(wasm, importSection...)
+
+	result := RewriteEmptyModuleNames(wasm)
+
+	wantModule := append([]byte{byte(len(RootModuleName))}, []byte(RootModuleName)...)
+	wantField := append([]byte{byte(len(EmptyFieldName))}, []byte(EmptyFieldName)...)
+	if !bytes.Contains(result, append(wantModule, wantField...)) {
+		t.Fatalf("expected import rewritten to (%q, %q); got % x", RootModuleName, EmptyFieldName, result)
 	}
 }
