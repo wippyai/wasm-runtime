@@ -4,6 +4,7 @@ import (
 	"math"
 	"reflect"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 	"unsafe"
 
@@ -1235,6 +1236,30 @@ func (e *Encoder) flattenVariant(v *wit.Variant, value any, mem Memory, alloc Al
 		Build()
 }
 
+// witFieldToGoName converts a WIT kebab-case field name to the Go PascalCase
+// field name a host struct conventionally uses (e.g. "descriptor-type" ->
+// "DescriptorType", "name" -> "Name").
+func witFieldToGoName(witName string) string {
+	parts := strings.Split(witName, "-")
+	var b strings.Builder
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		b.WriteString(strings.ToUpper(p[:1]))
+		b.WriteString(p[1:])
+	}
+	return b.String()
+}
+
+// StoreToMemory writes a single value to guest linear memory at addr using the
+// Canonical ABI memory layout (correct sizes, alignment, and out-of-line
+// allocations). This is the memory-layout counterpart to LowerToStack and is the
+// correct primitive for retptr-style results.
+func (e *Encoder) StoreToMemory(witType wit.Type, value any, addr uint32, mem Memory, alloc Allocator, allocList *AllocationList) error {
+	return e.storeValue(witType, value, addr, mem, alloc, allocList, nil)
+}
+
 func (e *Encoder) storeValue(witType wit.Type, value any, addr uint32, mem Memory, alloc Allocator, allocList *AllocationList, path []string) error {
 	switch t := witType.(type) {
 	case wit.Bool:
@@ -1379,17 +1404,9 @@ func (e *Encoder) storeValue(witType wit.Type, value any, addr uint32, mem Memor
 func (e *Encoder) storeTypeDef(t *wit.TypeDef, value any, addr uint32, mem Memory, alloc Allocator, allocList *AllocationList, path []string) error {
 	switch kind := t.Kind.(type) {
 	case *wit.Record:
-		m, ok := value.(map[string]any)
-		if !ok {
-			return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "map[string]any")
-		}
 		lc := e.compiler.layout
 		recordLayout := lc.Calculate(t)
-		for _, field := range kind.Fields {
-			fieldVal, exists := m[field.Name]
-			if !exists {
-				return errors.FieldMissing(errors.PhaseEncode, path, field.Name)
-			}
+		storeField := func(field wit.Field, fieldVal any) error {
 			fieldAddr := addr + recordLayout.FieldOffs[field.Name]
 			if err := e.storeValue(field.Type, fieldVal, fieldAddr, mem, alloc, allocList, nil); err != nil {
 				if path != nil {
@@ -1401,8 +1418,43 @@ func (e *Encoder) storeTypeDef(t *wit.TypeDef, value any, addr uint32, mem Memor
 				}
 				return err
 			}
+			return nil
 		}
-		return nil
+		if m, ok := value.(map[string]any); ok {
+			for _, field := range kind.Fields {
+				fieldVal, exists := m[field.Name]
+				if !exists {
+					return errors.FieldMissing(errors.PhaseEncode, path, field.Name)
+				}
+				if err := storeField(field, fieldVal); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		// Host handlers return native Go structs; map record fields to struct
+		// fields BY NAME (WIT kebab -> Go PascalCase), not position, since Go
+		// struct field order is not guaranteed to match the WIT record order.
+		rv := reflect.ValueOf(value)
+		for rv.Kind() == reflect.Pointer {
+			if rv.IsNil() {
+				return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "non-nil struct or map[string]any")
+			}
+			rv = rv.Elem()
+		}
+		if rv.Kind() == reflect.Struct {
+			for _, field := range kind.Fields {
+				fv := rv.FieldByName(witFieldToGoName(field.Name))
+				if !fv.IsValid() || !fv.CanInterface() {
+					return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "struct field "+witFieldToGoName(field.Name))
+				}
+				if err := storeField(field, fv.Interface()); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "map[string]any or struct")
 
 	case *wit.List:
 		rv := reflect.ValueOf(value)
@@ -1581,11 +1633,32 @@ func (e *Encoder) storeTypeDef(t *wit.TypeDef, value any, addr uint32, mem Memor
 			Build()
 
 	case *wit.Enum:
+		discSize := abi.DiscriminantSize(len(kind.Cases))
+		// Host handlers represent an enum as its integer discriminant; component
+		// callers use the case-name string. Accept both.
+		if rv := reflect.ValueOf(value); rv.IsValid() && (rv.CanInt() || rv.CanUint()) {
+			var idx uint64
+			if rv.CanInt() {
+				idx = uint64(rv.Int())
+			} else {
+				idx = rv.Uint()
+			}
+			if idx >= uint64(len(kind.Cases)) {
+				return errors.InvalidDiscriminant(errors.PhaseEncode, path, uint32(idx), uint32(len(kind.Cases)-1))
+			}
+			switch discSize {
+			case 1:
+				return mem.WriteU8(addr, uint8(idx))
+			case 2:
+				return mem.WriteU16(addr, uint16(idx))
+			default:
+				return mem.WriteU32(addr, uint32(idx))
+			}
+		}
 		caseName, ok := value.(string)
 		if !ok {
-			return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "string")
+			return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "string or integer")
 		}
-		discSize := abi.DiscriminantSize(len(kind.Cases))
 		for i, c := range kind.Cases {
 			if c.Name == caseName {
 				switch discSize {
@@ -1634,6 +1707,20 @@ func (e *Encoder) storeTypeDef(t *wit.TypeDef, value any, addr uint32, mem Memor
 			}
 		}
 		return nil
+
+	case *wit.Own:
+		h, ok := coerceToUint32(value)
+		if !ok {
+			return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "uint32 handle")
+		}
+		return mem.WriteU32(addr, h)
+
+	case *wit.Borrow:
+		h, ok := coerceToUint32(value)
+		if !ok {
+			return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "uint32 handle")
+		}
+		return mem.WriteU32(addr, h)
 
 	case wit.Type:
 		return e.storeValue(kind, value, addr, mem, alloc, allocList, path)

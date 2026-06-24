@@ -545,6 +545,15 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 
 	results := w.handler.Call(args)
 
+	// Host handlers follow the Go (value, error) convention, but the Canonical ABI
+	// encoder represents a result<T,E> as map[string]any{"ok"/"err"}. Fold the two
+	// returns into that representation before lowering; otherwise the raw ok value
+	// fails to encode and the result area is left uninitialized.
+	if w.hasResultType() && len(results) == 2 {
+		folded := foldResultValue(results[0].Interface(), results[1].Interface())
+		results = []reflect.Value{reflect.ValueOf(folded)}
+	}
+
 	if w.usesRetptr() {
 		offset := uint32(0)
 		for i, result := range results {
@@ -604,6 +613,65 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 	}
 }
 
+// foldResultValue maps a host handler's (value, error) returns onto the
+// map[string]any{"ok"/"err"} representation the Canonical ABI encoder expects for
+// a result<T,E>. On success the ok payload is the value; on failure the err
+// payload is the host error's WIT representation.
+func foldResultValue(okVal, errVal any) any {
+	if isNilHandlerError(errVal) {
+		return map[string]any{"ok": okVal}
+	}
+	return map[string]any{"err": handlerErrPayload(errVal)}
+}
+
+func isNilHandlerError(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Slice, reflect.Map, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+// handlerErrPayload extracts the WIT error payload from a host error value. For
+// result<_, error-code> the payload is the enum discriminant, conventionally a
+// "Code" field on the host error struct; integer error values are used directly.
+func handlerErrPayload(errVal any) any {
+	// Host error types may expose their exact WIT error payload (e.g. a variant
+	// like stream-error). Prefer that over structural reflection.
+	if p, ok := errVal.(interface{ WITErrorPayload() any }); ok {
+		return p.WITErrorPayload()
+	}
+	rv := reflect.ValueOf(errVal)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return uint32(0)
+		}
+		rv = rv.Elem()
+	}
+	if rv.Kind() == reflect.Struct {
+		if f := rv.FieldByName("Code"); f.IsValid() {
+			if f.CanUint() {
+				return f.Uint()
+			}
+			if f.CanInt() {
+				return uint64(f.Int())
+			}
+		}
+	}
+	if rv.CanUint() {
+		return rv.Uint()
+	}
+	if rv.CanInt() {
+		return uint64(rv.Int())
+	}
+	return uint32(0)
+}
+
 func (w *LowerWrapper) storeResultToMemoryWithAlloc(witType wit.Type, value any, addr uint32, mem wasmruntime.Memory, alloc wasmruntime.Allocator) error {
 	switch witType.(type) {
 	case wit.String:
@@ -636,16 +704,9 @@ func (w *LowerWrapper) storeResultToMemoryWithAlloc(witType wit.Type, value any,
 		}
 		return nil
 	default:
-		flat, err := w.encoder.EncodeParams([]wit.Type{witType}, []any{value}, mem, alloc, nil)
-		if err != nil {
-			return err
-		}
-		for i, v := range flat {
-			if err := mem.WriteU32(addr+uint32(i*4), uint32(v)); err != nil {
-				return err
-			}
-		}
-		return nil
+		allocList := transcoder.NewAllocationList()
+		defer allocList.Release() // allocations are owned by the WASM caller
+		return w.encoder.StoreToMemory(witType, value, addr, mem, alloc, allocList)
 	}
 }
 
