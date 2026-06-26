@@ -479,3 +479,182 @@ func TestTypesHost_DescriptorAdvise(t *testing.T) {
 		t.Error("expected error for invalid handle")
 	}
 }
+
+func TestTypesHost_DescriptorWrite(t *testing.T) {
+	tempDir := t.TempDir()
+	testFile := filepath.Join(tempDir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("hello"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	handle := resources.Add(preview2.NewDescriptorResource(testFile, false, false))
+
+	n, fsErr := host.MethodDescriptorWrite(ctx, handle, []byte("world"), 0)
+	if fsErr != nil {
+		t.Fatalf("unexpected error: %v", fsErr)
+	}
+	if n != 5 {
+		t.Errorf("expected 5 bytes written, got %d", n)
+	}
+
+	data, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("failed to read test file: %v", err)
+	}
+	if string(data) != "world" {
+		t.Errorf("expected 'world', got '%s'", data)
+	}
+
+	_, fsErr = host.MethodDescriptorWrite(ctx, 9999, []byte("x"), 0)
+	if fsErr == nil {
+		t.Fatal("expected error for invalid handle")
+	}
+	if fsErr.Code != ErrorBadDescriptor {
+		t.Errorf("expected ErrorBadDescriptor, got %d", fsErr.Code)
+	}
+}
+
+func TestTypesHost_DescriptorSeek(t *testing.T) {
+	tempDir := t.TempDir()
+	testFile := filepath.Join(tempDir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("hello world"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	handle := resources.Add(preview2.NewDescriptorResource(testFile, false, true))
+
+	pos, fsErr := host.MethodDescriptorSeek(ctx, handle, 6, 0)
+	if fsErr != nil {
+		t.Fatalf("unexpected error: %v", fsErr)
+	}
+	if pos != 6 {
+		t.Errorf("expected position 6, got %d", pos)
+	}
+
+	_, fsErr = host.MethodDescriptorSeek(ctx, 9999, 0, 0)
+	if fsErr == nil {
+		t.Fatal("expected error for invalid handle")
+	}
+	if fsErr.Code != ErrorBadDescriptor {
+		t.Errorf("expected ErrorBadDescriptor, got %d", fsErr.Code)
+	}
+}
+
+func TestTypesHost_DescriptorSetSize(t *testing.T) {
+	tempDir := t.TempDir()
+	testFile := filepath.Join(tempDir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("hello world"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	handle := resources.Add(preview2.NewDescriptorResource(testFile, false, false))
+
+	fsErr := host.MethodDescriptorSetSize(ctx, handle, 5)
+	if fsErr != nil {
+		t.Fatalf("unexpected error: %v", fsErr)
+	}
+
+	info, err := os.Stat(testFile)
+	if err != nil {
+		t.Fatalf("failed to stat test file: %v", err)
+	}
+	if info.Size() != 5 {
+		t.Errorf("expected size 5, got %d", info.Size())
+	}
+
+	fsErr = host.MethodDescriptorSetSize(ctx, 9999, 5)
+	if fsErr == nil {
+		t.Fatal("expected error for invalid handle")
+	}
+	if fsErr.Code != ErrorBadDescriptor {
+		t.Errorf("expected ErrorBadDescriptor, got %d", fsErr.Code)
+	}
+}
+
+func TestTypesHost_DescriptorMetadataHash(t *testing.T) {
+	tempDir := t.TempDir()
+	testFile := filepath.Join(tempDir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("hello world"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	handle := resources.Add(preview2.NewDescriptorResource(testFile, false, true))
+
+	hash, fsErr := host.MethodDescriptorMetadataHash(ctx, handle)
+	if fsErr != nil {
+		t.Fatalf("unexpected error: %v", fsErr)
+	}
+	if hash == 0 {
+		t.Error("expected non-zero metadata hash")
+	}
+
+	_, fsErr = host.MethodDescriptorMetadataHash(ctx, 9999)
+	if fsErr == nil {
+		t.Fatal("expected error for invalid handle")
+	}
+	if fsErr.Code != ErrorBadDescriptor {
+		t.Errorf("expected ErrorBadDescriptor, got %d", fsErr.Code)
+	}
+}
+
+func TestTypesHost_ResourceDropDescriptor(t *testing.T) {
+	tempDir := t.TempDir()
+	testFile := filepath.Join(tempDir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	handle := resources.Add(preview2.NewDescriptorResource(testFile, false, true))
+
+	if _, ok := resources.Get(handle); !ok {
+		t.Fatal("descriptor should be in table before drop")
+	}
+
+	host.ResourceDropDescriptor(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Fatal("descriptor should be removed from table after drop")
+	}
+}
+
+func TestTypesHost_ResourceDropDirectoryEntryStream(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	entries := []preview2.DirectoryEntry{
+		{Name: "file1.txt", Type: uint8(DescriptorTypeRegularFile)},
+	}
+	stream := preview2.NewDirectoryEntryStreamResource(entries)
+	handle := resources.Add(stream)
+
+	if _, ok := resources.Get(handle); !ok {
+		t.Fatal("stream should be in table before drop")
+	}
+
+	host.ResourceDropDirectoryEntryStream(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Fatal("stream should be removed from table after drop")
+	}
+}
