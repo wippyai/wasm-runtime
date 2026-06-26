@@ -1,7 +1,7 @@
 // Package sockets implements WASI socket interfaces for network I/O.
 //
 // Implements:
-//   - wasi:sockets/network@0.2.0 - Network instance
+//   - wasi:sockets/instance-network@0.2.0 - Network instance
 //   - wasi:sockets/tcp@0.2.0 - TCP sockets
 //   - wasi:sockets/tcp-create-socket@0.2.0 - TCP socket creation
 //   - wasi:sockets/udp@0.2.0 - UDP sockets
