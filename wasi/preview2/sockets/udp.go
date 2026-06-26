@@ -462,3 +462,41 @@ func (h *UDPHost) MethodOutgoingDatagramStreamSubscribe(_ context.Context, _ uin
 	pollable.SetReady(true)
 	return h.resources.Add(pollable)
 }
+
+func (h *UDPHost) ResourceDropUDPSocket(_ context.Context, self uint32) {
+	h.resources.Remove(self)
+}
+
+func (h *UDPHost) ResourceDropIncomingDatagramStream(_ context.Context, self uint32) {
+	h.resources.Remove(self)
+}
+
+func (h *UDPHost) ResourceDropOutgoingDatagramStream(_ context.Context, self uint32) {
+	h.resources.Remove(self)
+}
+
+func (h *UDPHost) Register() map[string]any {
+	return map[string]any{
+		"[method]udp-socket.start-bind":               h.MethodUDPSocketStartBind,
+		"[method]udp-socket.finish-bind":              h.MethodUDPSocketFinishBind,
+		"[method]udp-socket.stream":                   h.MethodUDPSocketStream,
+		"[method]udp-socket.address-family":           h.MethodUDPSocketAddressFamily,
+		"[method]udp-socket.local-address":            h.MethodUDPSocketLocalAddress,
+		"[method]udp-socket.remote-address":           h.MethodUDPSocketRemoteAddress,
+		"[method]udp-socket.subscribe":                h.MethodUDPSocketSubscribe,
+		"[method]udp-socket.receive-buffer-size":      h.MethodUDPSocketReceiveBufferSize,
+		"[method]udp-socket.set-receive-buffer-size":  h.MethodUDPSocketSetReceiveBufferSize,
+		"[method]udp-socket.send-buffer-size":         h.MethodUDPSocketSendBufferSize,
+		"[method]udp-socket.set-send-buffer-size":     h.MethodUDPSocketSetSendBufferSize,
+		"[method]udp-socket.unicast-hop-limit":        h.MethodUDPSocketUnicastHopLimit,
+		"[method]udp-socket.set-unicast-hop-limit":    h.MethodUDPSocketSetUnicastHopLimit,
+		"[method]incoming-datagram-stream.receive":    h.MethodIncomingDatagramStreamReceive,
+		"[method]incoming-datagram-stream.subscribe":  h.MethodIncomingDatagramStreamSubscribe,
+		"[method]outgoing-datagram-stream.check-send": h.MethodOutgoingDatagramStreamCheckSend,
+		"[method]outgoing-datagram-stream.send":       h.MethodOutgoingDatagramStreamSend,
+		"[method]outgoing-datagram-stream.subscribe":  h.MethodOutgoingDatagramStreamSubscribe,
+		"[resource-drop]udp-socket":                   h.ResourceDropUDPSocket,
+		"[resource-drop]incoming-datagram-stream":     h.ResourceDropIncomingDatagramStream,
+		"[resource-drop]outgoing-datagram-stream":     h.ResourceDropOutgoingDatagramStream,
+	}
+}

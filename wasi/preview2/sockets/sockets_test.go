@@ -595,3 +595,52 @@ func TestTCPHost_ResourceDrop_InvalidHandle(t *testing.T) {
 
 	host.ResourceDropTCPSocket(ctx, 9999)
 }
+
+func TestUDPHost_ResourceDropSocket(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewUDPHost(resources)
+	ctx := context.Background()
+
+	handle, err := NewUDPCreateSocketHost(resources).CreateUDPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	host.ResourceDropUDPSocket(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("socket should be removed after drop")
+	}
+}
+
+func TestUDPHost_ResourceDropIncomingDatagramStream(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewUDPHost(resources)
+	ctx := context.Background()
+
+	socket := preview2.NewUDPSocketResource(AddressFamilyIPv4)
+	stream := preview2.NewIncomingDatagramStreamResource(socket, "", 0)
+	handle := resources.Add(stream)
+
+	host.ResourceDropIncomingDatagramStream(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("stream should be removed after drop")
+	}
+}
+
+func TestUDPHost_ResourceDropOutgoingDatagramStream(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewUDPHost(resources)
+	ctx := context.Background()
+
+	socket := preview2.NewUDPSocketResource(AddressFamilyIPv4)
+	stream := preview2.NewOutgoingDatagramStreamResource(socket, "", 0)
+	handle := resources.Add(stream)
+
+	host.ResourceDropOutgoingDatagramStream(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("stream should be removed after drop")
+	}
+}
