@@ -390,7 +390,11 @@ func (h *TypesHost) MethodDescriptorSeek(_ context.Context, self uint32, offset 
 	return uint64(newPosition), nil
 }
 
-func (h *TypesHost) MethodDescriptorGetFlags(_ context.Context, _ uint32) (uint32, *Error) {
+func (h *TypesHost) MethodDescriptorGetFlags(_ context.Context, self uint32) (uint32, *Error) {
+	if _, err := h.getDescriptor(self); err != nil {
+		return 0, err
+	}
+
 	return 0, nil
 }
 
@@ -493,11 +497,39 @@ func (h *TypesHost) MethodDescriptorReadDirectory(_ context.Context, self uint32
 	return handle, nil
 }
 
-func (h *TypesHost) MethodDescriptorSync(_ context.Context, _ uint32) *Error {
-	return nil
+func (h *TypesHost) MethodDescriptorSync(_ context.Context, self uint32) *Error {
+	desc, err := h.getDescriptor(self)
+	if err != nil {
+		return err
+	}
+
+	return syncDescriptor(desc)
 }
 
-func (h *TypesHost) MethodDescriptorSyncData(_ context.Context, _ uint32) *Error {
+func (h *TypesHost) MethodDescriptorSyncData(_ context.Context, self uint32) *Error {
+	desc, err := h.getDescriptor(self)
+	if err != nil {
+		return err
+	}
+
+	return syncDescriptor(desc)
+}
+
+func syncDescriptor(desc *preview2.DescriptorResource) *Error {
+	if desc.IsDir() {
+		return nil
+	}
+
+	f, osErr := os.Open(desc.Path())
+	if osErr != nil {
+		return mapOSError(osErr)
+	}
+	defer f.Close()
+
+	if osErr := f.Sync(); osErr != nil {
+		return mapOSError(osErr)
+	}
+
 	return nil
 }
 
@@ -898,7 +930,11 @@ func (h *TypesHost) MethodDescriptorSetSize(_ context.Context, self uint32, size
 	return nil
 }
 
-func (h *TypesHost) MethodDescriptorAdvise(_ context.Context, _ uint32, _ uint64, _ uint64, _ uint8) *Error {
+func (h *TypesHost) MethodDescriptorAdvise(_ context.Context, self uint32, _ uint64, _ uint64, _ uint8) *Error {
+	if _, err := h.getDescriptor(self); err != nil {
+		return err
+	}
+
 	return nil
 }
 

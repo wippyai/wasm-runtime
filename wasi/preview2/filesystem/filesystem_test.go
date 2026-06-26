@@ -390,3 +390,92 @@ func TestError_Error(t *testing.T) {
 		})
 	}
 }
+
+func TestTypesHost_DescriptorSync(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	tmpFile := filepath.Join(t.TempDir(), "test.txt")
+	if err := os.WriteFile(tmpFile, []byte("test"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	handle := resources.Add(preview2.NewDescriptorResource(tmpFile, false, true))
+
+	if err := host.MethodDescriptorSync(ctx, handle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := host.MethodDescriptorSync(ctx, 9999); err == nil {
+		t.Error("expected error for invalid handle")
+	}
+}
+
+func TestTypesHost_DescriptorSyncData(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	tmpFile := filepath.Join(t.TempDir(), "test.txt")
+	if err := os.WriteFile(tmpFile, []byte("test"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	handle := resources.Add(preview2.NewDescriptorResource(tmpFile, false, true))
+
+	if err := host.MethodDescriptorSyncData(ctx, handle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := host.MethodDescriptorSyncData(ctx, 9999); err == nil {
+		t.Error("expected error for invalid handle")
+	}
+}
+
+func TestTypesHost_DescriptorGetFlags(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	tmpFile := filepath.Join(t.TempDir(), "test.txt")
+	if err := os.WriteFile(tmpFile, []byte("test"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	handle := resources.Add(preview2.NewDescriptorResource(tmpFile, false, true))
+
+	flags, err := host.MethodDescriptorGetFlags(ctx, handle)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if flags != 0 {
+		t.Errorf("expected flags 0, got %d", flags)
+	}
+
+	_, err = host.MethodDescriptorGetFlags(ctx, 9999)
+	if err == nil {
+		t.Error("expected error for invalid handle")
+	}
+}
+
+func TestTypesHost_DescriptorAdvise(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTypesHost(resources)
+	ctx := context.Background()
+
+	tmpFile := filepath.Join(t.TempDir(), "test.txt")
+	if err := os.WriteFile(tmpFile, []byte("test"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	handle := resources.Add(preview2.NewDescriptorResource(tmpFile, false, true))
+
+	if err := host.MethodDescriptorAdvise(ctx, handle, 0, 100, 0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := host.MethodDescriptorAdvise(ctx, 9999, 0, 100, 0); err == nil {
+		t.Error("expected error for invalid handle")
+	}
+}
