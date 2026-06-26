@@ -105,6 +105,30 @@ func TestExitHost_Namespace(t *testing.T) {
 	}
 }
 
+func TestExitHost_Exit(t *testing.T) {
+	host := NewExitHost()
+	ctx := context.Background()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic from Exit")
+		}
+
+		exitErr, ok := r.(ExitError)
+		if !ok {
+			t.Fatalf("expected ExitError, got %T: %v", r, r)
+		}
+
+		if exitErr.Code != 42 {
+			t.Errorf("expected exit code 42, got %d", exitErr.Code)
+		}
+	}()
+
+	host.Exit(ctx, 42)
+	t.Fatal("should not reach here — Exit should panic")
+}
+
 func TestStdioHost_GetStdin(t *testing.T) {
 	resources := preview2.NewResourceTable()
 	stdin := preview2.NewInputStreamResource([]byte("test input"))
