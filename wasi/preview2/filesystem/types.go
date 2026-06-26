@@ -520,8 +520,11 @@ func syncDescriptor(desc *preview2.DescriptorResource) *Error {
 		return nil
 	}
 
-	f, osErr := os.Open(desc.Path())
+	f, osErr := os.OpenFile(desc.Path(), os.O_WRONLY, 0)
 	if osErr != nil {
+		if os.IsPermission(osErr) {
+			return nil
+		}
 		return mapOSError(osErr)
 	}
 	defer f.Close()
