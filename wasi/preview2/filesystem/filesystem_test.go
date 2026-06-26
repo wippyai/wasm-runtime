@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/wippyai/wasm-runtime/wasi/preview2"
@@ -365,5 +366,27 @@ func TestPreopensHost_Namespace(t *testing.T) {
 	expected := "wasi:filesystem/preopens@0.2.3"
 	if ns != expected {
 		t.Errorf("expected namespace %s, got %s", expected, ns)
+	}
+}
+
+func TestError_Error(t *testing.T) {
+	tests := []struct {
+		name     string
+		contains string
+		code     ErrorCode
+	}{
+		{"access", "access", ErrorAccess},
+		{"bad-descriptor", "bad-descriptor", ErrorBadDescriptor},
+		{"io", "io", ErrorIo},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &Error{Code: tc.code}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.contains) {
+				t.Errorf("expected error message to contain %q, got %q", tc.contains, msg)
+			}
+		})
 	}
 }

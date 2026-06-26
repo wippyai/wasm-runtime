@@ -71,7 +71,52 @@ const (
 )
 
 func (e *Error) Error() string {
-	return "filesystem error"
+	codes := map[ErrorCode]string{
+		ErrorAccess:              "access",
+		ErrorWouldBlock:          "would-block",
+		ErrorAlready:             "already",
+		ErrorBadDescriptor:       "bad-descriptor",
+		ErrorBusy:                "busy",
+		ErrorDeadlock:            "deadlock",
+		ErrorQuota:               "quota",
+		ErrorExist:               "exist",
+		ErrorFileTooLarge:        "file-too-large",
+		ErrorIllegalByteSequence: "illegal-byte-sequence",
+		ErrorInProgress:          "in-progress",
+		ErrorInterrupted:         "interrupted",
+		ErrorInvalid:             "invalid",
+		ErrorIo:                  "io",
+		ErrorIsDirectory:         "is-directory",
+		ErrorLoop:                "loop",
+		ErrorTooManyLinks:        "too-many-links",
+		ErrorMessageSize:         "message-size",
+		ErrorNameTooLong:         "name-too-long",
+		ErrorNoDevice:            "no-device",
+		ErrorNoEntry:             "no-entry",
+		ErrorNoLock:              "no-lock",
+		ErrorInsufficientMemory:  "insufficient-memory",
+		ErrorInsufficientSpace:   "insufficient-space",
+		ErrorNotDirectory:        "not-directory",
+		ErrorNotEmpty:            "not-empty",
+		ErrorNotRecoverable:      "not-recoverable",
+		ErrorUnsupported:         "unsupported",
+		ErrorNoTty:               "no-tty",
+		ErrorNoSuchDevice:        "no-such-device",
+		ErrorOverflow:            "overflow",
+		ErrorNotPermitted:        "not-permitted",
+		ErrorPipe:                "pipe",
+		ErrorReadOnly:            "read-only",
+		ErrorInvalidSeek:         "invalid-seek",
+		ErrorTextFileBusy:        "text-file-busy",
+		ErrorCrossDevice:         "cross-device",
+	}
+
+	name, ok := codes[e.Code]
+	if !ok {
+		name = "unknown"
+	}
+
+	return "filesystem error: " + name
 }
 
 func mapOSError(err error) *Error {

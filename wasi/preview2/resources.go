@@ -374,10 +374,14 @@ type StreamError struct {
 }
 
 func (e *StreamError) Error() string {
-	if e.Closed {
-		return "stream closed"
+	switch {
+	case e.Closed:
+		return "stream error: closed"
+	case e.LastOpFailed:
+		return "stream error: last-operation-failed"
+	default:
+		return "stream error: unknown"
 	}
-	return "stream error"
 }
 
 // ErrorResource holds an error message that can be retrieved via ToDebugString.
