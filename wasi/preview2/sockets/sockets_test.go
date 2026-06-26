@@ -36,6 +36,20 @@ func TestInstanceNetworkHost_Namespace(t *testing.T) {
 	}
 }
 
+func TestInstanceNetworkHost_ResourceDrop(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewInstanceNetworkHost(resources)
+	ctx := context.Background()
+
+	handle := host.InstanceNetwork(ctx)
+
+	host.ResourceDropNetwork(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("network should be removed after drop")
+	}
+}
+
 func TestTCPCreateSocketHost_CreateTCPSocket(t *testing.T) {
 	resources := preview2.NewResourceTable()
 	host := NewTCPCreateSocketHost(resources)
