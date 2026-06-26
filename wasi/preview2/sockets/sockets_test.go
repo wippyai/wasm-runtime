@@ -2,6 +2,7 @@ package sockets
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -671,5 +672,28 @@ func TestUDPHost_ResourceDropOutgoingDatagramStream(t *testing.T) {
 
 	if _, ok := resources.Get(handle); ok {
 		t.Error("stream should be removed after drop")
+	}
+}
+
+func TestNetworkError_Error(t *testing.T) {
+	tests := []struct {
+		name     string
+		contains string
+		code     NetworkErrorCode
+	}{
+		{"access denied", "access-denied", NetworkErrorAccessDenied},
+		{"invalid argument", "invalid-argument", NetworkErrorInvalidArgument},
+		{"address in use", "address-in-use", NetworkErrorAddressInUse},
+		{"unknown", "unknown", NetworkErrorUnknown},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &NetworkError{Code: tc.code}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.contains) {
+				t.Errorf("expected error message to contain %q, got %q", tc.contains, msg)
+			}
+		})
 	}
 }
