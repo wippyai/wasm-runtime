@@ -448,6 +448,38 @@ func TestOutgoingHandlerHost_Register(t *testing.T) {
 	}
 }
 
+func TestOutgoingHandlerHost_ResourceDropRequestBody(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewOutgoingHandlerHost(resources)
+	ctx := context.Background()
+
+	body := &requestBodyResource{buffer: &bytes.Buffer{}}
+	handle := resources.Add(body)
+
+	host.ResourceDropRequestBody(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("request body should be removed after drop")
+	}
+}
+
+func TestOutgoingHandlerHost_RegisterRequestBodyEntries(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	h := NewOutgoingHandlerHost(resources)
+
+	reg := h.Register()
+	expected := []string{
+		"[method]outgoing-body.write",
+		"[resource-drop]request-body",
+	}
+
+	for _, method := range expected {
+		if _, ok := reg[method]; !ok {
+			t.Errorf("expected method %s in register", method)
+		}
+	}
+}
+
 func TestIncomingResponseMethods(t *testing.T) {
 	ctx := context.Background()
 	resources := preview2.NewResourceTable()

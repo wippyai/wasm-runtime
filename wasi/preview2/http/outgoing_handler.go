@@ -214,6 +214,10 @@ func (h *OutgoingHandlerHost) MethodRequestBodyWrite(_ context.Context, self uin
 	return handle, 0
 }
 
+func (h *OutgoingHandlerHost) ResourceDropRequestBody(_ context.Context, self uint32) {
+	h.resources.Remove(self)
+}
+
 // FutureIncomingResponse resource
 type futureIncomingResponseResource struct {
 	err      error
@@ -415,6 +419,8 @@ func (h *OutgoingHandlerHost) Register() map[string]any {
 		"[method]outgoing-request.headers":             h.MethodOutgoingRequestHeaders,
 		"[method]outgoing-request.body":                h.MethodOutgoingRequestBody,
 		"[resource-drop]outgoing-request":              h.ResourceDropOutgoingRequest,
+		"[method]outgoing-body.write":                  h.MethodRequestBodyWrite,
+		"[resource-drop]request-body":                  h.ResourceDropRequestBody,
 		// Future incoming response methods
 		"[method]future-incoming-response.subscribe": h.MethodFutureIncomingResponseSubscribe,
 		"[method]future-incoming-response.get":       h.MethodFutureIncomingResponseGet,
