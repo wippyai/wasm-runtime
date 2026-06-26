@@ -396,6 +396,21 @@ func TestIPNameLookupHost_Namespace(t *testing.T) {
 	}
 }
 
+func TestIPNameLookupHost_ResourceDrop(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewIPNameLookupHost(resources)
+	ctx := context.Background()
+
+	stream := preview2.NewResolveAddressStreamResource(nil)
+	handle := resources.Add(stream)
+
+	host.ResourceDropResolveAddressStream(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("stream should be removed after drop")
+	}
+}
+
 func TestTCPHost_InvalidHandle(t *testing.T) {
 	resources := preview2.NewResourceTable()
 	host := NewTCPHost(resources)

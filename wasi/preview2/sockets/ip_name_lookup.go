@@ -64,3 +64,16 @@ func (h *IPNameLookupHost) MethodResolveAddressStreamSubscribe(_ context.Context
 	pollable.SetReady(true)
 	return h.resources.Add(pollable)
 }
+
+func (h *IPNameLookupHost) ResourceDropResolveAddressStream(_ context.Context, self uint32) {
+	h.resources.Remove(self)
+}
+
+func (h *IPNameLookupHost) Register() map[string]any {
+	return map[string]any{
+		"resolve-addresses": h.ResolveAddresses,
+		"[method]resolve-address-stream.resolve-next-address": h.MethodResolveAddressStreamResolveNextAddress,
+		"[method]resolve-address-stream.subscribe":            h.MethodResolveAddressStreamSubscribe,
+		"[resource-drop]resolve-address-stream":               h.ResourceDropResolveAddressStream,
+	}
+}
