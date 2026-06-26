@@ -570,3 +570,28 @@ func TestTCPHost_Shutdown(t *testing.T) {
 		t.Fatalf("shutdown: %v", shutdownErr)
 	}
 }
+
+func TestTCPHost_ResourceDrop(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	ctx := context.Background()
+
+	handle, err := NewTCPCreateSocketHost(resources).CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	host.ResourceDropTCPSocket(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("socket should be removed from resource table after drop")
+	}
+}
+
+func TestTCPHost_ResourceDrop_InvalidHandle(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	ctx := context.Background()
+
+	host.ResourceDropTCPSocket(ctx, 9999)
+}

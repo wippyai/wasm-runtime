@@ -618,3 +618,47 @@ func (h *TCPHost) MethodTCPSocketSetKeepAliveCount(_ context.Context, self uint3
 	socket.SetKeepAliveCount(value)
 	return nil
 }
+
+func (h *TCPHost) ResourceDropTCPSocket(_ context.Context, self uint32) {
+	if r, ok := h.resources.Get(self); ok {
+		if socket, ok := r.(*preview2.TCPSocketResource); ok {
+			socket.Drop()
+		}
+	}
+	h.resources.Remove(self)
+}
+
+func (h *TCPHost) Register() map[string]any {
+	return map[string]any{
+		"[method]tcp-socket.start-bind":               h.MethodTCPSocketStartBind,
+		"[method]tcp-socket.finish-bind":              h.MethodTCPSocketFinishBind,
+		"[method]tcp-socket.start-connect":            h.MethodTCPSocketStartConnect,
+		"[method]tcp-socket.finish-connect":           h.MethodTCPSocketFinishConnect,
+		"[method]tcp-socket.start-listen":             h.MethodTCPSocketStartListen,
+		"[method]tcp-socket.finish-listen":            h.MethodTCPSocketFinishListen,
+		"[method]tcp-socket.accept":                   h.MethodTCPSocketAccept,
+		"[method]tcp-socket.shutdown":                 h.MethodTCPSocketShutdown,
+		"[method]tcp-socket.address-family":           h.MethodTCPSocketAddressFamily,
+		"[method]tcp-socket.local-address":            h.MethodTCPSocketLocalAddress,
+		"[method]tcp-socket.remote-address":           h.MethodTCPSocketRemoteAddress,
+		"[method]tcp-socket.is-listening":             h.MethodTCPSocketIsListening,
+		"[method]tcp-socket.subscribe":                h.MethodTCPSocketSubscribe,
+		"[method]tcp-socket.hop-limit":                h.MethodTCPSocketHopLimit,
+		"[method]tcp-socket.set-hop-limit":            h.MethodTCPSocketSetHopLimit,
+		"[method]tcp-socket.receive-buffer-size":      h.MethodTCPSocketReceiveBufferSize,
+		"[method]tcp-socket.set-receive-buffer-size":  h.MethodTCPSocketSetReceiveBufferSize,
+		"[method]tcp-socket.send-buffer-size":         h.MethodTCPSocketSendBufferSize,
+		"[method]tcp-socket.set-send-buffer-size":     h.MethodTCPSocketSetSendBufferSize,
+		"[method]tcp-socket.listen-backlog-size":      h.MethodTCPSocketListenBacklogSize,
+		"[method]tcp-socket.set-listen-backlog-size":  h.MethodTCPSocketSetListenBacklogSize,
+		"[method]tcp-socket.keep-alive-enabled":       h.MethodTCPSocketKeepAliveEnabled,
+		"[method]tcp-socket.set-keep-alive-enabled":   h.MethodTCPSocketSetKeepAliveEnabled,
+		"[method]tcp-socket.keep-alive-idle-time":     h.MethodTCPSocketKeepAliveIdleTime,
+		"[method]tcp-socket.set-keep-alive-idle-time": h.MethodTCPSocketSetKeepAliveIdleTime,
+		"[method]tcp-socket.keep-alive-interval":      h.MethodTCPSocketKeepAliveInterval,
+		"[method]tcp-socket.set-keep-alive-interval":  h.MethodTCPSocketSetKeepAliveInterval,
+		"[method]tcp-socket.keep-alive-count":         h.MethodTCPSocketKeepAliveCount,
+		"[method]tcp-socket.set-keep-alive-count":     h.MethodTCPSocketSetKeepAliveCount,
+		"[resource-drop]tcp-socket":                   h.ResourceDropTCPSocket,
+	}
+}
