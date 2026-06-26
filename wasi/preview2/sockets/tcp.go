@@ -620,11 +620,6 @@ func (h *TCPHost) MethodTCPSocketSetKeepAliveCount(_ context.Context, self uint3
 }
 
 func (h *TCPHost) ResourceDropTCPSocket(_ context.Context, self uint32) {
-	if r, ok := h.resources.Get(self); ok {
-		if socket, ok := r.(*preview2.TCPSocketResource); ok {
-			socket.Drop()
-		}
-	}
 	h.resources.Remove(self)
 }
 
