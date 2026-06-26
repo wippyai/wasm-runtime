@@ -517,19 +517,6 @@ func (e *Encoder) lowerOptionToStack(ct *CompiledType, ptr unsafe.Pointer, stack
 }
 
 func (e *Encoder) lowerResultToStack(ct *CompiledType, ptr unsafe.Pointer, stack []uint64, offset int, mem Memory, alloc Allocator, allocList *AllocationList) (int, error) {
-	// Result[T, E] is represented as Go struct: { Ok *T; Err *E }
-	// Only one field should be non-nil at a time
-	//
-	// Stack layout: [discriminant, payload...]
-	// discriminant: 0 = Ok, 1 = Err
-	// payload: flattened Ok or Err value (padded to max of both)
-
-	type resultLayout struct {
-		Ok  unsafe.Pointer
-		Err unsafe.Pointer
-	}
-	r := (*resultLayout)(ptr)
-
 	okCount := 0
 	if ct.OkType != nil {
 		okCount = ct.OkType.FlatCount
@@ -543,25 +530,47 @@ func (e *Encoder) lowerResultToStack(ct *CompiledType, ptr unsafe.Pointer, stack
 		payloadCount = errCount
 	}
 
-	// Zero the payload slots first
 	for i := 0; i < payloadCount; i++ {
 		stack[offset+1+i] = 0
 	}
 
-	if r.Ok != nil {
-		stack[offset] = 0 // Ok discriminant
-		if ct.OkType != nil {
-			_, err := e.lowerToStack(ct.OkType, r.Ok, stack, offset+1, mem, alloc, allocList)
-			if err != nil {
-				return 0, err
+	rv := reflect.NewAt(ct.GoType, ptr).Elem()
+
+	if rv.Kind() == reflect.Struct {
+		okField := rv.Field(0)
+		errField := rv.Field(1)
+
+		if !okField.IsNil() {
+			stack[offset] = 0
+			if ct.OkType != nil {
+				_, err := e.lowerToStack(ct.OkType, okField.UnsafePointer(), stack, offset+1, mem, alloc, allocList)
+				if err != nil {
+					return 0, err
+				}
+			}
+		} else {
+			stack[offset] = 1
+			if ct.ErrType != nil && !errField.IsNil() {
+				_, err := e.lowerToStack(ct.ErrType, errField.UnsafePointer(), stack, offset+1, mem, alloc, allocList)
+				if err != nil {
+					return 0, err
+				}
 			}
 		}
 	} else {
-		stack[offset] = 1 // Err discriminant
-		if ct.ErrType != nil && r.Err != nil {
-			_, err := e.lowerToStack(ct.ErrType, r.Err, stack, offset+1, mem, alloc, allocList)
-			if err != nil {
-				return 0, err
+		var disc uint64
+		if rv.CanUint() {
+			disc = rv.Uint()
+		} else if rv.CanInt() {
+			disc = uint64(rv.Int())
+		}
+
+		if disc == 0 {
+			stack[offset] = 0
+		} else {
+			stack[offset] = 1
+			if payloadCount > 0 {
+				stack[offset+1] = disc
 			}
 		}
 	}
