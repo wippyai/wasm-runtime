@@ -407,6 +407,12 @@ func TestTypesHost_DescriptorSync(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	writableHandle := resources.Add(preview2.NewDescriptorResource(tmpFile, false, false))
+
+	if err := host.MethodDescriptorSync(ctx, writableHandle); err != nil {
+		t.Fatalf("unexpected error for writable descriptor: %v", err)
+	}
+
 	if err := host.MethodDescriptorSync(ctx, 9999); err == nil {
 		t.Error("expected error for invalid handle")
 	}

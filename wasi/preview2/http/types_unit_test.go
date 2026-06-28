@@ -448,34 +448,28 @@ func TestOutgoingHandlerHost_Register(t *testing.T) {
 	}
 }
 
-func TestOutgoingHandlerHost_ResourceDropRequestBody(t *testing.T) {
-	resources := preview2.NewResourceTable()
-	host := NewOutgoingHandlerHost(resources)
-	ctx := context.Background()
-
-	body := &requestBodyResource{buffer: &bytes.Buffer{}}
-	handle := resources.Add(body)
-
-	host.ResourceDropRequestBody(ctx, handle)
-
-	if _, ok := resources.Get(handle); ok {
-		t.Error("request body should be removed after drop")
-	}
-}
-
 func TestOutgoingHandlerHost_RegisterRequestBodyEntries(t *testing.T) {
 	resources := preview2.NewResourceTable()
 	h := NewOutgoingHandlerHost(resources)
 
 	reg := h.Register()
-	expected := []string{
-		"[method]outgoing-body.write",
-		"[resource-drop]request-body",
-	}
-
-	for _, method := range expected {
+	for _, method := range []string{
+		"handle",
+		"[constructor]outgoing-request",
+		"[method]outgoing-request.body",
+		"[resource-drop]outgoing-request",
+	} {
 		if _, ok := reg[method]; !ok {
 			t.Errorf("expected method %s in register", method)
+		}
+	}
+
+	for _, method := range []string{
+		"[method]outgoing-body.write",
+		"[resource-drop]request-body",
+	} {
+		if _, ok := reg[method]; ok {
+			t.Errorf("method %s must not be in outgoing-handler register", method)
 		}
 	}
 }

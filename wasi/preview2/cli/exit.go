@@ -23,6 +23,10 @@ func (e ExitError) Error() string {
 	return fmt.Sprintf("wasi:cli/exit called with code %d", e.Code)
 }
 
+func (e ExitError) ExitCode() uint32 {
+	return e.Code
+}
+
 func (h *ExitHost) Exit(_ context.Context, status uint32) {
 	panic(ExitError{Code: status})
 }

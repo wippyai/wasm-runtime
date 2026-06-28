@@ -447,17 +447,10 @@ func TestStreamError(t *testing.T) {
 	if failed.Error() != "stream error: last-operation-failed" {
 		t.Errorf("expected 'stream error: last-operation-failed', got %q", failed.Error())
 	}
-}
 
-func TestStreamError_Error(t *testing.T) {
-	closed := &StreamError{Closed: true}
-	if !strings.Contains(closed.Error(), "closed") {
-		t.Errorf("expected 'closed' in error, got %q", closed.Error())
-	}
-
-	failed := &StreamError{LastOpFailed: true}
-	if !strings.Contains(failed.Error(), "last-operation-failed") {
-		t.Errorf("expected 'last-operation-failed' in error, got %q", failed.Error())
+	unknown := &StreamError{}
+	if unknown.Error() != "stream error: unknown" {
+		t.Errorf("expected 'stream error: unknown', got %q", unknown.Error())
 	}
 }
 

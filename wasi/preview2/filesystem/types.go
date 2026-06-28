@@ -516,15 +516,12 @@ func (h *TypesHost) MethodDescriptorSyncData(_ context.Context, self uint32) *Er
 }
 
 func syncDescriptor(desc *preview2.DescriptorResource) *Error {
-	if desc.IsDir() {
+	if desc.IsDir() || desc.ReadOnly() {
 		return nil
 	}
 
 	f, osErr := os.OpenFile(desc.Path(), os.O_WRONLY, 0)
 	if osErr != nil {
-		if os.IsPermission(osErr) {
-			return nil
-		}
 		return mapOSError(osErr)
 	}
 	defer f.Close()
