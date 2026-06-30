@@ -47,15 +47,16 @@ func NewWazeroEngine(ctx context.Context) (*WazeroEngine, error) {
 
 // NewWazeroEngineWithConfig creates a new engine with custom configuration
 func NewWazeroEngineWithConfig(ctx context.Context, cfg *Config) (*WazeroEngine, error) {
-	runtimeCfg := wazero.NewRuntimeConfig()
+	coreFeatures := api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling
 
-	if cfg != nil {
-		if cfg.MemoryLimitPages > 0 {
-			runtimeCfg = runtimeCfg.WithMemoryLimitPages(cfg.MemoryLimitPages)
-		}
-		if cfg.EnableThreads {
-			runtimeCfg = runtimeCfg.WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesThreads)
-		}
+	if cfg != nil && cfg.EnableThreads {
+		coreFeatures |= experimental.CoreFeaturesThreads
+	}
+
+	runtimeCfg := wazero.NewRuntimeConfig().WithCoreFeatures(coreFeatures)
+
+	if cfg != nil && cfg.MemoryLimitPages > 0 {
+		runtimeCfg = runtimeCfg.WithMemoryLimitPages(cfg.MemoryLimitPages)
 	}
 
 	runtime := wazero.NewRuntimeWithConfig(ctx, runtimeCfg)
