@@ -206,7 +206,33 @@ func splitParams(s string) []string {
 	return result
 }
 
+// parseWitType parses a WIT value type from its textual form. wit.ParseType only
+// handles primitives, so the single-element compound types (list<T>, option<T>) are
+// parsed here recursively; everything else falls through to wit.ParseType.
 func parseWitType(s string) (wit.Type, error) {
 	s = strings.TrimSpace(s)
+	if inner, ok := witCompound(s, "list"); ok {
+		elem, err := parseWitType(inner)
+		if err != nil {
+			return nil, err
+		}
+		return &wit.TypeDef{Kind: &wit.List{Type: elem}}, nil
+	}
+	if inner, ok := witCompound(s, "option"); ok {
+		elem, err := parseWitType(inner)
+		if err != nil {
+			return nil, err
+		}
+		return &wit.TypeDef{Kind: &wit.Option{Type: elem}}, nil
+	}
 	return wit.ParseType(s)
+}
+
+// witCompound reports whether s is "<name><T>" and returns the inner type T.
+func witCompound(s, name string) (string, bool) {
+	prefix := name + "<"
+	if !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, ">") {
+		return "", false
+	}
+	return strings.TrimSpace(s[len(prefix) : len(s)-1]), true
 }

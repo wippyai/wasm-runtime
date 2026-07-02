@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"testing"
+
+	"go.bytecodealliance.org/wit"
 )
 
 func TestModule_IsComponent_Core(t *testing.T) {
@@ -209,6 +211,11 @@ func TestParseWitType(t *testing.T) {
 		{"string", true},
 		{"char", true},
 		{"invalid-type-xyz", false},
+		{"list<u8>", true},
+		{"list<string>", true},
+		{"option<u32>", true},
+		{"list<list<u8>>", true},
+		{"list<invalid-xyz>", false},
 	}
 
 	for _, tc := range tests {
@@ -222,6 +229,41 @@ func TestParseWitType(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestParseWitType_Compound checks that list<T>/option<T> parse into the right wit
+// types (regression: list<u8> return types — e.g. a binary-wire function.wasm entry —
+// were rejected as "unknown primitive type").
+func TestParseWitType_Compound(t *testing.T) {
+	asList := func(ty wit.Type) *wit.List {
+		td, ok := ty.(*wit.TypeDef)
+		if !ok {
+			t.Fatalf("%T, want *wit.TypeDef", ty)
+		}
+		l, ok := td.Kind.(*wit.List)
+		if !ok {
+			t.Fatalf("kind %T, want *wit.List", td.Kind)
+		}
+		return l
+	}
+
+	lt, err := parseWitType("list<u8>")
+	if err != nil {
+		t.Fatalf("list<u8>: %v", err)
+	}
+	if _, ok := asList(lt).Type.(wit.U8); !ok {
+		t.Fatalf("list element -> %T, want wit.U8", asList(lt).Type)
+	}
+
+	sig, err := parseWitFunctions("r_run: func(code: string) -> list<u8>;")
+	if err != nil {
+		t.Fatalf("parseWitFunctions: %v", err)
+	}
+	s := sig["r_run"]
+	if s == nil || len(s.results) != 1 {
+		t.Fatalf("r_run signature = %+v", s)
+	}
+	asList(s.results[0])
 }
 
 // Minimal valid WASM module (no exports)
