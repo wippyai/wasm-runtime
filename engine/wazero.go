@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"fmt"
+	"io"
+	"io/fs"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -71,10 +73,60 @@ type CompileConfig struct {
 
 // InstanceConfig holds configuration for module instantiation
 type InstanceConfig struct {
+	Stdout          io.Writer
+	Stderr          io.Writer
+	Stdin           io.Reader
+	Env             map[string]string
 	Name            string
 	DecodeOptions   transcoder.DecodeOptions
 	AsyncifyImports []string
+	Args            []string
+	Mounts          []Mount
 	EnableAsyncify  bool
+}
+
+// Mount preopens a filesystem into the guest at Guest. FS is mounted when set;
+// otherwise Host (a host directory path) is used.
+type Mount struct {
+	Guest    string
+	FS       fs.FS
+	Host     string
+	ReadOnly bool
+}
+
+// applyWASIConfig threads preview1 args/env/stdio/preopens from cfg into the wazero
+// module config so a core wasi_snapshot_preview1 guest can see them.
+func applyWASIConfig(mc wazero.ModuleConfig, cfg *InstanceConfig) wazero.ModuleConfig {
+	if len(cfg.Args) > 0 {
+		mc = mc.WithArgs(cfg.Args...)
+	}
+	for k, v := range cfg.Env {
+		mc = mc.WithEnv(k, v)
+	}
+	if cfg.Stdout != nil {
+		mc = mc.WithStdout(cfg.Stdout)
+	}
+	if cfg.Stderr != nil {
+		mc = mc.WithStderr(cfg.Stderr)
+	}
+	if cfg.Stdin != nil {
+		mc = mc.WithStdin(cfg.Stdin)
+	}
+	if len(cfg.Mounts) > 0 {
+		fsCfg := wazero.NewFSConfig()
+		for _, mnt := range cfg.Mounts {
+			switch {
+			case mnt.FS != nil:
+				fsCfg = fsCfg.WithFSMount(mnt.FS, mnt.Guest)
+			case mnt.ReadOnly:
+				fsCfg = fsCfg.WithReadOnlyDirMount(mnt.Host, mnt.Guest)
+			default:
+				fsCfg = fsCfg.WithDirMount(mnt.Host, mnt.Guest)
+			}
+		}
+		mc = mc.WithFSConfig(fsCfg)
+	}
+	return mc
 }
 
 func (e *WazeroEngine) LoadModule(ctx context.Context, wasmBytes []byte) (*WazeroModule, error) {
@@ -639,6 +691,15 @@ func (m *WazeroModule) InstantiateWithConfig(ctx context.Context, cfg *InstanceC
 		modConfig = modConfig.WithName(cfg.Name)
 	} else {
 		modConfig = modConfig.WithName("") // anonymous for parallel instantiation
+	}
+	if cfg != nil {
+		modConfig = applyWASIConfig(modConfig, cfg)
+	}
+	// WASI reactors export _initialize (not _start); wazero's default only invokes
+	// _start, so a reactor's libc/global-ctor init (which populates environ from the
+	// host env) would never run. Invoke _initialize when the module exports it.
+	if _, ok := m.compiled.ExportedFunctions()["_initialize"]; ok {
+		modConfig = modConfig.WithStartFunctions("_initialize")
 	}
 
 	// Instantiate the module
