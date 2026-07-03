@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/tetratelabs/wazero/sys"
 	"github.com/wippyai/wasm-runtime/wasi/preview2"
 )
 
@@ -115,17 +117,40 @@ func TestExitHost_Exit(t *testing.T) {
 			t.Fatal("expected panic from Exit")
 		}
 
-		exitErr, ok := r.(ExitError)
+		err, ok := r.(error)
 		if !ok {
-			t.Fatalf("expected ExitError, got %T: %v", r, r)
+			t.Fatalf("expected error panic, got %T: %v", r, r)
 		}
-
-		if exitErr.Code != 42 {
-			t.Errorf("expected exit code 42, got %d", exitErr.Code)
+		var exitErr *sys.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("expected *sys.ExitError, got %T: %v", r, r)
+		}
+		if exitErr.ExitCode() != 42 {
+			t.Errorf("expected exit code 42, got %d", exitErr.ExitCode())
 		}
 	}()
 
 	host.Exit(ctx, 42)
+	t.Fatal("should not reach here — Exit should panic")
+}
+
+// TestExitHost_ExitZeroIsSuccessSentinel confirms a clean exit(0) still produces
+// wazero's success sentinel rather than a code-less panic.
+func TestExitHost_ExitZeroIsSuccessSentinel(t *testing.T) {
+	host := NewExitHost()
+
+	defer func() {
+		r := recover()
+		var exitErr *sys.ExitError
+		if err, ok := r.(error); !ok || !errors.As(err, &exitErr) {
+			t.Fatalf("expected *sys.ExitError, got %T: %v", r, r)
+		}
+		if exitErr.ExitCode() != 0 {
+			t.Errorf("expected exit code 0, got %d", exitErr.ExitCode())
+		}
+	}()
+
+	host.Exit(context.Background(), 0)
 	t.Fatal("should not reach here — Exit should panic")
 }
 

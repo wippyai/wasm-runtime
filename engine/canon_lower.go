@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/sys"
 	"go.bytecodealliance.org/wit"
 	"go.uber.org/zap"
 
@@ -16,15 +17,6 @@ import (
 	"github.com/wippyai/wasm-runtime/component"
 	"github.com/wippyai/wasm-runtime/transcoder"
 )
-
-// wasiExitError is panicked by host functions (e.g. wasi:cli/exit) to request
-// module termination with a specific exit code. Recovering it here lets the
-// engine apply the exit code via CloseWithExitCode instead of letting wazero
-// convert the panic into a generic, code-less error.
-type wasiExitError interface {
-	error
-	ExitCode() uint32
-}
 
 // LowerWrapper wraps a Go function for Canonical ABI lowering.
 type LowerWrapper struct {
@@ -474,9 +466,12 @@ func (w *LowerWrapper) tryBuildBoolFastFunc(paramCount, resultCount int) api.GoM
 func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []uint64) {
 	log := Logger()
 
+	// A wasi:cli/exit host call unwinds here as wazero's sys.ExitError. Apply the
+	// exit code via CloseWithExitCode (the module has already stopped) and stop;
+	// any other panic re-throws so genuine faults still surface.
 	defer func() {
 		if r := recover(); r != nil {
-			if exitErr, ok := r.(wasiExitError); ok {
+			if exitErr, ok := r.(*sys.ExitError); ok {
 				_ = mod.CloseWithExitCode(ctx, exitErr.ExitCode())
 				return
 			}
