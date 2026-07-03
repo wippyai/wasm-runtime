@@ -380,6 +380,16 @@ func (e *StreamError) Error() string {
 	return "stream error"
 }
 
+// WITErrorPayload returns the wasi:io/streams stream-error variant representation
+// (variant stream-error { last-operation-failed(own<error>), closed }) used when
+// lowering a result<_, stream-error> error to guest memory.
+func (e *StreamError) WITErrorPayload() any {
+	if e.LastOpFailed {
+		return map[string]any{"last-operation-failed": e.LastOpFailedErr}
+	}
+	return map[string]any{"closed": nil}
+}
+
 // ErrorResource holds an error message that can be retrieved via ToDebugString.
 type ErrorResource struct {
 	msg string
