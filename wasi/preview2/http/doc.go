@@ -5,7 +5,9 @@
 //   - wasi:http/outgoing-handler@0.2.8 - HTTP client (outbound requests)
 //   - wasi:http/incoming-handler@0.2.8 - HTTP server (inbound requests)
 //
-// Provides 100% spec compliance for HTTP types:
+// Implements wasi:http/types and wasi:http/outgoing-handler with core
+// functionality. Some edge cases (trailers, informational responses) are
+// not yet fully supported. Core functionality includes:
 //   - Incoming requests: method, path, scheme, authority, headers, body
 //   - Outgoing responses: status code, headers, body
 //   - Outgoing requests: full HTTP client support

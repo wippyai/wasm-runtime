@@ -49,7 +49,36 @@ const (
 )
 
 func (e *NetworkError) Error() string {
-	return "network error"
+	codes := map[NetworkErrorCode]string{
+		NetworkErrorUnknown:                  "unknown",
+		NetworkErrorAccessDenied:             "access-denied",
+		NetworkErrorNotSupported:             "not-supported",
+		NetworkErrorInvalidArgument:          "invalid-argument",
+		NetworkErrorOutOfMemory:              "out-of-memory",
+		NetworkErrorTimeout:                  "timeout",
+		NetworkErrorConcurrencyConflict:      "concurrency-conflict",
+		NetworkErrorNotInProgress:            "not-in-progress",
+		NetworkErrorWouldBlock:               "would-block",
+		NetworkErrorInvalidState:             "invalid-state",
+		NetworkErrorNewSocketLimit:           "new-socket-limit",
+		NetworkErrorAddressNotBindable:       "address-not-bindable",
+		NetworkErrorAddressInUse:             "address-in-use",
+		NetworkErrorRemoteUnreachable:        "remote-unreachable",
+		NetworkErrorConnectionRefused:        "connection-refused",
+		NetworkErrorConnectionReset:          "connection-reset",
+		NetworkErrorConnectionAborted:        "connection-aborted",
+		NetworkErrorDatagramTooLarge:         "datagram-too-large",
+		NetworkErrorNameUnresolvable:         "name-unresolvable",
+		NetworkErrorTemporaryResolverFailure: "temporary-resolver-failure",
+		NetworkErrorPermanentResolverFailure: "permanent-resolver-failure",
+	}
+
+	name, ok := codes[e.Code]
+	if !ok {
+		name = "unknown"
+	}
+
+	return "network error: " + name
 }
 
 const (

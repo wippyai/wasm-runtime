@@ -22,3 +22,14 @@ func (h *InstanceNetworkHost) InstanceNetwork(_ context.Context) uint32 {
 	network := preview2.NewNetworkResource()
 	return h.resources.Add(network)
 }
+
+func (h *InstanceNetworkHost) ResourceDropNetwork(_ context.Context, self uint32) {
+	h.resources.Remove(self)
+}
+
+func (h *InstanceNetworkHost) Register() map[string]any {
+	return map[string]any{
+		"instance-network":       h.InstanceNetwork,
+		"[resource-drop]network": h.ResourceDropNetwork,
+	}
+}

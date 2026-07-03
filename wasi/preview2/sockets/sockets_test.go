@@ -2,6 +2,7 @@ package sockets
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,20 @@ func TestInstanceNetworkHost_Namespace(t *testing.T) {
 	expected := "wasi:sockets/instance-network@0.2.0"
 	if ns != expected {
 		t.Errorf("expected namespace %s, got %s", expected, ns)
+	}
+}
+
+func TestInstanceNetworkHost_ResourceDrop(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewInstanceNetworkHost(resources)
+	ctx := context.Background()
+
+	handle := host.InstanceNetwork(ctx)
+
+	host.ResourceDropNetwork(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("network should be removed after drop")
 	}
 }
 
@@ -382,6 +397,21 @@ func TestIPNameLookupHost_Namespace(t *testing.T) {
 	}
 }
 
+func TestIPNameLookupHost_ResourceDrop(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewIPNameLookupHost(resources)
+	ctx := context.Background()
+
+	stream := preview2.NewResolveAddressStreamResource(nil)
+	handle := resources.Add(stream)
+
+	host.ResourceDropResolveAddressStream(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("stream should be removed after drop")
+	}
+}
+
 func TestTCPHost_InvalidHandle(t *testing.T) {
 	resources := preview2.NewResourceTable()
 	host := NewTCPHost(resources)
@@ -568,5 +598,330 @@ func TestTCPHost_Shutdown(t *testing.T) {
 	shutdownErr := tcpHost.MethodTCPSocketShutdown(ctx, clientHandle, 1)
 	if shutdownErr != nil {
 		t.Fatalf("shutdown: %v", shutdownErr)
+	}
+}
+
+func TestTCPHost_ResourceDrop(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	ctx := context.Background()
+
+	handle, err := NewTCPCreateSocketHost(resources).CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	host.ResourceDropTCPSocket(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("socket should be removed from resource table after drop")
+	}
+}
+
+func TestTCPHost_ResourceDrop_InvalidHandle(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	ctx := context.Background()
+
+	host.ResourceDropTCPSocket(ctx, 9999)
+}
+
+func TestUDPHost_ResourceDropSocket(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewUDPHost(resources)
+	ctx := context.Background()
+
+	handle, err := NewUDPCreateSocketHost(resources).CreateUDPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	host.ResourceDropUDPSocket(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("socket should be removed after drop")
+	}
+}
+
+func TestUDPHost_ResourceDropIncomingDatagramStream(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewUDPHost(resources)
+	ctx := context.Background()
+
+	socket := preview2.NewUDPSocketResource(AddressFamilyIPv4)
+	stream := preview2.NewIncomingDatagramStreamResource(socket, "", 0)
+	handle := resources.Add(stream)
+
+	host.ResourceDropIncomingDatagramStream(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("stream should be removed after drop")
+	}
+}
+
+func TestUDPHost_ResourceDropOutgoingDatagramStream(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewUDPHost(resources)
+	ctx := context.Background()
+
+	socket := preview2.NewUDPSocketResource(AddressFamilyIPv4)
+	stream := preview2.NewOutgoingDatagramStreamResource(socket, "", 0)
+	handle := resources.Add(stream)
+
+	host.ResourceDropOutgoingDatagramStream(ctx, handle)
+
+	if _, ok := resources.Get(handle); ok {
+		t.Error("stream should be removed after drop")
+	}
+}
+
+func TestNetworkError_Error(t *testing.T) {
+	tests := []struct {
+		name     string
+		contains string
+		code     NetworkErrorCode
+	}{
+		{"access denied", "access-denied", NetworkErrorAccessDenied},
+		{"invalid argument", "invalid-argument", NetworkErrorInvalidArgument},
+		{"address in use", "address-in-use", NetworkErrorAddressInUse},
+		{"unknown", "unknown", NetworkErrorUnknown},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &NetworkError{Code: tc.code}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.contains) {
+				t.Errorf("expected error message to contain %q, got %q", tc.contains, msg)
+			}
+		})
+	}
+}
+
+func TestTCPHost_Accept_InvalidHandle(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	ctx := context.Background()
+
+	socketHandle, inputHandle, outputHandle, err := host.MethodTCPSocketAccept(ctx, 9999)
+	if err == nil {
+		t.Fatal("expected error for invalid handle")
+	}
+	if err.Code != NetworkErrorInvalidArgument {
+		t.Errorf("expected InvalidArgument, got %d", err.Code)
+	}
+	if socketHandle != 0 || inputHandle != 0 || outputHandle != 0 {
+		t.Errorf("expected zero handles, got %d %d %d", socketHandle, inputHandle, outputHandle)
+	}
+}
+
+func TestTCPHost_SetHopLimit(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	createHost := NewTCPCreateSocketHost(resources)
+	ctx := context.Background()
+
+	handle, err := createHost.CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("create socket: %v", err)
+	}
+
+	if setErr := host.MethodTCPSocketSetHopLimit(ctx, handle, 128); setErr != nil {
+		t.Fatalf("set hop limit: %v", setErr)
+	}
+
+	value, getErr := host.MethodTCPSocketHopLimit(ctx, handle)
+	if getErr != nil {
+		t.Fatalf("get hop limit: %v", getErr)
+	}
+	if value != 128 {
+		t.Errorf("expected hop limit 128, got %d", value)
+	}
+}
+
+func TestTCPHost_SetReceiveBufferSize(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	createHost := NewTCPCreateSocketHost(resources)
+	ctx := context.Background()
+
+	handle, err := createHost.CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("create socket: %v", err)
+	}
+
+	if setErr := host.MethodTCPSocketSetReceiveBufferSize(ctx, handle, 4096); setErr != nil {
+		t.Fatalf("set receive buffer size: %v", setErr)
+	}
+
+	value, getErr := host.MethodTCPSocketReceiveBufferSize(ctx, handle)
+	if getErr != nil {
+		t.Fatalf("get receive buffer size: %v", getErr)
+	}
+	if value != 4096 {
+		t.Errorf("expected receive buffer size 4096, got %d", value)
+	}
+}
+
+func TestTCPHost_SetSendBufferSize(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	createHost := NewTCPCreateSocketHost(resources)
+	ctx := context.Background()
+
+	handle, err := createHost.CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("create socket: %v", err)
+	}
+
+	if setErr := host.MethodTCPSocketSetSendBufferSize(ctx, handle, 8192); setErr != nil {
+		t.Fatalf("set send buffer size: %v", setErr)
+	}
+
+	value, getErr := host.MethodTCPSocketSendBufferSize(ctx, handle)
+	if getErr != nil {
+		t.Fatalf("get send buffer size: %v", getErr)
+	}
+	if value != 8192 {
+		t.Errorf("expected send buffer size 8192, got %d", value)
+	}
+}
+
+func TestTCPHost_SetListenBacklogSize(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	createHost := NewTCPCreateSocketHost(resources)
+	ctx := context.Background()
+
+	handle, err := createHost.CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("create socket: %v", err)
+	}
+
+	if setErr := host.MethodTCPSocketSetListenBacklogSize(ctx, handle, 256); setErr != nil {
+		t.Fatalf("set listen backlog size: %v", setErr)
+	}
+
+	value, getErr := host.MethodTCPSocketListenBacklogSize(ctx, handle)
+	if getErr != nil {
+		t.Fatalf("get listen backlog size: %v", getErr)
+	}
+	if value != 256 {
+		t.Errorf("expected listen backlog size 256, got %d", value)
+	}
+}
+
+func TestTCPHost_SetKeepAliveEnabled(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	createHost := NewTCPCreateSocketHost(resources)
+	ctx := context.Background()
+
+	handle, err := createHost.CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("create socket: %v", err)
+	}
+
+	if setErr := host.MethodTCPSocketSetKeepAliveEnabled(ctx, handle, true); setErr != nil {
+		t.Fatalf("set keep-alive enabled: %v", setErr)
+	}
+
+	value, getErr := host.MethodTCPSocketKeepAliveEnabled(ctx, handle)
+	if getErr != nil {
+		t.Fatalf("get keep-alive enabled: %v", getErr)
+	}
+	if !value {
+		t.Error("expected keep-alive enabled to be true")
+	}
+}
+
+func TestTCPHost_SetKeepAliveIdleTime(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	createHost := NewTCPCreateSocketHost(resources)
+	ctx := context.Background()
+
+	handle, err := createHost.CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("create socket: %v", err)
+	}
+
+	if setErr := host.MethodTCPSocketSetKeepAliveIdleTime(ctx, handle, 1000000000); setErr != nil {
+		t.Fatalf("set keep-alive idle time: %v", setErr)
+	}
+
+	value, getErr := host.MethodTCPSocketKeepAliveIdleTime(ctx, handle)
+	if getErr != nil {
+		t.Fatalf("get keep-alive idle time: %v", getErr)
+	}
+	if value != 1000000000 {
+		t.Errorf("expected keep-alive idle time 1000000000, got %d", value)
+	}
+}
+
+func TestTCPHost_SetKeepAliveInterval(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	createHost := NewTCPCreateSocketHost(resources)
+	ctx := context.Background()
+
+	handle, err := createHost.CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("create socket: %v", err)
+	}
+
+	if setErr := host.MethodTCPSocketSetKeepAliveInterval(ctx, handle, 5000000000); setErr != nil {
+		t.Fatalf("set keep-alive interval: %v", setErr)
+	}
+
+	value, getErr := host.MethodTCPSocketKeepAliveInterval(ctx, handle)
+	if getErr != nil {
+		t.Fatalf("get keep-alive interval: %v", getErr)
+	}
+	if value != 5000000000 {
+		t.Errorf("expected keep-alive interval 5000000000, got %d", value)
+	}
+}
+
+func TestTCPHost_SetKeepAliveCount(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewTCPHost(resources)
+	createHost := NewTCPCreateSocketHost(resources)
+	ctx := context.Background()
+
+	handle, err := createHost.CreateTCPSocket(ctx, AddressFamilyIPv4)
+	if err != nil {
+		t.Fatalf("create socket: %v", err)
+	}
+
+	if setErr := host.MethodTCPSocketSetKeepAliveCount(ctx, handle, 5); setErr != nil {
+		t.Fatalf("set keep-alive count: %v", setErr)
+	}
+
+	value, getErr := host.MethodTCPSocketKeepAliveCount(ctx, handle)
+	if getErr != nil {
+		t.Fatalf("get keep-alive count: %v", getErr)
+	}
+	if value != 5 {
+		t.Errorf("expected keep-alive count 5, got %d", value)
+	}
+}
+
+func TestResolveAddressStreamSubscribe(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	host := NewIPNameLookupHost(resources)
+	ctx := context.Background()
+
+	stream := preview2.NewResolveAddressStreamResource(nil)
+	streamHandle := resources.Add(stream)
+
+	pollableHandle := host.MethodResolveAddressStreamSubscribe(ctx, streamHandle)
+
+	r, ok := resources.Get(pollableHandle)
+	if !ok {
+		t.Fatal("pollable not in resource table")
+	}
+	if _, ok := r.(*preview2.PollableResource); !ok {
+		t.Error("resource is not a PollableResource")
 	}
 }

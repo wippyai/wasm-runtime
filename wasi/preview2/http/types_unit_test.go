@@ -448,6 +448,32 @@ func TestOutgoingHandlerHost_Register(t *testing.T) {
 	}
 }
 
+func TestOutgoingHandlerHost_RegisterRequestBodyEntries(t *testing.T) {
+	resources := preview2.NewResourceTable()
+	h := NewOutgoingHandlerHost(resources)
+
+	reg := h.Register()
+	for _, method := range []string{
+		"handle",
+		"[constructor]outgoing-request",
+		"[method]outgoing-request.body",
+		"[resource-drop]outgoing-request",
+	} {
+		if _, ok := reg[method]; !ok {
+			t.Errorf("expected method %s in register", method)
+		}
+	}
+
+	for _, method := range []string{
+		"[method]outgoing-body.write",
+		"[resource-drop]request-body",
+	} {
+		if _, ok := reg[method]; ok {
+			t.Errorf("method %s must not be in outgoing-handler register", method)
+		}
+	}
+}
+
 func TestIncomingResponseMethods(t *testing.T) {
 	ctx := context.Background()
 	resources := preview2.NewResourceTable()

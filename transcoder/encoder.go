@@ -429,14 +429,6 @@ func (e *Encoder) encodeOptionToMemory(addr uint32, ct *CompiledType, ptr unsafe
 }
 
 func (e *Encoder) encodeResultToMemory(addr uint32, ct *CompiledType, ptr unsafe.Pointer, mem Memory, alloc Allocator, allocList *AllocationList, path []string) error {
-	// Result is represented as struct: { Ok *T; Err *E }
-	type resultLayout struct {
-		Ok  unsafe.Pointer
-		Err unsafe.Pointer
-	}
-	r := (*resultLayout)(ptr)
-
-	// Determine max alignment of payloads
 	maxAlign := uint32(1)
 	if ct.OkType != nil && ct.OkType.WitAlign > maxAlign {
 		maxAlign = ct.OkType.WitAlign
@@ -446,21 +438,47 @@ func (e *Encoder) encodeResultToMemory(addr uint32, ct *CompiledType, ptr unsafe
 	}
 	payloadOffset := alignTo(1, maxAlign)
 
-	if r.Ok != nil {
-		if err := mem.WriteU8(addr, 0); err != nil {
+	rv := reflect.NewAt(ct.GoType, ptr).Elem()
+
+	if rv.Kind() == reflect.Struct {
+		okField := rv.Field(0)
+		errField := rv.Field(1)
+
+		if !okField.IsNil() {
+			if err := mem.WriteU8(addr, 0); err != nil {
+				return err
+			}
+			if ct.OkType != nil {
+				return e.encodeFieldToMemory(addr+payloadOffset, ct.OkType, okField.UnsafePointer(), mem, alloc, allocList, path)
+			}
+			return nil
+		}
+
+		if err := mem.WriteU8(addr, 1); err != nil {
 			return err
 		}
-		if ct.OkType != nil {
-			return e.encodeFieldToMemory(addr+payloadOffset, ct.OkType, r.Ok, mem, alloc, allocList, path)
+		if ct.ErrType != nil && !errField.IsNil() {
+			return e.encodeFieldToMemory(addr+payloadOffset, ct.ErrType, errField.UnsafePointer(), mem, alloc, allocList, path)
 		}
 		return nil
+	}
+
+	var disc uint64
+	if rv.CanUint() {
+		disc = rv.Uint()
+	} else if rv.CanInt() {
+		disc = uint64(rv.Int())
+	}
+
+	if disc == 0 {
+		return mem.WriteU8(addr, 0)
 	}
 
 	if err := mem.WriteU8(addr, 1); err != nil {
 		return err
 	}
-	if ct.ErrType != nil && r.Err != nil {
-		return e.encodeFieldToMemory(addr+payloadOffset, ct.ErrType, r.Err, mem, alloc, allocList, path)
+	if ct.ErrType != nil && payloadOffset > 0 {
+		return e.encodeFieldToMemory(addr+payloadOffset, ct.ErrType, ptr, mem, alloc, allocList, path)
 	}
 	return nil
 }

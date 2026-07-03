@@ -71,7 +71,52 @@ const (
 )
 
 func (e *Error) Error() string {
-	return "filesystem error"
+	codes := map[ErrorCode]string{
+		ErrorAccess:              "access",
+		ErrorWouldBlock:          "would-block",
+		ErrorAlready:             "already",
+		ErrorBadDescriptor:       "bad-descriptor",
+		ErrorBusy:                "busy",
+		ErrorDeadlock:            "deadlock",
+		ErrorQuota:               "quota",
+		ErrorExist:               "exist",
+		ErrorFileTooLarge:        "file-too-large",
+		ErrorIllegalByteSequence: "illegal-byte-sequence",
+		ErrorInProgress:          "in-progress",
+		ErrorInterrupted:         "interrupted",
+		ErrorInvalid:             "invalid",
+		ErrorIo:                  "io",
+		ErrorIsDirectory:         "is-directory",
+		ErrorLoop:                "loop",
+		ErrorTooManyLinks:        "too-many-links",
+		ErrorMessageSize:         "message-size",
+		ErrorNameTooLong:         "name-too-long",
+		ErrorNoDevice:            "no-device",
+		ErrorNoEntry:             "no-entry",
+		ErrorNoLock:              "no-lock",
+		ErrorInsufficientMemory:  "insufficient-memory",
+		ErrorInsufficientSpace:   "insufficient-space",
+		ErrorNotDirectory:        "not-directory",
+		ErrorNotEmpty:            "not-empty",
+		ErrorNotRecoverable:      "not-recoverable",
+		ErrorUnsupported:         "unsupported",
+		ErrorNoTty:               "no-tty",
+		ErrorNoSuchDevice:        "no-such-device",
+		ErrorOverflow:            "overflow",
+		ErrorNotPermitted:        "not-permitted",
+		ErrorPipe:                "pipe",
+		ErrorReadOnly:            "read-only",
+		ErrorInvalidSeek:         "invalid-seek",
+		ErrorTextFileBusy:        "text-file-busy",
+		ErrorCrossDevice:         "cross-device",
+	}
+
+	name, ok := codes[e.Code]
+	if !ok {
+		name = "unknown"
+	}
+
+	return "filesystem error: " + name
 }
 
 func mapOSError(err error) *Error {
@@ -345,7 +390,11 @@ func (h *TypesHost) MethodDescriptorSeek(_ context.Context, self uint32, offset 
 	return uint64(newPosition), nil
 }
 
-func (h *TypesHost) MethodDescriptorGetFlags(_ context.Context, _ uint32) (uint32, *Error) {
+func (h *TypesHost) MethodDescriptorGetFlags(_ context.Context, self uint32) (uint32, *Error) {
+	if _, err := h.getDescriptor(self); err != nil {
+		return 0, err
+	}
+
 	return 0, nil
 }
 
@@ -448,11 +497,39 @@ func (h *TypesHost) MethodDescriptorReadDirectory(_ context.Context, self uint32
 	return handle, nil
 }
 
-func (h *TypesHost) MethodDescriptorSync(_ context.Context, _ uint32) *Error {
-	return nil
+func (h *TypesHost) MethodDescriptorSync(_ context.Context, self uint32) *Error {
+	desc, err := h.getDescriptor(self)
+	if err != nil {
+		return err
+	}
+
+	return syncDescriptor(desc)
 }
 
-func (h *TypesHost) MethodDescriptorSyncData(_ context.Context, _ uint32) *Error {
+func (h *TypesHost) MethodDescriptorSyncData(_ context.Context, self uint32) *Error {
+	desc, err := h.getDescriptor(self)
+	if err != nil {
+		return err
+	}
+
+	return syncDescriptor(desc)
+}
+
+func syncDescriptor(desc *preview2.DescriptorResource) *Error {
+	if desc.IsDir() || desc.ReadOnly() {
+		return nil
+	}
+
+	f, osErr := os.OpenFile(desc.Path(), os.O_WRONLY, 0)
+	if osErr != nil {
+		return mapOSError(osErr)
+	}
+	defer f.Close()
+
+	if osErr := f.Sync(); osErr != nil {
+		return mapOSError(osErr)
+	}
+
 	return nil
 }
 
@@ -853,7 +930,11 @@ func (h *TypesHost) MethodDescriptorSetSize(_ context.Context, self uint32, size
 	return nil
 }
 
-func (h *TypesHost) MethodDescriptorAdvise(_ context.Context, _ uint32, _ uint64, _ uint64, _ uint8) *Error {
+func (h *TypesHost) MethodDescriptorAdvise(_ context.Context, self uint32, _ uint64, _ uint64, _ uint8) *Error {
+	if _, err := h.getDescriptor(self); err != nil {
+		return err
+	}
+
 	return nil
 }
 

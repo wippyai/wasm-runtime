@@ -439,13 +439,18 @@ func TestFileOutputStreamResource_Closed(t *testing.T) {
 
 func TestStreamError(t *testing.T) {
 	closed := &StreamError{Closed: true}
-	if closed.Error() != "stream closed" {
-		t.Errorf("expected 'stream closed', got %q", closed.Error())
+	if closed.Error() != "stream error: closed" {
+		t.Errorf("expected 'stream error: closed', got %q", closed.Error())
 	}
 
 	failed := &StreamError{LastOpFailed: true}
-	if failed.Error() != "stream error" {
-		t.Errorf("expected 'stream error', got %q", failed.Error())
+	if failed.Error() != "stream error: last-operation-failed" {
+		t.Errorf("expected 'stream error: last-operation-failed', got %q", failed.Error())
+	}
+
+	unknown := &StreamError{}
+	if unknown.Error() != "stream error: unknown" {
+		t.Errorf("expected 'stream error: unknown', got %q", unknown.Error())
 	}
 }
 

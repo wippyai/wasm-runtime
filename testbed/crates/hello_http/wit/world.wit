@@ -1,0 +1,11 @@
+package hello:http;
+
+world hello-http {
+    import wasi:clocks/monotonic-clock@0.2.8;
+    import wasi:io/error@0.2.8;
+    import wasi:io/poll@0.2.8;
+    import wasi:io/streams@0.2.8;
+    import wasi:http/types@0.2.8;
+    export wasi:http/incoming-handler@0.2.8;
+    export run: func() -> string;
+}

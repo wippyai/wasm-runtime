@@ -17,6 +17,15 @@ import (
 	"github.com/wippyai/wasm-runtime/transcoder"
 )
 
+// wasiExitError is panicked by host functions (e.g. wasi:cli/exit) to request
+// module termination with a specific exit code. Recovering it here lets the
+// engine apply the exit code via CloseWithExitCode instead of letting wazero
+// convert the panic into a generic, code-less error.
+type wasiExitError interface {
+	error
+	ExitCode() uint32
+}
+
 // LowerWrapper wraps a Go function for Canonical ABI lowering.
 type LowerWrapper struct {
 	argsPool     sync.Pool
@@ -464,6 +473,16 @@ func (w *LowerWrapper) tryBuildBoolFastFunc(paramCount, resultCount int) api.GoM
 
 func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []uint64) {
 	log := Logger()
+
+	defer func() {
+		if r := recover(); r != nil {
+			if exitErr, ok := r.(wasiExitError); ok {
+				_ = mod.CloseWithExitCode(ctx, exitErr.ExitCode())
+				return
+			}
+			panic(r)
+		}
+	}()
 
 	if mod == nil {
 		log.Error("callHandler: module is nil", zap.String("func", w.def.Name))

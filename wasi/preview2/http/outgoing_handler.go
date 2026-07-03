@@ -15,10 +15,9 @@ import (
 // OutgoingHandlerNamespace is the WASI HTTP outgoing handler namespace.
 const OutgoingHandlerNamespace = "wasi:http/outgoing-handler@0.2.8"
 
-// Outgoing handler resource type IDs (110-113 range)
+// Outgoing handler resource type IDs (110, 112-113 range)
 const (
 	resourceTypeOutgoingRequest        = preview2.ResourceType(110)
-	resourceTypeRequestBody            = preview2.ResourceType(111)
 	resourceTypeFutureIncomingResponse = preview2.ResourceType(112)
 	resourceTypeIncomingResponse       = preview2.ResourceType(113)
 )
@@ -169,7 +168,7 @@ func (h *OutgoingHandlerHost) MethodOutgoingRequestHeaders(_ context.Context, se
 }
 
 // MethodOutgoingRequestBody gets the request body.
-// [method]outgoing-request.body() -> result<outgoing-body>
+// [method]outgoing-request.body() -> result<outgoing-body, _>
 func (h *OutgoingHandlerHost) MethodOutgoingRequestBody(_ context.Context, self uint32) (uint32, uint32) {
 	r, ok := h.resources.Get(self)
 	if !ok {
@@ -180,7 +179,7 @@ func (h *OutgoingHandlerHost) MethodOutgoingRequestBody(_ context.Context, self 
 		return 0, 1
 	}
 
-	body := &requestBodyResource{buffer: req.body}
+	body := &outgoingBodyResource{buffer: req.body}
 	handle := h.resources.Add(body)
 	return handle, 0
 }
@@ -188,30 +187,6 @@ func (h *OutgoingHandlerHost) MethodOutgoingRequestBody(_ context.Context, self 
 // ResourceDropOutgoingRequest drops an outgoing request resource.
 func (h *OutgoingHandlerHost) ResourceDropOutgoingRequest(_ context.Context, self uint32) {
 	h.resources.Remove(self)
-}
-
-// Request body resource
-type requestBodyResource struct {
-	buffer *bytes.Buffer
-}
-
-func (b *requestBodyResource) Type() preview2.ResourceType { return resourceTypeRequestBody }
-func (b *requestBodyResource) Drop()                       {}
-
-// MethodRequestBodyWrite gets a stream for writing body data.
-func (h *OutgoingHandlerHost) MethodRequestBodyWrite(_ context.Context, self uint32) (uint32, uint32) {
-	r, ok := h.resources.Get(self)
-	if !ok {
-		return 0, 1
-	}
-	body, ok := r.(*requestBodyResource)
-	if !ok {
-		return 0, 1
-	}
-
-	stream := preview2.NewOutputStreamResource(body.buffer)
-	handle := h.resources.Add(stream)
-	return handle, 0
 }
 
 // FutureIncomingResponse resource
