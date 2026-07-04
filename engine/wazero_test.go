@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/wippyai/wasm-runtime/wat"
 )
@@ -78,6 +79,63 @@ func TestWazeroEngine_Close(t *testing.T) {
 	err = engine.Close(ctx)
 	if err != nil {
 		t.Errorf("Close failed: %v", err)
+	}
+}
+
+func TestWazeroEngine_FSMountReadlinkRegularFile(t *testing.T) {
+	ctx := context.Background()
+
+	eng, err := NewWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("NewWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+
+	wasmBytes, err := wat.Compile(`(module
+		(import "wasi_snapshot_preview1" "path_readlink"
+			(func $path_readlink (param i32 i32 i32 i32 i32 i32) (result i32)))
+		(memory (export "memory") 1)
+		(data (i32.const 8) "file.txt")
+		(func (export "readlink_errno") (result i32)
+			(call $path_readlink
+				(i32.const 3)
+				(i32.const 8)
+				(i32.const 8)
+				(i32.const 32)
+				(i32.const 64)
+				(i32.const 4))))`)
+	if err != nil {
+		t.Fatalf("compile WAT: %v", err)
+	}
+
+	mod, err := eng.LoadModule(ctx, wasmBytes)
+	if err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+
+	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{
+		Mounts: []Mount{{
+			Guest:    "/data",
+			FS:       fstest.MapFS{"file.txt": &fstest.MapFile{Data: []byte("ok")}},
+			ReadOnly: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("InstantiateWithConfig: %v", err)
+	}
+	defer inst.Close(ctx)
+
+	fn := inst.instance.ExportedFunction("readlink_errno")
+	if fn == nil {
+		t.Fatal("readlink_errno function not exported")
+	}
+	results, err := fn.Call(ctx)
+	if err != nil {
+		t.Fatalf("readlink_errno: %v", err)
+	}
+	const wasiErrnoInval = uint64(28)
+	if got := results[0]; got != wasiErrnoInval {
+		t.Fatalf("path_readlink regular file errno = %d, want %d", got, wasiErrnoInval)
 	}
 }
 
