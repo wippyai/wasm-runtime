@@ -12,6 +12,7 @@ import (
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/experimental"
+	"github.com/tetratelabs/wazero/experimental/sysfs"
 	"go.bytecodealliance.org/wit"
 	"go.uber.org/zap"
 
@@ -117,6 +118,10 @@ func applyWASIConfig(mc wazero.ModuleConfig, cfg *InstanceConfig) wazero.ModuleC
 		for _, mnt := range cfg.Mounts {
 			switch {
 			case mnt.FS != nil:
+				if sysCfg, ok := fsCfg.(sysfs.FSConfig); ok {
+					fsCfg = sysCfg.WithSysFSMount(newSymlinkFreeFS(mnt.FS), mnt.Guest)
+					continue
+				}
 				fsCfg = fsCfg.WithFSMount(mnt.FS, mnt.Guest)
 			case mnt.ReadOnly:
 				fsCfg = fsCfg.WithReadOnlyDirMount(mnt.Host, mnt.Guest)
