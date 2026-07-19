@@ -117,7 +117,7 @@ func applyWASIConfig(mc wazero.ModuleConfig, cfg *InstanceConfig) wazero.ModuleC
 		for _, mnt := range cfg.Mounts {
 			switch {
 			case mnt.FS != nil:
-				fsCfg = fsCfg.WithFSMount(mnt.FS, mnt.Guest)
+				fsCfg = withReadOnlyFSMount(fsCfg, mnt.FS, mnt.Guest)
 			case mnt.ReadOnly:
 				fsCfg = fsCfg.WithReadOnlyDirMount(mnt.Host, mnt.Guest)
 			default:
