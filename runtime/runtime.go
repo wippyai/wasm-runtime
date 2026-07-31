@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"github.com/tetratelabs/wazero/api"
 
 	"github.com/wippyai/wasm-runtime/component"
 	"github.com/wippyai/wasm-runtime/engine"
@@ -40,6 +41,16 @@ func (r *Runtime) RegisterHost(h Host) error {
 
 func (r *Runtime) RegisterFunc(namespace, name string, fn any) error {
 	return r.hosts.RegisterFunc(namespace, name, fn)
+}
+
+// RegisterCoreFunc registers a raw host function usable by core modules.
+func (r *Runtime) RegisterCoreFunc(
+	namespace, name string,
+	params, results []api.ValueType,
+	fn api.GoModuleFunc,
+	async bool,
+) error {
+	return r.hosts.RegisterCoreFunc(namespace, name, params, results, fn, async)
 }
 
 func (r *Runtime) Hosts() *HostRegistry {

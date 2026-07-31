@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"io/fs"
@@ -25,7 +26,9 @@ import (
 // WazeroEngine implements Engine using wazero runtime
 type WazeroEngine struct {
 	runtime      wazero.Runtime
+	hostMods     map[string]struct{}
 	wasiInitMu   sync.Mutex
+	hostModsMu   sync.Mutex
 	wasiInitDone atomic.Bool
 }
 
@@ -97,6 +100,12 @@ type Mount struct {
 // applyWASIConfig threads preview1 args/env/stdio/preopens from cfg into the wazero
 // module config so a core wasi_snapshot_preview1 guest can see them.
 func applyWASIConfig(mc wazero.ModuleConfig, cfg *InstanceConfig) wazero.ModuleConfig {
+	// wazero defaults to a fake clock and a zero random source, so a guest reads
+	// 1970 and identical "random" bytes on every run. A language runtime needs
+	// neither: TLS rejects every certificate as "not yet valid" against a 1970
+	// clock, and a predictable random source is a real weakness once the guest can
+	// reach the network. Give it the host's time and the host's entropy.
+	mc = mc.WithSysWalltime().WithSysNanotime().WithRandSource(rand.Reader)
 	if len(cfg.Args) > 0 {
 		mc = mc.WithArgs(cfg.Args...)
 	}
@@ -325,6 +334,40 @@ func (m *WazeroModule) RegisterHostFuncTyped(namespace, name string, handler any
 	return nil
 }
 
+// RegisterHostFuncRaw registers a host function with an explicit core signature.
+//
+// Typed registration lowers through the Canon ABI and therefore needs a component
+// with canon imports; a core module has none, so its imports can only be satisfied
+// by a function whose parameter and result types are stated outright. Marking the
+// function async makes calls to it yield, which is what lets a core module block on
+// host I/O.
+func (m *WazeroModule) RegisterHostFuncRaw(
+	namespace, name string,
+	params, results []api.ValueType,
+	fn api.GoModuleFunc,
+	async bool,
+) error {
+	if namespace == "" || name == "" {
+		return fmt.Errorf("raw host function needs a namespace and a name")
+	}
+	if fn == nil {
+		return fmt.Errorf("raw host function %q#%s has no handler", namespace, name)
+	}
+
+	m.hostFuncsMu.Lock()
+	defer m.hostFuncsMu.Unlock()
+
+	m.hostFuncs[namespace+"::"+name] = HostFunc{
+		Namespace: namespace,
+		Name:      name,
+		Raw:       fn,
+		ParamVT:   params,
+		ResultVT:  results,
+		IsAsync:   async,
+	}
+	return nil
+}
+
 // RegisterHostFuncTypedAsync registers a typed Go function as an async host function.
 // Same as RegisterHostFuncTyped but marks the function as async (yields during execution).
 func (m *WazeroModule) RegisterHostFuncTypedAsync(namespace, name string, handler any) error {
@@ -484,7 +527,68 @@ func splitLowerName(name string) (namespace, funcName string) {
 
 // initHostModules initializes WASI and other host modules via the engine singleton.
 func (m *WazeroModule) initHostModules(ctx context.Context) error {
-	return m.engine.InitWASI(ctx)
+	if err := m.engine.InitWASI(ctx); err != nil {
+		return err
+	}
+	return m.initRawHostModules(ctx)
+}
+
+// initRawHostModules instantiates a wazero host module per namespace holding raw
+// host functions.
+//
+// The linker materializes namespaces only for multi-module components; a single
+// core module is instantiated straight against the wazero runtime, so an import of
+// a raw host function would resolve to nothing and instantiation would fail with
+// "module[...] not instantiated". Host modules live in the runtime's namespace and
+// are shared by every instance, so each name is instantiated once.
+func (m *WazeroModule) initRawHostModules(ctx context.Context) error {
+	// This runs on every instantiation, so the common case of no raw host functions
+	// must not allocate: scan first, group only when there is something to group.
+	m.hostFuncsMu.RLock()
+	hasRaw := false
+	for _, hf := range m.hostFuncs {
+		if hf.Raw != nil {
+			hasRaw = true
+			break
+		}
+	}
+	if !hasRaw {
+		m.hostFuncsMu.RUnlock()
+		return nil
+	}
+
+	byNamespace := make(map[string][]HostFunc)
+	for _, hf := range m.hostFuncs {
+		if hf.Raw != nil {
+			byNamespace[hf.Namespace] = append(byNamespace[hf.Namespace], hf)
+		}
+	}
+	m.hostFuncsMu.RUnlock()
+
+	m.engine.hostModsMu.Lock()
+	defer m.engine.hostModsMu.Unlock()
+	if m.engine.hostMods == nil {
+		m.engine.hostMods = make(map[string]struct{})
+	}
+
+	for namespace, funcs := range byNamespace {
+		if _, done := m.engine.hostMods[namespace]; done {
+			continue
+		}
+
+		builder := m.engine.runtime.NewHostModuleBuilder(namespace)
+		for _, hf := range funcs {
+			builder.NewFunctionBuilder().
+				WithGoModuleFunction(hf.Raw, hf.ParamVT, hf.ResultVT).
+				Export(hf.Name)
+		}
+		if _, err := builder.Instantiate(ctx); err != nil {
+			return fmt.Errorf("instantiate raw host module %q: %w", namespace, err)
+		}
+		m.engine.hostMods[namespace] = struct{}{}
+	}
+
+	return nil
 }
 
 // linkerConfig holds configuration for ensureLinker
