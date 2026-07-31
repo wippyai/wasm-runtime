@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"github.com/tetratelabs/wazero/api"
 	"reflect"
 	"strings"
 	"sync"
@@ -25,6 +26,9 @@ type HostRegistry struct {
 type HostFunc struct {
 	Handler  any
 	Receiver reflect.Value
+	Raw      api.GoModuleFunc
+	ParamVT  []api.ValueType
+	ResultVT []api.ValueType
 	IsAsync  bool
 }
 
@@ -157,9 +161,12 @@ func (r *HostRegistry) Bind(mod *engine.WazeroModule) error {
 	for namespace, funcs := range r.funcs {
 		for name, hf := range funcs {
 			var err error
-			if hf.IsAsync {
+			switch {
+			case hf.Raw != nil:
+				err = mod.RegisterHostFuncRaw(namespace, name, hf.ParamVT, hf.ResultVT, hf.Raw, hf.IsAsync)
+			case hf.IsAsync:
 				err = mod.RegisterHostFuncTypedAsync(namespace, name, hf.Handler)
-			} else {
+			default:
 				err = mod.RegisterHostFuncTyped(namespace, name, hf.Handler)
 			}
 			if err != nil {
@@ -300,4 +307,43 @@ func tryExtractFunctionsViaReflection(h any) map[string]any {
 	}
 
 	return funcs
+}
+
+// RegisterCoreFunc registers a host function for core modules.
+//
+// A core module's imports cannot be satisfied by the typed path, which lowers
+// through the Canon ABI and requires a component's canon imports. The signature is
+// therefore given outright and the handler reads and writes guest memory itself.
+// Setting async makes the call yield, so a core module can block on host I/O.
+func (r *HostRegistry) RegisterCoreFunc(
+	namespace, name string,
+	params, results []api.ValueType,
+	fn api.GoModuleFunc,
+	async bool,
+) error {
+	if namespace == "" {
+		return errors.InvalidInput(errors.PhaseHost, "namespace cannot be empty")
+	}
+	if name == "" {
+		return errors.InvalidInput(errors.PhaseHost, "function name cannot be empty")
+	}
+	if fn == nil {
+		return errors.InvalidInput(errors.PhaseHost, "handler cannot be nil")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.funcs[namespace] == nil {
+		r.funcs[namespace] = make(map[string]*HostFunc)
+	}
+
+	r.funcs[namespace][name] = &HostFunc{
+		Raw:      fn,
+		ParamVT:  params,
+		ResultVT: results,
+		IsAsync:  async,
+	}
+
+	return nil
 }

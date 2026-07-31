@@ -1,4 +1,9 @@
-.PHONY: build-testbed check-testbed
+.PHONY: build-testbed check-testbed build-core-host
+
+build-core-host: ## Rebuild the core-module host-import fixture (needs wasi-sdk)
+	$(WASI_SDK_PATH)/bin/clang -mexec-model=reactor -O2 -nostartfiles \
+		-Wl,--no-entry -Wl,--export=run \
+		-o testbed/core-host.wasm testbed/fixtures/core-host.c
 
 check-testbed: ## Verify Rust toolchain for test components
 	rustup target list --installed | grep -q wasm32-wasip2 || rustup target add wasm32-wasip2
