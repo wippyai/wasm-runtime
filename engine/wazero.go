@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"io/fs"
@@ -99,6 +100,12 @@ type Mount struct {
 // applyWASIConfig threads preview1 args/env/stdio/preopens from cfg into the wazero
 // module config so a core wasi_snapshot_preview1 guest can see them.
 func applyWASIConfig(mc wazero.ModuleConfig, cfg *InstanceConfig) wazero.ModuleConfig {
+	// wazero defaults to a fake clock and a zero random source, so a guest reads
+	// 1970 and identical "random" bytes on every run. A language runtime needs
+	// neither: TLS rejects every certificate as "not yet valid" against a 1970
+	// clock, and a predictable random source is a real weakness once the guest can
+	// reach the network. Give it the host's time and the host's entropy.
+	mc = mc.WithSysWalltime().WithSysNanotime().WithRandSource(rand.Reader)
 	if len(cfg.Args) > 0 {
 		mc = mc.WithArgs(cfg.Args...)
 	}
