@@ -121,6 +121,34 @@ func TestInstance_MemorySize(t *testing.T) {
 	}
 }
 
+func TestInstance_HasMemory(t *testing.T) {
+	ctx := context.Background()
+	rt, err := New(ctx)
+	if err != nil {
+		t.Fatalf("create runtime: %v", err)
+	}
+	defer rt.Close(ctx)
+
+	mod, err := rt.LoadWAT(ctx, `(module
+		(func (export "run") (result i32)
+			i32.const 1))`, "run: func() -> s32;")
+	if err != nil {
+		t.Fatalf("load WAT: %v", err)
+	}
+	inst, err := mod.Instantiate(ctx)
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	defer inst.Close(ctx)
+
+	if inst.HasMemory() {
+		t.Fatal("memoryless instance reported memory")
+	}
+	if size := inst.MemorySize(); size != 0 {
+		t.Fatalf("MemorySize() = %d, want 0", size)
+	}
+}
+
 // NOTE: This test duplicates testbed/testbed_test.go:TestMinimal_ComputeUsingHost.
 // Consider consolidating to testbed package for E2E tests.
 func TestComponent_Minimal_ComputeUsingHost(t *testing.T) {

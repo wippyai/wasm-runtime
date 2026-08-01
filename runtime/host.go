@@ -1,11 +1,12 @@
 package runtime
 
 import (
-	"github.com/tetratelabs/wazero/api"
 	"reflect"
 	"strings"
 	"sync"
 	"unicode"
+
+	"github.com/tetratelabs/wazero/api"
 
 	"github.com/wippyai/wasm-runtime/engine"
 	"github.com/wippyai/wasm-runtime/errors"
