@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+
 	"github.com/tetratelabs/wazero/api"
 
 	"github.com/wippyai/wasm-runtime/component"

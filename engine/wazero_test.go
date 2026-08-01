@@ -254,6 +254,9 @@ func TestWazeroInstance_MemorySize(t *testing.T) {
 			t.Fatalf("Instantiate: %v", err)
 		}
 		defer inst.Close(ctx)
+		if !inst.HasMemory() {
+			t.Fatal("expected instance memory")
+		}
 
 		size := inst.MemorySize()
 		if size != 65536 {
@@ -287,9 +290,35 @@ func TestWazeroInstance_MemorySize(t *testing.T) {
 
 	t.Run("nil_memory", func(t *testing.T) {
 		inst := &WazeroInstance{}
+		if inst.HasMemory() {
+			t.Fatal("empty instance reported memory")
+		}
 		size := inst.MemorySize()
 		if size != 0 {
 			t.Errorf("expected 0 for nil memory, got %d", size)
+		}
+	})
+
+	t.Run("module_without_memory", func(t *testing.T) {
+		mod, err := eng.LoadModule(ctx, []byte{
+			0x00, 0x61, 0x73, 0x6d,
+			0x01, 0x00, 0x00, 0x00,
+		})
+		if err != nil {
+			t.Fatalf("LoadModule: %v", err)
+		}
+
+		inst, err := mod.Instantiate(ctx)
+		if err != nil {
+			t.Fatalf("Instantiate: %v", err)
+		}
+		defer inst.Close(ctx)
+
+		if inst.HasMemory() {
+			t.Fatal("memoryless module reported memory")
+		}
+		if size := inst.MemorySize(); size != 0 {
+			t.Fatalf("MemorySize() = %d, want 0", size)
 		}
 	})
 }

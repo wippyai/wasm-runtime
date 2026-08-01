@@ -824,7 +824,7 @@ func (m *WazeroModule) InstantiateWithConfig(ctx context.Context, cfg *InstanceC
 	}
 
 	// Cache memory
-	if mem := instance.Memory(); mem != nil {
+	if mem := instance.Memory(); hasMemory(mem) {
 		wazInst.memory = &WazeroMemory{mem: mem}
 	}
 
@@ -950,7 +950,7 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 	}
 
 	// Cache memory
-	if mem := inst.Memory(); mem != nil {
+	if mem := inst.Memory(); hasMemory(mem) {
 		wazInst.memory = &WazeroMemory{mem: mem}
 	}
 
@@ -1032,9 +1032,14 @@ func (i *WazeroInstance) GetExportedFunction(name string) api.Function {
 	return i.getExportedFunction(name)
 }
 
+// HasMemory reports whether the instance has linear memory.
+func (i *WazeroInstance) HasMemory() bool {
+	return i != nil && i.memory != nil && hasMemory(i.memory.mem)
+}
+
 // MemorySize returns the current linear memory size in bytes, or 0 if no memory.
 func (i *WazeroInstance) MemorySize() uint32 {
-	if i.memory == nil {
+	if !i.HasMemory() {
 		return 0
 	}
 	return i.memory.Size()
@@ -1326,6 +1331,14 @@ type WazeroMemory struct {
 	mem api.Memory
 }
 
+func hasMemory(mem api.Memory) bool {
+	if mem == nil {
+		return false
+	}
+	v := reflect.ValueOf(mem)
+	return v.Kind() != reflect.Pointer || !v.IsNil()
+}
+
 func (m *WazeroMemory) Read(offset uint32, length uint32) ([]byte, error) {
 	data, ok := m.mem.Read(offset, length)
 	if !ok {
@@ -1404,7 +1417,7 @@ func (m *WazeroModule) buildTypedHostFunc(wrapper *LowerWrapper) api.GoModuleFun
 }
 
 func (m *WazeroMemory) Size() uint32 {
-	if m.mem == nil {
+	if m == nil || !hasMemory(m.mem) {
 		return 0
 	}
 	return m.mem.Size()
