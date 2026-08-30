@@ -104,6 +104,18 @@ func (t *UnifiedTable) Len() int {
 	return t.backend.Len()
 }
 
+// Count returns the number of live resources with the given type ID.
+func (t *UnifiedTable) Count(typeID uint32) int {
+	count := 0
+	t.backend.Each(func(_ Handle, candidate uint32, _ any) bool {
+		if candidate == typeID {
+			count++
+		}
+		return true
+	})
+	return count
+}
+
 // Clear drops all resources.
 func (t *UnifiedTable) Clear() {
 	// Collect handles first to avoid holding lock during Remove

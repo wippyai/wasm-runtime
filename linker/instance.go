@@ -2463,6 +2463,9 @@ func (inst *Instance) Graph() *component.InstanceGraph {
 func (inst *Instance) Close(ctx context.Context) error {
 	// Unregister from instance registry
 	instanceRegistry.Delete(inst.instanceID)
+	if inst.resources != nil {
+		inst.resources.Close()
+	}
 
 	// Close core modules (instance-specific, scoped by instanceID)
 	var firstErr error

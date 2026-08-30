@@ -12,6 +12,7 @@ type Handle uint32
 type ResourceStore struct {
 	tables map[uint32]*ResourceTable
 	mu     sync.RWMutex
+	closed bool
 }
 
 // NewResourceStore creates an empty resource store.
@@ -25,6 +26,9 @@ func NewResourceStore() *ResourceStore {
 func (s *ResourceStore) Table(typeID uint32) *ResourceTable {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return &ResourceTable{closed: true}
+	}
 
 	if t, ok := s.tables[typeID]; ok {
 		return t
@@ -35,10 +39,33 @@ func (s *ResourceStore) Table(typeID uint32) *ResourceTable {
 	return t
 }
 
+// Close drops every live resource in the store. It is safe to call more than
+// once.
+func (s *ResourceStore) Close() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	tables := make([]*ResourceTable, 0, len(s.tables))
+	for _, table := range s.tables {
+		tables = append(tables, table)
+	}
+	s.mu.Unlock()
+
+	for _, table := range tables {
+		table.close()
+	}
+}
+
 // TableWithDtor returns or creates a resource table with a destructor
 func (s *ResourceStore) TableWithDtor(typeID uint32, dtor func(rep uint32)) *ResourceTable {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return &ResourceTable{dtor: dtor, closed: true}
+	}
 
 	if t, ok := s.tables[typeID]; ok {
 		return t
@@ -62,6 +89,38 @@ type ResourceTable struct {
 	entries  []ResourceEntry
 	freeList []Handle
 	mu       sync.Mutex
+	closed   bool
+}
+
+func (t *ResourceTable) close() {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	if t.dtor == nil {
+		for i := range t.entries {
+			t.entries[i].RefCount = 0
+		}
+		t.freeList = nil
+		t.mu.Unlock()
+		return
+	}
+
+	reps := make([]uint32, 0, len(t.entries))
+	for i := range t.entries {
+		if t.entries[i].RefCount > 0 {
+			reps = append(reps, t.entries[i].Rep)
+			t.entries[i].RefCount = 0
+		}
+	}
+	t.freeList = nil
+	t.mu.Unlock()
+
+	for _, rep := range reps {
+		t.dtor(rep)
+	}
 }
 
 // NewResourceTable creates an empty table with optional destructor.
@@ -75,6 +134,9 @@ func NewResourceTable(dtor func(rep uint32)) *ResourceTable {
 func (t *ResourceTable) New(rep uint32) Handle {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.closed {
+		return 0
+	}
 
 	entry := ResourceEntry{
 		Rep:      rep,
