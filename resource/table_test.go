@@ -57,6 +57,20 @@ func TestUnifiedTable_Basic(t *testing.T) {
 	}
 }
 
+func TestUnifiedTable_Count(t *testing.T) {
+	table := NewTable()
+	table.Insert(1, "first")
+	table.Insert(2, "other")
+	table.Insert(1, "second")
+
+	if got := table.Count(1); got != 2 {
+		t.Fatalf("Count(1) = %d, want 2", got)
+	}
+	if got := table.Count(3); got != 0 {
+		t.Fatalf("Count(3) = %d, want 0", got)
+	}
+}
+
 func TestUnifiedTable_Observer(t *testing.T) {
 	table := NewTable()
 	obs := &testObserver{}

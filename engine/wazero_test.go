@@ -7,8 +7,17 @@ import (
 	"testing"
 	"testing/fstest"
 
+	"github.com/wippyai/wasm-runtime/resource"
 	"github.com/wippyai/wasm-runtime/wat"
 )
+
+type closeProbe struct {
+	dropped bool
+}
+
+func (p *closeProbe) Drop() {
+	p.dropped = true
+}
 
 func TestConfig_Defaults(t *testing.T) {
 	cfg := &Config{}
@@ -79,6 +88,35 @@ func TestWazeroEngine_Close(t *testing.T) {
 	err = engine.Close(ctx)
 	if err != nil {
 		t.Errorf("Close failed: %v", err)
+	}
+}
+
+func TestWazeroInstanceCloseDropsHostResources(t *testing.T) {
+	probe := &closeProbe{}
+	resources := resource.NewTable()
+	resources.Insert(1, probe)
+	inst := &WazeroInstance{resources: resources}
+
+	if err := inst.Close(context.Background()); err != nil {
+		t.Fatalf("close instance: %v", err)
+	}
+	if !probe.dropped {
+		t.Fatal("instance close did not drop its host resource")
+	}
+}
+
+func TestWazeroInstanceCallResourcesAreInstanceScoped(t *testing.T) {
+	first := &WazeroInstance{resources: resource.NewTable()}
+	second := &WazeroInstance{resources: resource.NewTable()}
+
+	if got := ResourcesFromContext(first.prepareCallContext(context.Background())); got != first.resources {
+		t.Fatalf("first call resources = %p, want %p", got, first.resources)
+	}
+	if got := ResourcesFromContext(second.prepareCallContext(context.Background())); got != second.resources {
+		t.Fatalf("second call resources = %p, want %p", got, second.resources)
+	}
+	if first.resources == second.resources {
+		t.Fatal("instances share their host resource table")
 	}
 }
 

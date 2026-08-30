@@ -2282,6 +2282,30 @@ func TestInstance_GetModule(t *testing.T) {
 	}
 }
 
+func TestInstanceCloseDropsOwnedResources(t *testing.T) {
+	var dropped []uint32
+	inst := &Instance{resources: NewResourceStore()}
+	table := inst.resources.TableWithDtor(1, func(rep uint32) {
+		dropped = append(dropped, rep)
+	})
+	table.New(41)
+	table.New(42)
+
+	if err := inst.Close(context.Background()); err != nil {
+		t.Fatalf("close instance: %v", err)
+	}
+	if len(dropped) != 2 || dropped[0] != 41 || dropped[1] != 42 {
+		t.Fatalf("resource destructors = %v, want [41 42]", dropped)
+	}
+	table.New(43)
+	if err := inst.Close(context.Background()); err != nil {
+		t.Fatalf("close instance again: %v", err)
+	}
+	if len(dropped) != 2 {
+		t.Fatalf("resource destructors ran after close: %v", dropped)
+	}
+}
+
 func TestInstance_Graph(t *testing.T) {
 	ctx := context.Background()
 	rt := wazero.NewRuntime(ctx)

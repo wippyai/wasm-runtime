@@ -20,8 +20,18 @@ import (
 	"github.com/wippyai/wasm-runtime/asyncify"
 	"github.com/wippyai/wasm-runtime/component"
 	"github.com/wippyai/wasm-runtime/linker"
+	"github.com/wippyai/wasm-runtime/resource"
 	"github.com/wippyai/wasm-runtime/transcoder"
 )
+
+type resourcesContextKey struct{}
+
+// ResourcesFromContext returns the host resource table owned by the instance
+// executing the current call.
+func ResourcesFromContext(ctx context.Context) *resource.UnifiedTable {
+	resources, _ := ctx.Value(resourcesContextKey{}).(*resource.UnifiedTable)
+	return resources
+}
 
 // WazeroEngine implements Engine using wazero runtime
 type WazeroEngine struct {
@@ -821,6 +831,7 @@ func (m *WazeroModule) InstantiateWithConfig(ctx context.Context, cfg *InstanceC
 		funcCache: make(map[string]api.Function),
 		liftCache: make(map[string]*cachedLift),
 		stackBuf:  make([]uint64, 16), // pre-allocate stack buffer
+		resources: resource.NewTable(),
 	}
 
 	// Cache memory
@@ -947,6 +958,7 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 		liftCache:  make(map[string]*cachedLift),
 		stackBuf:   make([]uint64, 16),
 		linkerInst: inst,
+		resources:  resource.NewTable(),
 	}
 
 	// Cache memory
@@ -994,16 +1006,17 @@ func (m *WazeroModule) decoderForConfig(cfg *InstanceConfig) *transcoder.Decoder
 // It is NOT safe for concurrent use from multiple goroutines.
 // Each goroutine should have its own Instance, or access must be synchronized externally.
 type WazeroInstance struct {
+	freeFn     api.Function
 	allocFn    api.Function
 	instance   api.Module
-	freeFn     api.Function
-	memory     *WazeroMemory
+	module     *WazeroModule
+	encoder    *transcoder.Encoder
 	compiler   *transcoder.Compiler
 	funcCache  map[string]api.Function
 	liftCache  map[string]*cachedLift
-	module     *WazeroModule
+	resources  *resource.UnifiedTable
 	decoder    *transcoder.Decoder
-	encoder    *transcoder.Encoder
+	memory     *WazeroMemory
 	alloc      *wazeroAllocator
 	linkerInst *linker.Instance
 	asyncify   *Asyncify
@@ -1049,6 +1062,7 @@ func (i *WazeroInstance) MemorySize() uint32 {
 // This is needed for host handlers to resolve the correct instance when
 // called from synthetic shim modules that don't have instanceID suffix.
 func (i *WazeroInstance) prepareCallContext(ctx context.Context) context.Context {
+	ctx = context.WithValue(ctx, resourcesContextKey{}, i.resources)
 	if i.linkerInst != nil {
 		return linker.WithInstance(ctx, i.linkerInst)
 	}
@@ -1302,6 +1316,12 @@ func (a *wazeroAllocator) Free(ptr, size, align uint32) {
 
 func (i *WazeroInstance) Close(ctx context.Context) error {
 	var firstErr error
+	if i.resources != nil {
+		if err := i.resources.Close(); err != nil {
+			firstErr = err
+		}
+		i.resources = nil
+	}
 	// Close linker instance if present (for multi-module components)
 	if i.linkerInst != nil {
 		if err := i.linkerInst.Close(ctx); err != nil {
