@@ -51,15 +51,53 @@ func (r *Reader) ReadByte() (byte, error) {
 	return b, nil
 }
 
+// ReadVectorCount reads a vector length from a bounded byte reader. Every
+// encoded element must occupy at least one byte. Check that lower bound before
+// callers allocate from an untrusted count; element parsing still validates the
+// full encoding. This is not a bound on decoded module memory usage.
+func (r *Reader) ReadVectorCount() (uint32, error) {
+	count, err := r.ReadU32()
+	if err != nil {
+		return 0, err
+	}
+	br, ok := r.r.(*bytes.Reader)
+	if !ok {
+		return 0, errors.New("vector count requires bounded byte reader")
+	}
+	if uint64(count) > uint64(br.Len()) {
+		return 0, fmt.Errorf("vector count %d exceeds remaining bytes %d: %w", count, br.Len(), io.ErrUnexpectedEOF)
+	}
+	return count, nil
+}
+
 // ReadBytes reads exactly n bytes.
 func (r *Reader) ReadBytes(n int) ([]byte, error) {
-	buf := make([]byte, n)
+	if n < 0 {
+		return nil, errors.New("negative byte length")
+	}
+	if br, ok := r.r.(*bytes.Reader); ok {
+		if n > br.Len() {
+			// Preserve consumed-byte position on truncation without allocating
+			// storage for the untrusted claimed length.
+			remaining := br.Len()
+			_, _ = br.Seek(0, io.SeekEnd)
+			r.pos += remaining
+			return nil, io.EOF
+		}
+		buf := make([]byte, n)
+		read, err := io.ReadFull(br, buf)
+		r.pos += read
+		return buf, err
+	}
+	// Generic byte readers may not expose their remaining length. Grow only
+	// from bytes actually read instead of trusting a declared length.
+	buf := []byte{}
 	for i := 0; i < n; i++ {
 		b, err := r.ReadByte()
 		if err != nil {
 			return nil, err
 		}
-		buf[i] = b
+		buf = append(buf, b)
 	}
 	return buf, nil
 }
