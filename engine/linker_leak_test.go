@@ -12,6 +12,11 @@ import (
 // TestBridgeModuleCleanup verifies that bridge modules are properly closed
 // when all instances using them are closed, by measuring memory.
 func TestBridgeModuleCleanup(t *testing.T) {
+	// Race tracking retains allocations beyond module lifetime. Deterministic
+	// survivor/refcount tests cover teardown under -race; measure heap normally.
+	if isRaceDetectorEnabled() {
+		t.Skip("heap measurements are unreliable under the race detector")
+	}
 	ctx := context.Background()
 
 	wasmBytes := getCalculatorComponent(t)
