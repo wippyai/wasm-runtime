@@ -102,6 +102,34 @@ func (r *Reader) ReadBytes(n int) ([]byte, error) {
 	return buf, nil
 }
 
+// Skip advances the reader position by n bytes without allocating.
+func (r *Reader) Skip(n int) error {
+	if n < 0 {
+		return errors.New("negative skip")
+	}
+	if n == 0 {
+		return nil
+	}
+	if br, ok := r.r.(*bytes.Reader); ok {
+		if int64(br.Len()) < int64(n) {
+			return io.EOF
+		}
+		_, err := br.Seek(int64(n), io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		r.pos += n
+		return nil
+	}
+	for i := 0; i < n; i++ {
+		_, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ReadU32 reads an unsigned LEB128 encoded uint32.
 func (r *Reader) ReadU32() (uint32, error) {
 	var result uint32

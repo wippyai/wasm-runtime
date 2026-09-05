@@ -56,6 +56,54 @@ func TestReaderReadBytes(t *testing.T) {
 	}
 }
 
+func TestReaderSkip(t *testing.T) {
+	data := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+	r := NewReader(bytes.NewReader(data))
+
+	// Skip 0
+	if err := r.Skip(0); err != nil {
+		t.Fatalf("Skip(0): %v", err)
+	}
+	if r.Position() != 0 {
+		t.Errorf("pos after Skip(0): got %d, want 0", r.Position())
+	}
+
+	// Skip 2
+	if err := r.Skip(2); err != nil {
+		t.Fatalf("Skip(2): %v", err)
+	}
+	if r.Position() != 2 {
+		t.Errorf("pos after Skip(2): got %d, want 2", r.Position())
+	}
+
+	// Read next byte
+	b, err := r.ReadByte()
+	if err != nil {
+		t.Fatalf("ReadByte: %v", err)
+	}
+	if b != 0x03 {
+		t.Errorf("ReadByte after Skip: got 0x%02x, want 0x03", b)
+	}
+
+	// Skip 2 to end
+	if err := r.Skip(2); err != nil {
+		t.Fatalf("Skip(2) to end: %v", err)
+	}
+	if r.Position() != 5 {
+		t.Errorf("pos after Skip to end: got %d, want 5", r.Position())
+	}
+
+	// Skip past EOF
+	if err := r.Skip(1); !errors.Is(err, io.EOF) {
+		t.Errorf("expected EOF on Skip past end, got %v", err)
+	}
+
+	// Negative skip
+	if err := r.Skip(-1); err == nil {
+		t.Error("expected error on negative skip")
+	}
+}
+
 func TestReaderReadU32(t *testing.T) {
 	tests := []struct {
 		encoded []byte

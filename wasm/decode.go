@@ -17,6 +17,10 @@ var (
 
 // ParseModule parses a WebAssembly binary module
 func ParseModule(data []byte) (*Module, error) {
+	return parseModule(data, false)
+}
+
+func parseModule(data []byte, metadataOnly bool) (*Module, error) {
 	r := binary.NewReader(bytes.NewReader(data))
 
 	// Check magic number
@@ -66,6 +70,13 @@ func ParseModule(data []byte) (*Module, error) {
 		sectionSize, err := r.ReadU32()
 		if err != nil {
 			return nil, r.WrapError("section size", err)
+		}
+
+		if metadataOnly && (sectionID == SectionCode || sectionID == SectionData) {
+			if err := r.Skip(int(sectionSize)); err != nil {
+				return nil, r.WrapError("section data", err)
+			}
+			continue
 		}
 
 		sectionData, err := r.ReadBytes(int(sectionSize))
