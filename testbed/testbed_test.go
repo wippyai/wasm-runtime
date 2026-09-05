@@ -2,6 +2,7 @@ package testbed
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -238,7 +239,17 @@ func TestMinimal_ConcurrentInstances(t *testing.T) {
 
 				expected := a * b
 				if result != expected {
+					errors <- fmt.Errorf("instance %d call %d returned %v, want %d", goroutineID, i, result, expected)
+					return
+				}
+				result, err = inst.CallWithTypes(ctx, "compute-using-host",
+					[]wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, a, b)
+				if err != nil {
 					errors <- err
+					return
+				}
+				if result != a+b {
+					errors <- fmt.Errorf("instance %d host call %d returned %v, want %d", goroutineID, i, result, a+b)
 					return
 				}
 			}

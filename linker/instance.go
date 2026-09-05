@@ -74,6 +74,61 @@ func lookupInstanceFromCaller(caller api.Module) *Instance {
 	return nil
 }
 
+// virtualHostKey identifies a function-only virtual host export by import
+// namespace and export name so distinct component layouts can share an interface.
+type virtualHostKey struct {
+	namespace string
+	name      string
+}
+
+func (inst *Instance) registerVirtualHostFn(namespace, name string, fn api.GoModuleFunc) {
+	inst.virtualHostMu.Lock()
+	defer inst.virtualHostMu.Unlock()
+	if inst.virtualHostFns == nil {
+		inst.virtualHostFns = make(map[virtualHostKey]api.GoModuleFunc)
+	}
+	inst.virtualHostFns[virtualHostKey{namespace: namespace, name: name}] = fn
+}
+
+func (inst *Instance) lookupVirtualHostFn(namespace, name string) api.GoModuleFunc {
+	inst.virtualHostMu.RLock()
+	defer inst.virtualHostMu.RUnlock()
+	if inst.virtualHostFns == nil {
+		return nil
+	}
+	return inst.virtualHostFns[virtualHostKey{namespace: namespace, name: name}]
+}
+
+func clearVirtualHostFns(inst *Instance) {
+	inst.virtualHostMu.Lock()
+	inst.virtualHostFns = nil
+	inst.virtualHostMu.Unlock()
+}
+
+// dispatchVirtualHostExport is the immutable thunk exported by a shared virtual
+// host module. It selects the active instance's original handler and never
+// stores or invokes another dispatcher.
+func dispatchVirtualHostExport(owner *Instance, namespace, name string, original api.GoModuleFunc) api.GoModuleFunc {
+	return func(ctx context.Context, caller api.Module, stack []uint64) {
+		var active *Instance
+		if caller != nil {
+			active = lookupInstanceFromCaller(caller)
+		}
+		if active == nil {
+			active = InstanceFromContext(ctx)
+		}
+		if active == nil || active == owner {
+			original(ctx, caller, stack)
+			return
+		}
+		handler := active.lookupVirtualHostFn(namespace, name)
+		if handler == nil {
+			panic(fmt.Sprintf("virtual host binding missing for %s#%s", namespace, name))
+		}
+		handler(ctx, caller, stack)
+	}
+}
+
 // resolveMemory returns cached memory and allocator, resolving on first call.
 // Not thread-safe.
 func (inst *Instance) resolveMemory() (api.Memory, api.Function) {
@@ -126,6 +181,7 @@ type Instance struct {
 	coreInstances   map[int]*coreInstance
 	bridgeModules   map[string]bool
 	virtualBridges  map[string]bool
+	virtualHostFns  map[virtualHostKey]api.GoModuleFunc
 	pre             *InstancePre
 	exports         map[string]Export
 	encoder         *transcoder.Encoder
@@ -133,6 +189,7 @@ type Instance struct {
 	layoutCalc      *transcoder.LayoutCalculator
 	modules         []api.Module
 	valueSpace      []uint64
+	virtualHostMu   sync.RWMutex
 	instanceID      uint64
 	memResolved     bool
 }
@@ -687,12 +744,25 @@ func (inst *Instance) createBridgeFrom(ctx context.Context, name string, source 
 
 	needsReplace := source.module != nil && inst.virtualBridges[name]
 
+	if source.virtual != nil {
+		for i := range exports {
+			expName := exportName(exports[i].Name)
+			inst.registerVirtualHostFn(name, expName, exports[i].Fn)
+		}
+	}
+
 	buildHost := func() (api.Module, error) {
 		builder := inst.pre.linker.runtime.NewHostModuleBuilder(name)
-		for _, exp := range exports {
+		for i := range exports {
+			exp := exports[i]
+			expName := exportName(exp.Name)
+			fn := exp.Fn
+			if source.virtual != nil {
+				fn = dispatchVirtualHostExport(inst, name, expName, exp.Fn)
+			}
 			builder.NewFunctionBuilder().
-				WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
-				Export(exportName(exp.Name))
+				WithGoModuleFunction(fn, exp.ParamTypes, exp.ResultTypes).
+				Export(expName)
 		}
 		return builder.Instantiate(ctx)
 	}
@@ -2483,6 +2553,7 @@ func (inst *Instance) Close(ctx context.Context) error {
 	inst.exports = nil
 	inst.bridgeModules = nil
 	inst.coreInstances = nil
+	clearVirtualHostFns(inst)
 	return firstErr
 }
 
