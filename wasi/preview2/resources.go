@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/wippyai/wasm-runtime/resource"
@@ -90,10 +91,25 @@ func (t *ResourceTable) Clear() {
 	t.table.Clear()
 }
 
+// Close drops and removes all resources.
+func (t *ResourceTable) Close() error {
+	return t.table.Close()
+}
+
+// SocketBudget returns the socket budget associated with this table, if bounded.
+func (t *ResourceTable) SocketBudget() *SocketBudget {
+	if t == nil || t.budget == nil {
+		return nil
+	}
+	return t.budget.socketBudget
+}
+
 // resourceAdapter adapts preview2.Resource to resource.WASIResource
 type resourceAdapter struct {
 	resource Resource
 	budget   *resourceBudget
+	lease    *SocketLease
+	once     sync.Once
 }
 
 func (a *resourceAdapter) WASIResourceType() resource.WASIResourceType {
@@ -102,12 +118,17 @@ func (a *resourceAdapter) WASIResourceType() resource.WASIResourceType {
 
 // Drop implements resource.Dropper to ensure resource cleanup
 func (a *resourceAdapter) Drop() {
-	if a.budget != nil {
-		defer a.budget.release(a.resource.Type())
-	}
-	if a.resource != nil {
-		a.resource.Drop()
-	}
+	a.once.Do(func() {
+		// Keep reservations until the underlying resources actually close.
+		// These fields remain immutable for concurrent Get/type inspection.
+		defer a.lease.Release()
+		if a.budget != nil {
+			defer a.budget.releaseHandle()
+		}
+		if a.resource != nil {
+			a.resource.Drop()
+		}
+	})
 }
 
 // Pollable is the interface for async-ready resources that can be polled.
