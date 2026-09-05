@@ -605,28 +605,30 @@ type TCPSocketResource struct {
 	listener           interface{}
 	pendingErr         error
 	conn               interface{}
+	pendingOp          TCPNetworkOperation
 	acceptQueue        *TCPAcceptQueue
 	output             *TCPOutputStreamResource
 	input              *TCPInputStreamResource
+	notifyCh           chan struct{}
 	localAddr          string
 	remoteAddr         string
-	receiveBufferSize  uint64
+	listenBacklogSize  uint64
 	keepAliveIdleTime  uint64
 	keepAliveInterval  uint64
+	receiveBufferSize  uint64
 	sendBufferSize     uint64
-	listenBacklogSize  uint64
 	dropOnce           sync.Once
 	mu                 sync.Mutex
 	keepAliveCount     uint32
 	inputStreamHandle  uint32
 	outputStreamHandle uint32
-	remotePort         uint16
 	localPort          uint16
-	keepAliveEnabled   bool
+	remotePort         uint16
 	hopLimit           uint8
 	state              TCPState
 	family             uint8
 	dropped            bool
+	keepAliveEnabled   bool
 }
 
 func NewTCPSocketResource(family uint8) *TCPSocketResource {
@@ -649,11 +651,19 @@ func (s *TCPSocketResource) Drop() {
 		s.mu.Lock()
 		s.dropped = true
 		s.state = TCPStateClosed
-		conn, listener, input, output, acceptQueue := s.conn, s.listener, s.input, s.output, s.acceptQueue
+		conn, listener, input, output, acceptQueue, pendingOp := s.conn, s.listener, s.input, s.output, s.acceptQueue, s.pendingOp
 		s.conn = nil
 		s.listener = nil
 		s.acceptQueue = nil
+		s.pendingOp = nil
+		if s.notifyCh != nil {
+			close(s.notifyCh)
+			s.notifyCh = nil
+		}
 		s.mu.Unlock()
+		if pendingOp != nil {
+			_ = pendingOp.Close()
+		}
 		if acceptQueue != nil {
 			acceptQueue.Drop()
 		}
@@ -687,6 +697,10 @@ func (s *TCPSocketResource) SetState(state TCPState) {
 	defer s.mu.Unlock()
 	if !s.dropped {
 		s.state = state
+		if s.notifyCh != nil {
+			close(s.notifyCh)
+			s.notifyCh = nil
+		}
 	}
 }
 func (s *TCPSocketResource) IsListening() bool {
@@ -734,6 +748,10 @@ func (s *TCPSocketResource) SetConn(conn interface{}) {
 	s.mu.Lock()
 	if !s.dropped {
 		s.conn = conn
+		if s.notifyCh != nil {
+			close(s.notifyCh)
+			s.notifyCh = nil
+		}
 		s.mu.Unlock()
 		return
 	}
@@ -751,6 +769,10 @@ func (s *TCPSocketResource) SetListener(listener interface{}) {
 	s.mu.Lock()
 	if !s.dropped {
 		s.listener = listener
+		if s.notifyCh != nil {
+			close(s.notifyCh)
+			s.notifyCh = nil
+		}
 		s.mu.Unlock()
 		return
 	}
@@ -785,6 +807,10 @@ func (s *TCPSocketResource) SetAcceptQueue(queue *TCPAcceptQueue) error {
 		return errors.New("accept queue already attached")
 	}
 	s.acceptQueue = queue
+	if s.notifyCh != nil {
+		close(s.notifyCh)
+		s.notifyCh = nil
+	}
 	s.mu.Unlock()
 	return nil
 }
@@ -799,8 +825,20 @@ func (s *TCPSocketResource) SetPendingError(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pendingErr = err
+	if s.notifyCh != nil {
+		close(s.notifyCh)
+		s.notifyCh = nil
+	}
 }
-func (s *TCPSocketResource) ClearPendingError() { s.mu.Lock(); defer s.mu.Unlock(); s.pendingErr = nil }
+func (s *TCPSocketResource) ClearPendingError() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingErr = nil
+	if s.notifyCh != nil {
+		close(s.notifyCh)
+		s.notifyCh = nil
+	}
+}
 
 // StreamHandles returns the input and output stream handles
 func (s *TCPSocketResource) StreamHandles() (uint32, uint32) {
