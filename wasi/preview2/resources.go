@@ -122,7 +122,7 @@ func (a *resourceAdapter) Drop() {
 	a.once.Do(func() {
 		// Keep reservations until the underlying resources actually close.
 		// These fields remain immutable for concurrent Get/type inspection.
-		defer a.lease.Release()
+		defer a.lease.releaseTable()
 		if a.budget != nil {
 			defer a.budget.releaseHandle()
 		}
@@ -602,23 +602,24 @@ const (
 
 // TCPSocketResource represents a TCP socket with full connection lifecycle.
 type TCPSocketResource struct {
-	input              *TCPInputStreamResource
-	output             *TCPOutputStreamResource
 	listener           interface{}
 	pendingErr         error
 	conn               interface{}
+	acceptQueue        *TCPAcceptQueue
+	output             *TCPOutputStreamResource
+	input              *TCPInputStreamResource
 	localAddr          string
 	remoteAddr         string
-	mu                 sync.Mutex
-	dropOnce           sync.Once
+	receiveBufferSize  uint64
 	keepAliveIdleTime  uint64
 	keepAliveInterval  uint64
-	receiveBufferSize  uint64
 	sendBufferSize     uint64
 	listenBacklogSize  uint64
-	outputStreamHandle uint32
-	inputStreamHandle  uint32
+	dropOnce           sync.Once
+	mu                 sync.Mutex
 	keepAliveCount     uint32
+	inputStreamHandle  uint32
+	outputStreamHandle uint32
 	remotePort         uint16
 	localPort          uint16
 	keepAliveEnabled   bool
@@ -648,10 +649,14 @@ func (s *TCPSocketResource) Drop() {
 		s.mu.Lock()
 		s.dropped = true
 		s.state = TCPStateClosed
-		conn, listener, input, output := s.conn, s.listener, s.input, s.output
+		conn, listener, input, output, acceptQueue := s.conn, s.listener, s.input, s.output, s.acceptQueue
 		s.conn = nil
 		s.listener = nil
+		s.acceptQueue = nil
 		s.mu.Unlock()
+		if acceptQueue != nil {
+			acceptQueue.Drop()
+		}
 		if input != nil {
 			input.Drop()
 		}
@@ -661,7 +666,7 @@ func (s *TCPSocketResource) Drop() {
 		if c, ok := conn.(interface{ Close() error }); ok {
 			_ = c.Close()
 		}
-		if l, ok := listener.(interface{ Close() error }); ok {
+		if l, ok := listener.(interface{ Close() error }); ok && acceptQueue == nil {
 			_ = l.Close()
 		}
 		if input != nil && input.buffer != nil {
@@ -669,6 +674,9 @@ func (s *TCPSocketResource) Drop() {
 		}
 		if output != nil && output.buffer != nil {
 			output.buffer.WaitClosed()
+		}
+		if acceptQueue != nil {
+			acceptQueue.WaitClosed()
 		}
 	})
 }
@@ -750,6 +758,35 @@ func (s *TCPSocketResource) SetListener(listener interface{}) {
 	if c, ok := listener.(interface{ Close() error }); ok {
 		_ = c.Close()
 	}
+}
+
+// AcceptQueue returns the attached accept queue, if any.
+func (s *TCPSocketResource) AcceptQueue() *TCPAcceptQueue {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acceptQueue
+}
+
+// SetAcceptQueue attaches an accept queue to the socket.
+// If the socket has already been dropped or closed, it rejects late attach,
+// drops the provided queue, and returns resource.ErrClosed.
+func (s *TCPSocketResource) SetAcceptQueue(queue *TCPAcceptQueue) error {
+	if queue == nil {
+		return errors.New("nil accept queue")
+	}
+	s.mu.Lock()
+	if s.dropped || s.state == TCPStateClosed {
+		s.mu.Unlock()
+		queue.Drop()
+		return resource.ErrClosed
+	}
+	if s.acceptQueue != nil && s.acceptQueue != queue {
+		s.mu.Unlock()
+		return errors.New("accept queue already attached")
+	}
+	s.acceptQueue = queue
+	s.mu.Unlock()
+	return nil
 }
 
 // PendingError returns the pending error if any
