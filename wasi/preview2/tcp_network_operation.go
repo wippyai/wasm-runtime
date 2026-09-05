@@ -83,8 +83,8 @@ func (s *TCPSocketResource) PendingOperation() TCPNetworkOperation {
 //     (W1 finish handles state transitions and streams).
 //     Pending op is cleaned up (Close) outside the socket lock after safe transfer.
 //   - (false, err) on error (operation error, nil connection, or wrong type). Any returned
-//     closer is closed before removing ownership, pending op is closed outside the lock,
-//     and the error is returned.
+//     closer is closed before removing ownership, pending op is kept attached during op.Close
+//     outside the lock and cleared afterwards, and the error is returned.
 func (s *TCPSocketResource) ResolvePendingConnect() (bool, error) {
 	s.mu.Lock()
 
@@ -93,15 +93,16 @@ func (s *TCPSocketResource) ResolvePendingConnect() (bool, error) {
 		return false, resource.ErrClosed
 	}
 
+	if s.pendingErr != nil {
+		err := s.pendingErr
+		s.mu.Unlock()
+		return false, err
+	}
+
 	if s.pendingOp == nil {
 		if s.conn != nil {
 			s.mu.Unlock()
 			return true, nil
-		}
-		if s.pendingErr != nil {
-			err := s.pendingErr
-			s.mu.Unlock()
-			return false, err
 		}
 		if s.state != TCPStateConnectInProgress {
 			s.mu.Unlock()
@@ -121,47 +122,16 @@ func (s *TCPSocketResource) ResolvePendingConnect() (bool, error) {
 	}
 
 	if err != nil {
-		// Unavoidable wrong-result disposal: close any closer returned with error.
-		if closer != nil {
-			_ = closer.Close()
-		}
-		s.pendingErr = err
-		s.pendingOp = nil
-		if s.notifyCh != nil {
-			close(s.notifyCh)
-			s.notifyCh = nil
-		}
-		s.mu.Unlock()
-		_ = op.Close()
-		return false, err
+		return s.finishPendingErrorLocked(op, closer, err)
 	}
 
 	if closer == nil {
-		err = errors.New("nil connection from pending connect operation")
-		s.pendingErr = err
-		s.pendingOp = nil
-		if s.notifyCh != nil {
-			close(s.notifyCh)
-			s.notifyCh = nil
-		}
-		s.mu.Unlock()
-		_ = op.Close()
-		return false, err
+		return s.finishPendingErrorLocked(op, nil, errors.New("nil connection from pending connect operation"))
 	}
 
 	conn, ok := closer.(net.Conn)
 	if !ok {
-		_ = closer.Close()
-		err = errors.New("pending connect operation did not produce net.Conn")
-		s.pendingErr = err
-		s.pendingOp = nil
-		if s.notifyCh != nil {
-			close(s.notifyCh)
-			s.notifyCh = nil
-		}
-		s.mu.Unlock()
-		_ = op.Close()
-		return false, err
+		return s.finishPendingErrorLocked(op, closer, errors.New("pending connect operation did not produce net.Conn"))
 	}
 
 	// Safe transfer: install net.Conn atomically while holding socket lock.
@@ -198,8 +168,8 @@ func (s *TCPSocketResource) ResolvePendingConnect() (bool, error) {
 //     (W1 finish handles state transitions and acceptqueue).
 //     Pending op is cleaned up (Close) outside the socket lock after safe transfer.
 //   - (false, err) on error (operation error, nil listener, or wrong type). Any returned
-//     closer is closed before removing ownership, pending op is closed outside the lock,
-//     and the error is returned.
+//     closer is closed before removing ownership, pending op is kept attached during op.Close
+//     outside the lock and cleared afterwards, and the error is returned.
 func (s *TCPSocketResource) ResolvePendingListen() (bool, error) {
 	s.mu.Lock()
 
@@ -208,15 +178,16 @@ func (s *TCPSocketResource) ResolvePendingListen() (bool, error) {
 		return false, resource.ErrClosed
 	}
 
+	if s.pendingErr != nil {
+		err := s.pendingErr
+		s.mu.Unlock()
+		return false, err
+	}
+
 	if s.pendingOp == nil {
 		if s.listener != nil {
 			s.mu.Unlock()
 			return true, nil
-		}
-		if s.pendingErr != nil {
-			err := s.pendingErr
-			s.mu.Unlock()
-			return false, err
 		}
 		if s.state != TCPStateListenInProgress {
 			s.mu.Unlock()
@@ -236,46 +207,16 @@ func (s *TCPSocketResource) ResolvePendingListen() (bool, error) {
 	}
 
 	if err != nil {
-		if closer != nil {
-			_ = closer.Close()
-		}
-		s.pendingErr = err
-		s.pendingOp = nil
-		if s.notifyCh != nil {
-			close(s.notifyCh)
-			s.notifyCh = nil
-		}
-		s.mu.Unlock()
-		_ = op.Close()
-		return false, err
+		return s.finishPendingErrorLocked(op, closer, err)
 	}
 
 	if closer == nil {
-		err = errors.New("nil listener from pending listen operation")
-		s.pendingErr = err
-		s.pendingOp = nil
-		if s.notifyCh != nil {
-			close(s.notifyCh)
-			s.notifyCh = nil
-		}
-		s.mu.Unlock()
-		_ = op.Close()
-		return false, err
+		return s.finishPendingErrorLocked(op, nil, errors.New("nil listener from pending listen operation"))
 	}
 
 	listener, ok := closer.(net.Listener)
 	if !ok {
-		_ = closer.Close()
-		err = errors.New("pending listen operation did not produce net.Listener")
-		s.pendingErr = err
-		s.pendingOp = nil
-		if s.notifyCh != nil {
-			close(s.notifyCh)
-			s.notifyCh = nil
-		}
-		s.mu.Unlock()
-		_ = op.Close()
-		return false, err
+		return s.finishPendingErrorLocked(op, closer, errors.New("pending listen operation did not produce net.Listener"))
 	}
 
 	s.listener = listener
@@ -295,6 +236,31 @@ func (s *TCPSocketResource) ResolvePendingListen() (bool, error) {
 	_ = op.Close()
 
 	return true, nil
+}
+
+func (s *TCPSocketResource) finishPendingErrorLocked(op TCPNetworkOperation, closer io.Closer, err error) (bool, error) {
+	// Erroneous closer must physically close before ownership is detached.
+	if closer != nil {
+		_ = closer.Close()
+	}
+	s.pendingErr = err
+	if s.notifyCh != nil {
+		close(s.notifyCh)
+		s.notifyCh = nil
+	}
+	s.mu.Unlock()
+
+	// Keep operation attached during Close outside socket mutex so concurrent Drop
+	// will observe the operation and wait for its cleanup before quota release.
+	_ = op.Close()
+
+	s.mu.Lock()
+	if s.pendingOp == op {
+		s.pendingOp = nil
+	}
+	s.mu.Unlock()
+
+	return false, err
 }
 
 // Ready returns true if the socket is ready for immediate I/O or polling progress:

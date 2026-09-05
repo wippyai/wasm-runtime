@@ -878,3 +878,360 @@ func TestTCPSocket_Stress_ResolveVsDrop(t *testing.T) {
 		}
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Deterministic Error Gate Tests: Quota Preservation and Rejection During Cleanup
+// -----------------------------------------------------------------------------
+
+func TestTCPSocket_ResolvePendingConnect_ErrorGate_ReservationHeldUntilCloseJoined(t *testing.T) {
+	testCases := []struct {
+		name      string
+		useRemove bool
+	}{
+		{name: "TableRemove", useRemove: true},
+		{name: "TableClose", useRemove: false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			budget := NewSocketBudget(1)
+			table := NewResourceTableWithBudget(10, budget)
+
+			sock := NewTCPSocketResource(4)
+			sock.SetState(TCPStateConnectInProgress)
+
+			handle, err := table.TryAdd(sock)
+			if err != nil {
+				t.Fatalf("failed to add socket: %v", err)
+			}
+			if budget.Available() != 0 {
+				t.Fatalf("expected budget available=0, got %d", budget.Available())
+			}
+
+			closer := &fakeTrackedCloser{}
+			expectedErr := errors.New("connection failed")
+			op := newFakeOperation(closer, expectedErr, true)
+
+			gate := make(chan struct{})
+			closeStarted := make(chan struct{})
+			var startOnce sync.Once
+
+			op.closeHook = func() {
+				startOnce.Do(func() {
+					close(closeStarted)
+				})
+				<-gate
+			}
+
+			if err := sock.SetPendingOperation(op); err != nil {
+				t.Fatalf("failed to set pending operation: %v", err)
+			}
+
+			resolveDone := make(chan struct{})
+			var resolved bool
+			var resolveErr error
+
+			go func() {
+				defer close(resolveDone)
+				resolved, resolveErr = sock.ResolvePendingConnect()
+			}()
+
+			select {
+			case <-closeStarted:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for op.Close to start")
+			}
+
+			// 1. Returned erroneous closer must physically close before ownership is detached.
+			if closer.closeCount.Load() != 1 {
+				t.Fatalf("expected erroneous closer to be closed during Take error processing, got %d", closer.closeCount.Load())
+			}
+
+			// 2. New pending operation must not attach during cleanup.
+			newOp := newFakeOperation(nil, nil, false)
+			if err := sock.SetPendingOperation(newOp); err == nil {
+				t.Fatal("expected SetPendingOperation to fail while cleanup is in progress")
+			}
+			if newOp.closed.Load() {
+				t.Fatal("rejected new operation must not be closed")
+			}
+
+			// 3. Resolve in progress then table Remove/Close must not return reservation until gate released.
+			dropDone := make(chan struct{})
+			go func() {
+				defer close(dropDone)
+				if tc.useRemove {
+					table.Remove(handle)
+				} else {
+					_ = table.Close()
+				}
+			}()
+
+			select {
+			case <-dropDone:
+				t.Fatal("table drop returned before gate was released")
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			if budget.Available() != 0 {
+				t.Fatalf("quota released early! expected available=0 while gate blocked, got %d", budget.Available())
+			}
+
+			// Release the gate: op.Close finishes, Drop can finish, quota is returned.
+			close(gate)
+
+			select {
+			case <-resolveDone:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for ResolvePendingConnect to finish")
+			}
+
+			select {
+			case <-dropDone:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for table drop to finish")
+			}
+
+			if resolved {
+				t.Fatal("expected resolved=false")
+			}
+			if !errors.Is(resolveErr, expectedErr) {
+				t.Fatalf("expected resolve error %v, got %v", expectedErr, resolveErr)
+			}
+			if budget.Available() != 1 {
+				t.Fatalf("expected budget available=1 after gate released and Drop finished, got %d", budget.Available())
+			}
+		})
+	}
+}
+
+func TestTCPSocket_ResolvePendingListen_ErrorGate_ReservationHeldUntilCloseJoined(t *testing.T) {
+	testCases := []struct {
+		name      string
+		useRemove bool
+	}{
+		{name: "TableRemove", useRemove: true},
+		{name: "TableClose", useRemove: false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			budget := NewSocketBudget(1)
+			table := NewResourceTableWithBudget(10, budget)
+
+			sock := NewTCPSocketResource(4)
+			sock.SetState(TCPStateListenInProgress)
+
+			handle, err := table.TryAdd(sock)
+			if err != nil {
+				t.Fatalf("failed to add socket: %v", err)
+			}
+			if budget.Available() != 0 {
+				t.Fatalf("expected budget available=0, got %d", budget.Available())
+			}
+
+			closer := &fakeTrackedCloser{}
+			expectedErr := errors.New("listen failed")
+			op := newFakeOperation(closer, expectedErr, true)
+
+			gate := make(chan struct{})
+			closeStarted := make(chan struct{})
+			var startOnce sync.Once
+
+			op.closeHook = func() {
+				startOnce.Do(func() {
+					close(closeStarted)
+				})
+				<-gate
+			}
+
+			if err := sock.SetPendingOperation(op); err != nil {
+				t.Fatalf("failed to set pending operation: %v", err)
+			}
+
+			resolveDone := make(chan struct{})
+			var resolved bool
+			var resolveErr error
+
+			go func() {
+				defer close(resolveDone)
+				resolved, resolveErr = sock.ResolvePendingListen()
+			}()
+
+			select {
+			case <-closeStarted:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for op.Close to start")
+			}
+
+			// 1. Returned erroneous closer must physically close before ownership is detached.
+			if closer.closeCount.Load() != 1 {
+				t.Fatalf("expected erroneous closer to be closed during Take error processing, got %d", closer.closeCount.Load())
+			}
+
+			// 2. New pending operation must not attach during cleanup.
+			newOp := newFakeOperation(nil, nil, false)
+			if err := sock.SetPendingOperation(newOp); err == nil {
+				t.Fatal("expected SetPendingOperation to fail while cleanup is in progress")
+			}
+			if newOp.closed.Load() {
+				t.Fatal("rejected new operation must not be closed")
+			}
+
+			// 3. Resolve in progress then table Remove/Close must not return reservation until gate released.
+			dropDone := make(chan struct{})
+			go func() {
+				defer close(dropDone)
+				if tc.useRemove {
+					table.Remove(handle)
+				} else {
+					_ = table.Close()
+				}
+			}()
+
+			select {
+			case <-dropDone:
+				t.Fatal("table drop returned before gate was released")
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			if budget.Available() != 0 {
+				t.Fatalf("quota released early! expected available=0 while gate blocked, got %d", budget.Available())
+			}
+
+			// Release the gate: op.Close finishes, Drop can finish, quota is returned.
+			close(gate)
+
+			select {
+			case <-resolveDone:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for ResolvePendingListen to finish")
+			}
+
+			select {
+			case <-dropDone:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for table drop to finish")
+			}
+
+			if resolved {
+				t.Fatal("expected resolved=false")
+			}
+			if !errors.Is(resolveErr, expectedErr) {
+				t.Fatalf("expected resolve error %v, got %v", expectedErr, resolveErr)
+			}
+			if budget.Available() != 1 {
+				t.Fatalf("expected budget available=1 after gate released and Drop finished, got %d", budget.Available())
+			}
+		})
+	}
+}
+
+func TestTCPSocket_ResolvePendingError_NoDrop_PendingOpClearedAfterClose(t *testing.T) {
+	// Verify that when no Drop occurs, pendingOp is cleared after Close finishes.
+	sock := NewTCPSocketResource(4)
+	sock.SetState(TCPStateConnectInProgress)
+
+	expectedErr := errors.New("standalone connect error")
+	closer := &fakeTrackedCloser{}
+	op := newFakeOperation(closer, expectedErr, true)
+
+	gate := make(chan struct{})
+	closeStarted := make(chan struct{})
+	var startOnce sync.Once
+
+	op.closeHook = func() {
+		startOnce.Do(func() {
+			close(closeStarted)
+		})
+		<-gate
+	}
+
+	if err := sock.SetPendingOperation(op); err != nil {
+		t.Fatal(err)
+	}
+
+	resolveDone := make(chan struct{})
+	var resolved bool
+	var resolveErr error
+
+	go func() {
+		defer close(resolveDone)
+		resolved, resolveErr = sock.ResolvePendingConnect()
+	}()
+
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for op.Close to start")
+	}
+
+	// While blocked, pendingOp is still attached
+	if sock.PendingOperation() != op {
+		t.Fatal("pendingOp must remain attached during op.Close")
+	}
+
+	close(gate)
+
+	select {
+	case <-resolveDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for resolve to finish")
+	}
+
+	if resolved || !errors.Is(resolveErr, expectedErr) {
+		t.Fatalf("expected resolved=false, err=%v; got resolved=%v, err=%v", expectedErr, resolved, resolveErr)
+	}
+
+	// After Close finishes, pendingOp is cleared
+	if sock.PendingOperation() != nil {
+		t.Fatal("pendingOp must be cleared after op.Close finished")
+	}
+	if !errors.Is(sock.PendingError(), expectedErr) {
+		t.Fatalf("expected PendingError=%v, got %v", expectedErr, sock.PendingError())
+	}
+}
+
+func TestTCPSocket_Stress_ResolveErrorVsDrop(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		budget := NewSocketBudget(1)
+		table := NewResourceTableWithBudget(10, budget)
+
+		sock := NewTCPSocketResource(4)
+		sock.SetState(TCPStateConnectInProgress)
+
+		handle, err := table.TryAdd(sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		closer := &fakeTrackedCloser{}
+		op := newFakeOperation(closer, errors.New("transient error"), true)
+
+		if err := sock.SetPendingOperation(op); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			_, _ = sock.ResolvePendingConnect()
+		}()
+
+		go func() {
+			defer wg.Done()
+			table.Remove(handle)
+		}()
+
+		wg.Wait()
+
+		if closer.closeCount.Load() != 1 {
+			t.Fatalf("iteration %d: expected closer close count 1, got %d", i, closer.closeCount.Load())
+		}
+		if budget.Available() != 1 {
+			t.Fatalf("iteration %d: expected budget available 1, got %d", i, budget.Available())
+		}
+	}
+}
