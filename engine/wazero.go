@@ -277,8 +277,18 @@ type WazeroModule struct {
 	cachedPre     *linker.InstancePre
 	linker        *linker.Linker
 	rawBytes      []byte
+	transformed   bool
 	hostFuncsMu   sync.RWMutex
 	cachedPreMu   sync.RWMutex
+}
+
+// IsTransformed reports whether this module was transformed by our embedded
+// asyncify transformer in this load.
+func (m *WazeroModule) IsTransformed() bool {
+	if m == nil {
+		return false
+	}
+	return m.transformed
 }
 
 type HostFunc struct {
@@ -753,7 +763,8 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 		}
 		if m.rawBytes != nil && !asyncify.IsAsyncified(m.rawBytes) && len(asyncImports) > 0 {
 			transformed, err := asyncify.Transform(m.rawBytes, asyncify.Config{
-				AsyncImports: asyncImports,
+				AsyncImports:  asyncImports,
+				ExportGlobals: true,
 			})
 			if err != nil {
 				return fmt.Errorf("asyncify transform: %w", err)
@@ -764,6 +775,7 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 				return fmt.Errorf("recompile after asyncify: %w", err)
 			}
 			m.compiled = compiled
+			m.transformed = true
 			if oldCompiled != nil {
 				oldCompiled.Close(ctx)
 			}
@@ -833,15 +845,16 @@ func (m *WazeroModule) InstantiateWithConfig(ctx context.Context, cfg *InstanceC
 	}
 
 	wazInst := &WazeroInstance{
-		module:    m,
-		instance:  instance,
-		encoder:   m.encoder,
-		decoder:   m.decoderForConfig(cfg),
-		compiler:  m.compiler,
-		funcCache: make(map[string]api.Function),
-		liftCache: make(map[string]*cachedLift),
-		stackBuf:  make([]uint64, 16), // pre-allocate stack buffer
-		resources: resource.NewTable(),
+		module:      m,
+		instance:    instance,
+		encoder:     m.encoder,
+		decoder:     m.decoderForConfig(cfg),
+		compiler:    m.compiler,
+		funcCache:   make(map[string]api.Function),
+		liftCache:   make(map[string]*cachedLift),
+		stackBuf:    make([]uint64, 16), // pre-allocate stack buffer
+		resources:   resource.NewTable(),
+		transformed: m.transformed,
 	}
 
 	// Cache memory
@@ -951,10 +964,11 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 	}
 
 	lastMod := mods[len(mods)-1]
-	module := inst.GetModule(lastMod.InstanceIndex)
+	selectedIdx := lastMod.InstanceIndex
+	module := inst.GetModule(selectedIdx)
 	if module == nil {
 		inst.Close(ctx)
-		return nil, fmt.Errorf("final module not found at index %d", lastMod.InstanceIndex)
+		return nil, fmt.Errorf("final module not found at index %d", selectedIdx)
 	}
 
 	// An adapter or fixup may be instantiated last. Select the executable
@@ -971,7 +985,8 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 			inst.Close(ctx)
 			return nil, fmt.Errorf("entry export %q has unsupported executable ownership", cfg.EntryExport)
 		}
-		module = inst.GetModule(owner.InstanceIdx)
+		selectedIdx = owner.InstanceIdx
+		module = inst.GetModule(selectedIdx)
 		if module == nil {
 			inst.Close(ctx)
 			return nil, fmt.Errorf("entry export %q executable unavailable", cfg.EntryExport)
@@ -985,16 +1000,17 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 	}
 	// Create WazeroInstance wrapper
 	wazInst := &WazeroInstance{
-		module:     m,
-		instance:   module,
-		encoder:    m.encoder,
-		decoder:    m.decoderForConfig(cfg),
-		compiler:   m.compiler,
-		funcCache:  make(map[string]api.Function),
-		liftCache:  make(map[string]*cachedLift),
-		stackBuf:   make([]uint64, 16),
-		linkerInst: inst,
-		resources:  resource.NewTable(),
+		module:      m,
+		instance:    module,
+		encoder:     m.encoder,
+		decoder:     m.decoderForConfig(cfg),
+		compiler:    m.compiler,
+		funcCache:   make(map[string]api.Function),
+		liftCache:   make(map[string]*cachedLift),
+		stackBuf:    make([]uint64, 16),
+		linkerInst:  inst,
+		resources:   resource.NewTable(),
+		transformed: inst.IsInstanceTransformed(selectedIdx),
 	}
 
 	// Cache memory
@@ -1049,23 +1065,33 @@ func (m *WazeroModule) decoderForConfig(cfg *InstanceConfig) *transcoder.Decoder
 // It is NOT safe for concurrent use from multiple goroutines.
 // Each goroutine should have its own Instance, or access must be synchronized externally.
 type WazeroInstance struct {
-	freeFn     api.Function
-	allocFn    api.Function
-	instance   api.Module
-	module     *WazeroModule
-	encoder    *transcoder.Encoder
-	compiler   *transcoder.Compiler
-	funcCache  map[string]api.Function
-	liftCache  map[string]*cachedLift
-	resources  *resource.UnifiedTable
-	decoder    *transcoder.Decoder
-	memory     *WazeroMemory
-	alloc      *wazeroAllocator
-	linkerInst *linker.Instance
-	asyncify   *Asyncify
-	scheduler  *Scheduler
-	stackBuf   []uint64
-	cacheMu    sync.RWMutex
+	freeFn      api.Function
+	allocFn     api.Function
+	instance    api.Module
+	module      *WazeroModule
+	encoder     *transcoder.Encoder
+	compiler    *transcoder.Compiler
+	funcCache   map[string]api.Function
+	liftCache   map[string]*cachedLift
+	resources   *resource.UnifiedTable
+	decoder     *transcoder.Decoder
+	memory      *WazeroMemory
+	alloc       *wazeroAllocator
+	linkerInst  *linker.Instance
+	asyncify    *Asyncify
+	scheduler   *Scheduler
+	stackBuf    []uint64
+	transformed bool
+	cacheMu     sync.RWMutex
+}
+
+// IsTransformed reports whether this instance was proven by trusted linker/engine
+// metadata to have been transformed by our embedded transformer in this load.
+func (i *WazeroInstance) IsTransformed() bool {
+	if i == nil {
+		return false
+	}
+	return i.transformed
 }
 
 // cachedLift stores pre-computed lift info for fast repeated calls
@@ -1123,6 +1149,7 @@ func (i *WazeroInstance) EnableAsyncify(config AsyncifyConfig) error {
 	if config.DataAddr > 0 {
 		a.SetDataAddr(config.DataAddr)
 	}
+	a.trusted = i.transformed
 
 	if err := a.Init(i.instance); err != nil {
 		return err

@@ -139,8 +139,9 @@ type Instance struct {
 
 // coreInstance wraps either a real wazero module or a virtual instance.
 type coreInstance struct {
-	module  api.Module
-	virtual *VirtualInstance
+	module      api.Module
+	virtual     *VirtualInstance
+	transformed bool
 }
 
 // moduleName returns a unique module name for this instance.
@@ -333,7 +334,11 @@ func (pre *InstancePre) NewInstance(ctx context.Context) (*Instance, error) {
 				return nil, err
 			}
 			inst.modules = append(inst.modules, mod)
-			inst.coreInstances[idx] = &coreInstance{module: mod}
+			isTransformed := pre.isCoreModuleTransformed(int(parsedInst.ModuleIndex))
+			inst.coreInstances[idx] = &coreInstance{
+				module:      mod,
+				transformed: isTransformed,
+			}
 
 			if err := inst.createGlobalBridges(ctx, idx, int(parsedInst.ModuleIndex), mod); err != nil {
 				inst.Close(ctx)
@@ -2422,6 +2427,16 @@ func (inst *Instance) GetModule(instanceIndex int) api.Module {
 		return ci.module
 	}
 	return nil
+}
+
+// IsInstanceTransformed reports whether the core instance at the given index
+// was proven by trusted linker metadata to have been transformed by our
+// embedded transformer in this load.
+func (inst *Instance) IsInstanceTransformed(instanceIndex int) bool {
+	if ci := inst.coreInstances[instanceIndex]; ci != nil {
+		return ci.transformed
+	}
+	return false
 }
 
 // Graph returns the instance graph for inspection.

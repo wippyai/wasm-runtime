@@ -52,12 +52,16 @@ type Asyncify struct {
 		startRewind api.Function
 		stopRewind  api.Function
 	}
-	memory    api.Memory
-	hostArgs  []uint64
-	mu        sync.Mutex
-	state     int32
-	dataAddr  uint32
-	stackSize uint32
+	memory      api.Memory
+	module      api.Module
+	stateGlobal api.MutableGlobal
+	dataGlobal  api.MutableGlobal
+	hostArgs    []uint64
+	mu          sync.Mutex
+	state       int32
+	dataAddr    uint32
+	stackSize   uint32
+	trusted     bool
 }
 
 const AsyncifyDataAddr uint32 = 16
@@ -75,6 +79,9 @@ func NewAsyncify() *Asyncify {
 		stackSize: AsyncifyDefaultStackSize,
 	}
 }
+
+// DirectGlobals reports whether trusted generated controls can use mutable globals.
+func (a *Asyncify) DirectGlobals() bool { return a.stateGlobal != nil && a.dataGlobal != nil }
 
 func (a *Asyncify) SetStackSize(size uint32) {
 	a.stackSize = size
@@ -102,6 +109,19 @@ func (a *Asyncify) Init(mod api.Module) error {
 
 	if a.exports.getState == nil {
 		return fmt.Errorf("asyncify: module missing asyncify_get_state export (run wasm-opt --asyncify)")
+	}
+
+	a.module = mod
+	a.stateGlobal, a.dataGlobal = nil, nil
+	// Provenance is supplied only by the engine after its embedded transform.
+	// Export names alone never enable this path. Keep other pointer widths on
+	// the original function path, whose guest code defines their semantics.
+	if a.trusted {
+		state, stateOK := mod.ExportedGlobal("asyncify_state").(api.MutableGlobal)
+		data, dataOK := mod.ExportedGlobal("asyncify_data").(api.MutableGlobal)
+		if stateOK && dataOK && state.Type() == api.ValueTypeI32 && data.Type() == api.ValueTypeI32 {
+			a.stateGlobal, a.dataGlobal = state, data
+		}
 	}
 
 	stackPtr := a.dataAddr + 8
@@ -150,7 +170,40 @@ func (a *Asyncify) IsRewinding(_ context.Context) bool {
 	return atomic.LoadInt32(&a.state) == 2
 }
 
+// directControl handles only successful transitions of our generated wasm32
+// controls. Exceptional cases use the original functions below, preserving their
+// trap types, guest-global side effects, and module cancellation behavior.
+func (a *Asyncify) directControl(ctx context.Context, expected, next int32, start bool) bool {
+	if !a.DirectGlobals() || a.module == nil || ctx.Err() != nil || a.module.IsClosed() {
+		return false
+	}
+	if a.stateGlobal.Get() != uint64(expected) {
+		return false
+	}
+	addr := a.dataGlobal.Get()
+	if start {
+		addr = uint64(a.dataAddr)
+	}
+	if addr > uint64(^uint32(0)-4) {
+		return false
+	}
+	ptr, ptrOK := a.memory.ReadUint32Le(uint32(addr))
+	end, endOK := a.memory.ReadUint32Le(uint32(addr + 4))
+	if !ptrOK || !endOK || ptr > end {
+		return false
+	}
+	a.stateGlobal.Set(uint64(next))
+	if start {
+		a.dataGlobal.Set(addr)
+	}
+	atomic.StoreInt32(&a.state, next)
+	return true
+}
+
 func (a *Asyncify) StartUnwind(ctx context.Context) error {
+	if a.directControl(ctx, 0, 1, true) {
+		return nil
+	}
 	if a.exports.startUnwind != nil {
 		_, err := a.exports.startUnwind.Call(ctx, uint64(a.dataAddr))
 		if err == nil {
@@ -163,6 +216,9 @@ func (a *Asyncify) StartUnwind(ctx context.Context) error {
 }
 
 func (a *Asyncify) StopUnwind(ctx context.Context) error {
+	if a.directControl(ctx, 1, 0, false) {
+		return nil
+	}
 	if a.exports.stopUnwind != nil {
 		_, err := a.exports.stopUnwind.Call(ctx)
 		if err == nil {
@@ -175,6 +231,9 @@ func (a *Asyncify) StopUnwind(ctx context.Context) error {
 }
 
 func (a *Asyncify) StartRewind(ctx context.Context) error {
+	if a.directControl(ctx, 0, 2, true) {
+		return nil
+	}
 	if a.exports.startRewind != nil {
 		_, err := a.exports.startRewind.Call(ctx, uint64(a.dataAddr))
 		if err == nil {
@@ -187,6 +246,9 @@ func (a *Asyncify) StartRewind(ctx context.Context) error {
 }
 
 func (a *Asyncify) StopRewind(ctx context.Context) error {
+	if a.directControl(ctx, 2, 0, false) {
+		return nil
+	}
 	if a.exports.stopRewind != nil {
 		_, err := a.exports.stopRewind.Call(ctx)
 		if err == nil {
