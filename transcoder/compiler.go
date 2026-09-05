@@ -342,6 +342,20 @@ func (c *Compiler) compileTuple(t *wit.Tuple, goType reflect.Type, layout Layout
 		return nil, errors.TypeMismatch(errors.PhaseCompile, path, goType.String(), "struct or array")
 	}
 
+	if goType.Kind() == reflect.Struct && goType.NumField() < len(t.Types) {
+		return nil, errors.New(errors.PhaseCompile, errors.KindTypeMismatch).
+			Path(path...).
+			Detail("tuple has %d elements but struct has %d fields", len(t.Types), goType.NumField()).
+			Build()
+	}
+
+	if goType.Kind() == reflect.Array && goType.Len() < len(t.Types) {
+		return nil, errors.New(errors.PhaseCompile, errors.KindTypeMismatch).
+			Path(path...).
+			Detail("tuple has %d elements but array has length %d", len(t.Types), goType.Len()).
+			Build()
+	}
+
 	fields := make([]CompiledField, 0, len(t.Types))
 	flatCount := 0
 	witOffset := uint32(0)
@@ -351,12 +365,6 @@ func (c *Compiler) compileTuple(t *wit.Tuple, goType reflect.Type, layout Layout
 		var goOffset uintptr
 
 		if goType.Kind() == reflect.Struct {
-			if i >= goType.NumField() {
-				return nil, errors.New(errors.PhaseCompile, errors.KindTypeMismatch).
-					Path(path...).
-					Detail("tuple has %d elements but struct has %d fields", len(t.Types), goType.NumField()).
-					Build()
-			}
 			f := goType.Field(i)
 			elemGoType = f.Type
 			goOffset = f.Offset
@@ -516,27 +524,40 @@ func (c *Compiler) compileResult(r *wit.Result, goType reflect.Type, layout Layo
 }
 
 func (c *Compiler) compileVariant(v *wit.Variant, goType reflect.Type, layout LayoutInfo, path []string) (*CompiledType, error) {
+	if goType.Kind() != reflect.Struct {
+		return nil, errors.TypeMismatch(errors.PhaseCompile, path, goType.String(), "struct")
+	}
+
 	cases := make([]CompiledCase, len(v.Cases))
 	maxFlatCount := 0
 
 	for i, vc := range v.Cases {
-		cc := CompiledCase{Name: vc.Name}
+		casePath := append(append([]string{}, path...), vc.Name)
 
-		// Find the Go struct field for this case
-		if goType.Kind() == reflect.Struct {
+		goField, found := c.findGoField(goType, vc.Name)
+		if !found {
 			for j := 0; j < goType.NumField(); j++ {
 				f := goType.Field(j)
-				if strings.EqualFold(f.Name, vc.Name) {
-					cc.GoOffset = f.Offset
-					break
+				if !f.IsExported() && fieldMatchesName(f, vc.Name) {
+					return nil, errors.New(errors.PhaseCompile, errors.KindTypeMismatch).
+						Path(casePath...).
+						Detail("field %q for case %q is unexported", f.Name, vc.Name).
+						Build()
 				}
 			}
+			return nil, errors.FieldMissing(errors.PhaseCompile, path, vc.Name)
+		}
+
+		cc := CompiledCase{
+			Name:     vc.Name,
+			GoOffset: goField.Offset,
 		}
 
 		if vc.Type != nil {
-			casePath := append(append([]string{}, path...), vc.Name)
-			caseGoType := getVariantCaseGoType(goType, vc.Name, vc.Type)
-			caseType, err := c.compile(vc.Type, caseGoType, casePath)
+			if goField.Type.Kind() != reflect.Pointer {
+				return nil, errors.TypeMismatch(errors.PhaseCompile, casePath, goField.Type.String(), "pointer")
+			}
+			caseType, err := c.compile(vc.Type, goField.Type.Elem(), casePath)
 			if err != nil {
 				return nil, err
 			}
@@ -544,7 +565,10 @@ func (c *Compiler) compileVariant(v *wit.Variant, goType reflect.Type, layout La
 			if caseType.FlatCount > maxFlatCount {
 				maxFlatCount = caseType.FlatCount
 			}
+		} else if goField.Type.Kind() != reflect.Pointer && goField.Type.Kind() != reflect.UnsafePointer {
+			return nil, errors.TypeMismatch(errors.PhaseCompile, casePath, goField.Type.String(), "pointer")
 		}
+
 		cases[i] = cc
 	}
 
@@ -559,8 +583,23 @@ func (c *Compiler) compileVariant(v *wit.Variant, goType reflect.Type, layout La
 	}, nil
 }
 
-// Infers Go type for result/variant payloads. Dereferences pointer fields since
-// variant/result cases use pointer fields for presence, but WIT type is the payload.
+func fieldMatchesName(field reflect.StructField, witName string) bool {
+	if tag := field.Tag.Get("wit"); tag != "" {
+		if tag == "-" {
+			return false
+		}
+		if tag == witName {
+			return true
+		}
+	}
+	if strings.EqualFold(field.Name, witName) {
+		return true
+	}
+	return toKebabCase(field.Name) == witName
+}
+
+// Infers Go type for result payloads. Dereferences pointer fields since
+// result cases use pointer fields for presence, but WIT type is the payload.
 func getResultOkGoType(goType reflect.Type, witType wit.Type) reflect.Type {
 	// Try to find an "Ok" or "Value" field in a struct
 	if goType.Kind() == reflect.Struct {
@@ -597,26 +636,10 @@ func getResultErrGoType(goType reflect.Type, witType wit.Type) reflect.Type {
 	return reflect.TypeOf((*any)(nil)).Elem()
 }
 
-func getVariantCaseGoType(goType reflect.Type, caseName string, witType wit.Type) reflect.Type {
-	if goType.Kind() == reflect.Struct {
-		for i := 0; i < goType.NumField(); i++ {
-			f := goType.Field(i)
-			if strings.EqualFold(f.Name, caseName) {
-				// Dereference pointer - the field is *T but WIT type is T
-				if f.Type.Kind() == reflect.Pointer {
-					return f.Type.Elem()
-				}
-				return f.Type
-			}
-		}
-	}
-	return reflect.TypeOf((*any)(nil)).Elem()
-}
-
 func (c *Compiler) compileOwn(o *wit.Own, goType reflect.Type, layout LayoutInfo, path []string) (*CompiledType, error) {
 	// Own<T> is represented as a u32 handle on the stack
 	// Go type should be Own[T] or uint32
-	if goType.Kind() != reflect.Uint32 && goType.Kind() != reflect.Struct {
+	if !validHandleLayout(goType) {
 		return nil, errors.TypeMismatch(errors.PhaseCompile, path, goType.String(), "uint32 or Own[T]")
 	}
 
@@ -633,7 +656,7 @@ func (c *Compiler) compileOwn(o *wit.Own, goType reflect.Type, layout LayoutInfo
 func (c *Compiler) compileBorrow(b *wit.Borrow, goType reflect.Type, layout LayoutInfo, path []string) (*CompiledType, error) {
 	// Borrow<T> is represented as a u32 handle on the stack
 	// Go type should be Borrow[T] or uint32
-	if goType.Kind() != reflect.Uint32 && goType.Kind() != reflect.Struct {
+	if !validHandleLayout(goType) {
 		return nil, errors.TypeMismatch(errors.PhaseCompile, path, goType.String(), "uint32 or Borrow[T]")
 	}
 
@@ -645,4 +668,17 @@ func (c *Compiler) compileBorrow(b *wit.Borrow, goType reflect.Type, layout Layo
 		FlatCount: 1,
 		Kind:      KindBorrow,
 	}, nil
+}
+
+// Handle codecs access a uint32 at offset zero directly. Accept only layouts
+// whose first field really is that scalar; size alone cannot exclude pointers.
+func validHandleLayout(t reflect.Type) bool {
+	if t.Kind() == reflect.Uint32 {
+		return true
+	}
+	if t.Kind() != reflect.Struct || t.NumField() == 0 {
+		return false
+	}
+	f := t.Field(0)
+	return f.IsExported() && f.Offset == 0 && f.Type.Kind() == reflect.Uint32
 }

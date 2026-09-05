@@ -138,20 +138,8 @@ func (e *Encoder) lowerToStack(ct *CompiledType, ptr unsafe.Pointer, stack []uin
 		return 1, nil
 
 	case KindOwn, KindBorrow:
-		// Resource handles are u32 on the stack
-		// Go type is either uint32 or a struct with Handle field
-		if ct.GoType.Kind() == reflect.Uint32 {
-			stack[offset] = uint64(*(*uint32)(ptr))
-		} else {
-			// Struct with Handle field (Own[T] or Borrow[T])
-			rv := reflect.NewAt(ct.GoType, ptr).Elem()
-			handleField := rv.FieldByName("Handle")
-			if handleField.IsValid() {
-				stack[offset] = handleField.Uint()
-			} else {
-				stack[offset] = 0
-			}
-		}
+		// The compiler validates the scalar at offset zero, as for memory codecs.
+		stack[offset] = uint64(*(*uint32)(ptr))
 		return 1, nil
 
 	default:
@@ -734,18 +722,7 @@ func (d *Decoder) liftFromStack(ct *CompiledType, stack []uint64, offset int, pt
 		return 1, nil
 
 	case KindOwn, KindBorrow:
-		// Resource handles are u32 on the stack
-		handle := uint32(stack[offset])
-		if ct.GoType.Kind() == reflect.Uint32 {
-			*(*uint32)(ptr) = handle
-		} else {
-			// Struct with Handle field (Own[T] or Borrow[T])
-			rv := reflect.NewAt(ct.GoType, ptr).Elem()
-			handleField := rv.FieldByName("Handle")
-			if handleField.IsValid() && handleField.CanSet() {
-				handleField.SetUint(uint64(handle))
-			}
-		}
+		*(*uint32)(ptr) = uint32(stack[offset])
 		return 1, nil
 
 	default:
