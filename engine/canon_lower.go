@@ -32,25 +32,25 @@ type LowerWrapper struct {
 	callMemoryPool      sync.Pool
 	typedInvoke         typedHostInvoker
 	typedResume         typedHostInvoker
-	paramSlots          int
 	validateRaw         func(context.Context, api.Module, []uint64) error
 	handlerIf           any
 	handlerTyp          reflect.Type
+	resultErrType       wit.Type
 	compiler            *transcoder.Compiler
 	encoder             *transcoder.Encoder
 	decoder             *transcoder.Decoder
 	def                 *component.LowerDef
+	resultSuccessType   *transcoder.CompiledType
 	handler             reflect.Value
 	paramTypes          []*transcoder.CompiledType
 	resultTypes         []*transcoder.CompiledType
 	resultOffsets       []uint32
-	resultSuccessType   *transcoder.CompiledType
-	resultErrType       wit.Type
-	resultPayloadOffset uint32
-	resultAreaSize      uint32
 	argTypes            []reflect.Type
+	paramSlots          int
 	numIn               int
 	goParamStart        int
+	resultPayloadOffset uint32
+	resultAreaSize      uint32
 	hasCtx              bool
 }
 
@@ -626,7 +626,6 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 				args[i] = reflect.Zero(paramType)
 			}
 		}
-
 	}
 
 	var retptr uint32
