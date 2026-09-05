@@ -1628,11 +1628,48 @@ func (i *WazeroInstance) StartCall(ctx context.Context, funcName string, params 
 	}, nil
 }
 
+// engineCallContext carries the instance resource table, asyncify, and scheduler
+// for one CallSession.Step. Unknown keys, deadlines, and cancellation come from
+// the embedded parent context.
+type engineCallContext struct {
+	context.Context
+	resources *resource.UnifiedTable
+	asyncify  *Asyncify
+	scheduler *Scheduler
+}
+
+func (c *engineCallContext) Value(key any) any {
+	switch key {
+	case resourcesContextKey{}:
+		return c.resources
+	case ctxKeyAsyncify{}:
+		return c.asyncify
+	case ctxKeyScheduler{}:
+		return c.scheduler
+	default:
+		return c.Context.Value(key)
+	}
+}
+
+func withEngineCallContext(ctx context.Context, i *WazeroInstance) context.Context {
+	if ctx == nil {
+		panic("cannot create context from nil parent")
+	}
+	ctx = &engineCallContext{
+		Context:   ctx,
+		resources: i.resources,
+		asyncify:  i.asyncify,
+		scheduler: i.scheduler,
+	}
+	if i.linkerInst != nil {
+		return linker.WithInstance(ctx, i.linkerInst)
+	}
+	return ctx
+}
+
 // Step advances execution. Pass nil for the first call, or a YieldResult to resume.
 func (cs *CallSession) Step(ctx context.Context, yr *YieldResult) (StepResult, error) {
-	ctx = cs.instance.prepareCallContext(ctx)
-	ctx = WithAsyncify(ctx, cs.instance.asyncify)
-	ctx = WithScheduler(ctx, cs.instance.scheduler)
+	ctx = withEngineCallContext(ctx, cs.instance)
 	return cs.instance.scheduler.Step(ctx, yr)
 }
 

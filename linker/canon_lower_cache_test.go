@@ -11,6 +11,12 @@ import (
 )
 
 func TestCanonLower_LazyResolutionAndCacheIsolation(t *testing.T) {
+	t.Run("explicit-memory-and-realloc", func(t *testing.T) { testCanonLowerBindings(t, true) })
+	t.Run("shared-realloc-fallback", func(t *testing.T) { testCanonLowerBindings(t, false) })
+}
+
+func testCanonLowerBindings(t *testing.T, explicitRealloc bool) {
+	t.Helper()
 	ctx := context.Background()
 	rt := wazero.NewRuntime(ctx)
 	defer rt.Close(ctx)
@@ -19,7 +25,7 @@ func TestCanonLower_LazyResolutionAndCacheIsolation(t *testing.T) {
 	wasmBytes, err := wat.Compile(`(module
 		(memory (export "memory") 1)
 		(func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
-			i32.const 42)
+			i32.const 4 i32.load8_u)
 	)`)
 	if err != nil {
 		t.Fatalf("compile wat: %v", err)
@@ -64,9 +70,11 @@ func TestCanonLower_LazyResolutionAndCacheIsolation(t *testing.T) {
 	l := NewWithDefaults(rt)
 	var observedMarkerA []byte
 	var observedMarkerB []byte
+	var retained []api.Module
 
 	ns := l.Namespace("test:pkg/iface@0.1.0")
 	ns.DefineFunc("host-fn", func(ctx context.Context, mod api.Module, stack []uint64) {
+		retained = append(retained, mod)
 		b, ok := mod.Memory().Read(4, 1)
 		if !ok {
 			t.Fatal("failed to read memory")
@@ -113,6 +121,10 @@ func TestCanonLower_LazyResolutionAndCacheIsolation(t *testing.T) {
 		},
 	}
 
+	if !explicitRealloc {
+		comp.CoreFuncIndexSpace[0].ReallocIdx = -1
+	}
+
 	pre := &InstancePre{
 		linker: l,
 		component: &component.ValidatedComponent{
@@ -121,14 +133,16 @@ func TestCanonLower_LazyResolutionAndCacheIsolation(t *testing.T) {
 	}
 
 	instA := &Instance{
-		pre: pre,
+		pre:     pre,
+		modules: []api.Module{modA},
 		coreInstances: map[int]*coreInstance{
 			0: {module: modA},
 		},
 	}
 
 	instB := &Instance{
-		pre: pre,
+		pre:     pre,
+		modules: []api.Module{modB},
 		coreInstances: map[int]*coreInstance{
 			0: {module: modB},
 		},
@@ -144,16 +158,16 @@ func TestCanonLower_LazyResolutionAndCacheIsolation(t *testing.T) {
 	virtA := instA.createVirtualInstance(1, parsedInst)
 	virtB := instB.createVirtualInstance(1, parsedInst)
 
-	fnA := virtA.Get("lowered").Source.(HostFunc).Def.GetHandler()
-	fnB := virtB.Get("lowered").Source.(HostFunc).Def.GetHandler()
+	fnA := instA.collectVirtualExports(virtA, "test:pkg/iface@0.1.0")[0].Fn
+	fnB := instB.collectVirtualExports(virtB, "test:pkg/iface@0.1.0")[0].Fn
 
 	// Call instA multiple times
-	fnA(ctx, callerMod, nil)
-	fnA(ctx, callerMod, nil)
+	fnA(WithInstance(ctx, instB), callerMod, nil)
+	fnA(WithInstance(ctx, instB), callerMod, nil)
 
 	// Call instB multiple times
-	fnB(ctx, callerMod, nil)
-	fnB(ctx, callerMod, nil)
+	fnB(WithInstance(ctx, instA), callerMod, nil)
+	fnB(WithInstance(ctx, instA), callerMod, nil)
 
 	if len(observedMarkerA) != 2 || observedMarkerA[0] != 0xAA || observedMarkerA[1] != 0xAA {
 		t.Fatalf("instA observed markers incorrect: %v", observedMarkerA)
@@ -161,9 +175,42 @@ func TestCanonLower_LazyResolutionAndCacheIsolation(t *testing.T) {
 	if len(observedMarkerB) != 2 || observedMarkerB[0] != 0xBB || observedMarkerB[1] != 0xBB {
 		t.Fatalf("instB observed markers incorrect: %v", observedMarkerB)
 	}
+	// A host may retain its module argument beyond the invocation. Later calls
+	// must not replace the memory or allocator seen by an earlier call.
+	for index, mod := range retained {
+		want := modA
+		if index >= 2 {
+			want = modB
+		}
+		if mod.Memory() != want.Memory() {
+			t.Fatal("retained canonical memory changed")
+		}
+		allocatorOwner := want
+		if !explicitRealloc {
+			allocatorOwner = modA
+			if index < 2 {
+				allocatorOwner = modB
+			}
+		}
+		alloc := mod.ExportedFunction("cabi_realloc")
+		if alloc == nil {
+			t.Fatal("canonical allocator unavailable")
+		}
+		got, err := alloc.Call(ctx, 0, 0, 0, 0)
+		wantMarker, _ := allocatorOwner.Memory().Read(4, 1)
+		if err != nil || len(got) != 1 || got[0] != uint64(wantMarker[0]) {
+			t.Fatalf("canonical allocator did not preserve explicit/fallback binding: %v, %v", got, err)
+		}
+	}
 }
 
 func TestCanonLower_FirstUseFailurePreserved(t *testing.T) {
+	t.Run("partial-binding", func(t *testing.T) { testCanonLowerFailure(t, -1) })
+	t.Run("complete-binding", func(t *testing.T) { testCanonLowerFailure(t, 1) })
+}
+
+func testCanonLowerFailure(t *testing.T, reallocIndex int32) {
+	t.Helper()
 	ctx := context.Background()
 	rt := wazero.NewRuntime(ctx)
 	defer rt.Close(ctx)
@@ -185,7 +232,7 @@ func TestCanonLower_FirstUseFailurePreserved(t *testing.T) {
 				Kind:       component.CoreFuncCanonLower,
 				FuncIndex:  0,
 				MemoryIdx:  0,
-				ReallocIdx: -1,
+				ReallocIdx: reallocIndex,
 			},
 		},
 		Aliases: []component.Alias{

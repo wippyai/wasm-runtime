@@ -235,9 +235,18 @@ func createSharedMemoryHandler(def *FuncDef) api.GoModuleFunc {
 	return createSharedMemoryHandlerFromDef(def)
 }
 
+// canonicalBoundFuncDef is emitted only for canonical imports with explicit
+// memory AND realloc indices. Its handler resolves both bindings itself, so a
+// shared-memory wrapper would be completely overridden. Partial bindings keep
+// the ordinary definition and its shared-memory fallback.
+type canonicalBoundFuncDef struct{ FuncDef }
+
 // createSharedMemoryHandlerFromDef creates a handler from a HostFuncDef.
 func createSharedMemoryHandlerFromDef(def resolve.HostFuncDef) api.GoModuleFunc {
 	handler := def.GetHandler()
+	if _, bound := def.(*canonicalBoundFuncDef); bound {
+		return handler
+	}
 	return func(ctx context.Context, caller api.Module, stack []uint64) {
 		// Try caller module name first, then context (for shim modules without #instanceID)
 		inst := lookupInstanceFromCaller(caller)
@@ -1142,6 +1151,14 @@ func (inst *Instance) createSynthBridgeFromModule(ctx context.Context, name stri
 		return false, err
 	}
 
+	// These closures capture source functions from this instance. Keeping the
+	// host module after instance close would bind a later instance to that stale
+	// source, even when its synthetic WASM bridge is rebuilt.
+	if hostModCreated {
+		inst.bridgeModules[hostModName] = true
+		inst.pre.linker.addBridgeRefs(map[string]bool{hostModName: true})
+	}
+
 	// Track only if we created the synth module
 	if synthCreated {
 		inst.bridgeModules[name] = true
@@ -1634,7 +1651,11 @@ func (inst *Instance) createVirtualInstance(
 								}
 								original(ctx, &boundModuleWrapper{Module: caller, boundMem: boundMemory, boundAlloc: allocator, allocName: "cabi_realloc"}, stack)
 							}
-							entity.Source = HostFunc{Def: &boundDef}
+							if memoryIndex >= 0 && reallocIndex >= 0 {
+								entity.Source = HostFunc{Def: &canonicalBoundFuncDef{FuncDef: boundDef}}
+							} else {
+								entity.Source = HostFunc{Def: &boundDef}
+							}
 						} else {
 							// Build descriptive path for error reporting
 							path := exp.Name

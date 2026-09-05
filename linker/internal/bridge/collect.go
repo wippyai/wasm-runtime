@@ -6,6 +6,24 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
+const (
+	// valueTypeV128 is the WebAssembly 128-bit vector type (0x7b).
+	// In wazero stack representation, each v128 value takes 2 uint64 slots.
+	valueTypeV128 api.ValueType = 0x7b
+)
+
+// stackSlots computes the number of uint64 stack slots required for a sequence of types.
+func stackSlots(types []api.ValueType) int {
+	slots := 0
+	for _, t := range types {
+		slots++
+		if t == valueTypeV128 {
+			slots++
+		}
+	}
+	return slots
+}
+
 // ForwardingWrapper creates a GoModuleFunc that forwards calls to a source function.
 // ForwardingWrapper is for bridge modules that re-export functions from other modules.
 // It returns nil if sourceFn is nil.
@@ -13,29 +31,85 @@ func ForwardingWrapper(sourceFn api.Function, paramCount int) api.GoModuleFunc {
 	if sourceFn == nil {
 		return nil
 	}
+
+	def := sourceFn.Definition()
+	if def == nil {
+		// Fallback for custom api.Function implementations lacking definitions.
+		return func(ctx context.Context, caller api.Module, stack []uint64) {
+			if err := ctx.Err(); err != nil {
+				if caller != nil {
+					_ = caller.CloseWithExitCode(ctx, 1)
+				}
+				panic(err)
+			}
+			if paramCount < 0 || paramCount > len(stack) {
+				// Invalid state - close module with error code
+				if caller != nil {
+					_ = caller.CloseWithExitCode(ctx, 1)
+				}
+				return
+			}
+			results, err := sourceFn.Call(ctx, stack[:paramCount]...)
+			if err != nil {
+				if caller != nil {
+					_ = caller.CloseWithExitCode(ctx, 1)
+				}
+				// Closing an intermediate bridge alone need not trap its consumer.
+				panic(err)
+			}
+			if len(results) > len(stack) {
+				if caller != nil {
+					_ = caller.CloseWithExitCode(ctx, 1)
+				}
+				return
+			}
+			copy(stack, results)
+		}
+	}
+
+	paramTypes := def.ParamTypes()
+	if paramCount < 0 || paramCount != len(paramTypes) {
+		// Arity mismatch or negative paramCount is invalid state.
+		// Guest side effects must not be invoked.
+		return func(ctx context.Context, caller api.Module, _ []uint64) {
+			if caller != nil {
+				_ = caller.CloseWithExitCode(ctx, 1)
+			}
+		}
+	}
+
+	paramSlots := stackSlots(paramTypes)
+	resultSlots := stackSlots(def.ResultTypes())
+	requiredSlots := paramSlots
+	if resultSlots > requiredSlots {
+		requiredSlots = resultSlots
+	}
+
 	return func(ctx context.Context, caller api.Module, stack []uint64) {
-		if paramCount > len(stack) {
-			// Invalid state - close module with error code
+		if err := ctx.Err(); err != nil {
+			if caller != nil {
+				_ = caller.CloseWithExitCode(ctx, 1)
+			}
+			panic(err)
+		}
+
+		if len(stack) < requiredSlots {
+			// Insufficient stack for parameters or results before invocation.
+			// Guest side effects must not be invoked.
 			if caller != nil {
 				_ = caller.CloseWithExitCode(ctx, 1)
 			}
 			return
 		}
-		results, err := sourceFn.Call(ctx, stack[:paramCount]...)
-		if err != nil {
-			// Propagate error by closing the module
+
+		if err := sourceFn.CallWithStack(ctx, stack); err != nil {
 			if caller != nil {
 				_ = caller.CloseWithExitCode(ctx, 1)
 			}
-			return
+			// Trap through the whole guest call chain, including synthetic WASM
+			// bridges whose consumer module remains open after caller.Close.
+			panic(err)
 		}
-		if len(results) > len(stack) {
-			if caller != nil {
-				_ = caller.CloseWithExitCode(ctx, 1)
-			}
-			return
-		}
-		copy(stack, results)
 	}
 }
 

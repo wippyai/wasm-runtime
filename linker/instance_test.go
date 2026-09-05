@@ -878,8 +878,8 @@ func TestCreateBridgeFrom_ForwardsFunctions(t *testing.T) {
 	}
 
 	// Verify host module is tracked
-	if len(inst.bridgeModules) != 1 || !inst.bridgeModules["bridge"] {
-		t.Errorf("bridgeModules = %v, want {bridge: true}", inst.bridgeModules)
+	if len(inst.bridgeModules) != 2 || !inst.bridgeModules["bridge"] || !inst.bridgeModules["bridge$host"] {
+		t.Errorf("bridgeModules = %v, want {bridge: true, bridge$host: true}", inst.bridgeModules)
 	}
 }
 
@@ -1386,7 +1386,7 @@ func TestNewInstance_WithBridgeFromModule(t *testing.T) {
 	}
 }
 
-func TestNewInstance_RealModuleBridgeStaleAfterSourceClose(t *testing.T) {
+func TestNewInstance_RealModuleBridgeRebindsAfterSourceClose(t *testing.T) {
 	ctx := context.Background()
 	rt := wazero.NewRuntime(ctx)
 	defer rt.Close(ctx)
@@ -1465,6 +1465,9 @@ func TestNewInstance_RealModuleBridgeStaleAfterSourceClose(t *testing.T) {
 		t.Fatalf("first call result = %v, want [1]", firstResult)
 	}
 	inst1.Close(ctx)
+	if rt.Module("source$host") != nil {
+		t.Fatal("source host bridge retained closed-instance function closures")
+	}
 
 	inst2, err := pre.NewInstance(ctx)
 	if err != nil {
@@ -1476,10 +1479,13 @@ func TestNewInstance_RealModuleBridgeStaleAfterSourceClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
-	if len(secondResult) != 1 || secondResult[0] != 0 {
-		t.Fatalf("second call result = %v, want [0] from stale closed source bridge", secondResult)
+	if len(secondResult) != 1 || secondResult[0] != 1 {
+		t.Fatalf("second call result = %v, want [1] from fresh source instance", secondResult)
 	}
-	t.Log("real-module synthetic bridge did not bind to the fresh second source instance")
+	inst2.Modules()[0].Close(ctx)
+	if got, err := inst2.Modules()[1].ExportedFunction("call").Call(ctx); err == nil {
+		t.Fatalf("closed source returned success through synthetic bridge: %v", got)
+	}
 }
 
 func TestNewInstance_WithFromExports(t *testing.T) {
