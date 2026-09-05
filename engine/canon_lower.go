@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -27,21 +28,30 @@ type CheckedHostFunction struct {
 
 // LowerWrapper wraps a Go function for Canonical ABI lowering.
 type LowerWrapper struct {
-	argsPool     sync.Pool
-	validateRaw  func(context.Context, api.Module, []uint64) error
-	handlerIf    any
-	handlerTyp   reflect.Type
-	compiler     *transcoder.Compiler
-	encoder      *transcoder.Encoder
-	decoder      *transcoder.Decoder
-	def          *component.LowerDef
-	handler      reflect.Value
-	paramTypes   []*transcoder.CompiledType
-	resultTypes  []*transcoder.CompiledType
-	argTypes     []reflect.Type
-	numIn        int
-	goParamStart int
-	hasCtx       bool
+	argsPool            sync.Pool
+	callMemoryPool      sync.Pool
+	typedInvoke         typedHostInvoker
+	typedResume         typedHostInvoker
+	paramSlots          int
+	validateRaw         func(context.Context, api.Module, []uint64) error
+	handlerIf           any
+	handlerTyp          reflect.Type
+	compiler            *transcoder.Compiler
+	encoder             *transcoder.Encoder
+	decoder             *transcoder.Decoder
+	def                 *component.LowerDef
+	handler             reflect.Value
+	paramTypes          []*transcoder.CompiledType
+	resultTypes         []*transcoder.CompiledType
+	resultOffsets       []uint32
+	resultSuccessType   *transcoder.CompiledType
+	resultErrType       wit.Type
+	resultPayloadOffset uint32
+	resultAreaSize      uint32
+	argTypes            []reflect.Type
+	numIn               int
+	goParamStart        int
+	hasCtx              bool
 }
 
 func (w *LowerWrapper) Name() string {
@@ -52,6 +62,11 @@ func NewLowerWrapper(def *component.LowerDef, handler any) (*LowerWrapper, error
 	var validateRaw func(context.Context, api.Module, []uint64) error
 	if checked, ok := handler.(CheckedHostFunction); ok {
 		handler, validateRaw = checked.Handler, checked.Validate
+	}
+	var direct *typedHostFunction
+	if typed, ok := handler.(typedHostFunction); ok {
+		direct = &typed
+		handler = typed.handler
 	}
 	handlerVal := reflect.ValueOf(handler)
 	if handlerVal.Kind() != reflect.Func {
@@ -72,18 +87,19 @@ func NewLowerWrapper(def *component.LowerDef, handler any) (*LowerWrapper, error
 	}
 
 	w := &LowerWrapper{
-		def:          def,
-		validateRaw:  validateRaw,
-		handler:      handlerVal,
-		handlerTyp:   handlerType,
-		handlerIf:    handler,
-		encoder:      transcoder.NewEncoder(),
-		decoder:      transcoder.NewDecoder(),
-		compiler:     transcoder.NewCompiler(),
-		numIn:        numIn,
-		hasCtx:       hasCtx,
-		goParamStart: goParamStart,
-		argTypes:     argTypes,
+		def:            def,
+		validateRaw:    validateRaw,
+		handler:        handlerVal,
+		handlerTyp:     handlerType,
+		handlerIf:      handler,
+		encoder:        transcoder.NewEncoder(),
+		decoder:        transcoder.NewDecoder(),
+		compiler:       transcoder.NewCompiler(),
+		numIn:          numIn,
+		hasCtx:         hasCtx,
+		goParamStart:   goParamStart,
+		argTypes:       argTypes,
+		callMemoryPool: sync.Pool{New: func() any { return new(lowerCallMemory) }},
 		argsPool: sync.Pool{
 			New: func() any {
 				s := make([]reflect.Value, numIn)
@@ -95,42 +111,79 @@ func NewLowerWrapper(def *component.LowerDef, handler any) (*LowerWrapper, error
 	if err := w.compileTypes(); err != nil {
 		debugf("canon_lower: type compilation failed, using dynamic transcoding: %v", err)
 	}
+	if direct != nil && w.hasCtx && w.hasResultType() && handlerType.NumOut() == 2 && len(def.Params) == numIn-1 {
+		compatible := true
+		for i, ct := range w.paramTypes {
+			if ct == nil || ct.GoType != handlerType.In(i+1) {
+				compatible = false
+				break
+			}
+			w.paramSlots += ct.FlatCount
+		}
+		if compatible {
+			w.typedInvoke = direct.invoke
+			w.typedResume = direct.resume
+		}
+	}
 
 	return w, nil
 }
 
 func (w *LowerWrapper) compileTypes() error {
 	handlerType := w.handlerTyp
-
+	// Result layout is required even when a parameter uses dynamic lifting.
+	w.resultOffsets = make([]uint32, len(w.def.Results))
+	var offset uint32
+	for i, witType := range w.def.Results {
+		w.resultOffsets[i] = offset
+		offset += resultSize(witType)
+	}
+	w.resultAreaSize = offset
+	numOut := handlerType.NumOut()
+	w.resultTypes = make([]*transcoder.CompiledType, len(w.def.Results))
+	isResult := w.hasResultType() && numOut == 2
+	if isResult {
+		r := w.def.Results[0].(*wit.TypeDef).Kind.(*wit.Result)
+		w.resultErrType = r.Err
+		layout := transcoder.NewLayoutCalculator().Calculate(w.def.Results[0])
+		w.resultPayloadOffset = alignTo(1, layout.Align)
+		if r.OK != nil {
+			// Unsupported Go representations retain the dynamic encoder.
+			w.resultSuccessType, _ = w.compiler.Compile(r.OK, handlerType.Out(0))
+		}
+	}
 	w.paramTypes = make([]*transcoder.CompiledType, len(w.def.Params))
 	for i, witType := range w.def.Params {
 		goIdx := w.goParamStart + i
 		if goIdx >= w.numIn {
 			break
 		}
-		goType := handlerType.In(goIdx)
-		ct, err := w.compiler.Compile(witType, goType)
+		ct, err := w.compiler.Compile(witType, handlerType.In(goIdx))
 		if err != nil {
 			return fmt.Errorf("param %d: %w", i, err)
 		}
 		w.paramTypes[i] = ct
 	}
-
-	numOut := handlerType.NumOut()
-	w.resultTypes = make([]*transcoder.CompiledType, len(w.def.Results))
-	for i, witType := range w.def.Results {
-		if i >= numOut {
-			break
+	if !isResult {
+		for i, witType := range w.def.Results {
+			if i >= numOut {
+				break
+			}
+			ct, err := w.compiler.Compile(witType, handlerType.Out(i))
+			if err != nil {
+				return fmt.Errorf("result %d: %w", i, err)
+			}
+			w.resultTypes[i] = ct
 		}
-		goType := handlerType.Out(i)
-		ct, err := w.compiler.Compile(witType, goType)
-		if err != nil {
-			return fmt.Errorf("result %d: %w", i, err)
-		}
-		w.resultTypes[i] = ct
 	}
-
 	return nil
+}
+
+func alignTo(offset, align uint32) uint32 {
+	if align <= 1 {
+		return offset
+	}
+	return (offset + align - 1) &^ (align - 1)
 }
 
 func (w *LowerWrapper) BuildRawFunc() api.GoModuleFunc {
@@ -496,13 +549,24 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 	if mod.Memory() == nil {
 		panic(fmt.Errorf("canonical host %s: module has no memory", w.def.Name))
 	}
-	mem := &WazeroMemory{mem: mod.Memory()}
-
 	allocFunc := mod.ExportedFunction(CabiRealloc)
 	if allocFunc == nil {
 		panic(fmt.Errorf("canonical host %s: cabi_realloc not found", w.def.Name))
 	}
-	alloc := &moduleAllocator{ctx: ctx, allocFunc: allocFunc}
+	callMemory := w.callMemoryPool.Get().(*lowerCallMemory)
+	callMemory.memory.mem = mod.Memory()
+	callMemory.allocator.ctx = ctx
+	callMemory.allocator.allocFunc = allocFunc
+	defer func() {
+		// A call has finished even when Asyncify parks the guest. No encoder or
+		// decoder retains these wrappers; clear instance/context references.
+		callMemory.memory.mem = nil
+		callMemory.allocator.ctx = nil
+		callMemory.allocator.allocFunc = nil
+		w.callMemoryPool.Put(callMemory)
+	}()
+	mem := &callMemory.memory
+	alloc := &callMemory.allocator
 
 	async := GetAsyncify(ctx)
 	if async != nil && async.IsRewinding(ctx) {
@@ -514,55 +578,66 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 			trapCanon(w.def.Name, "validate arguments", err)
 		}
 	}
-	argsPtr := w.argsPool.Get().(*[]reflect.Value)
-	args := *argsPtr
-	defer func() {
-		// Clear slice elements before returning to pool to avoid retaining references
-		var zero reflect.Value
-		for i := range args {
-			args[i] = zero
-		}
-		w.argsPool.Put(argsPtr)
-	}()
-	flatIdx := 0
-	paramIdx := 0
-
-	for i := 0; i < w.numIn; i++ {
-		paramType := w.argTypes[i] // use pre-cached type
-
-		if i == 0 && w.hasCtx {
-			args[i] = reflect.ValueOf(ctx)
-			continue
-		}
-
-		if paramIdx < len(w.paramTypes) && w.paramTypes[paramIdx] != nil {
-			ct := w.paramTypes[paramIdx]
-			goValPtr := reflect.New(paramType)
-			ptr := unsafe.Pointer(goValPtr.Pointer())
-			consumed, err := w.decoder.LiftFromStack(ct, stack[flatIdx:], ptr, mem)
-			if err != nil {
-				trapCanon(w.def.Name, "lift", err)
+	var args []reflect.Value
+	flatIdx := w.paramSlots
+	if w.typedInvoke == nil {
+		argsPtr := w.argsPool.Get().(*[]reflect.Value)
+		args = *argsPtr
+		defer func() {
+			// Clear slice elements before returning to pool to avoid retaining references
+			var zero reflect.Value
+			for i := range args {
+				args[i] = zero
 			}
-			args[i] = goValPtr.Elem()
-			flatIdx += consumed
-			paramIdx++
-		} else if paramIdx < len(w.def.Params) {
-			witType := w.def.Params[paramIdx]
-			goArg, consumed, err := w.liftArg(witType, stack[flatIdx:], mem, paramType)
-			if err != nil {
-				trapCanon(w.def.Name, "lift", err)
+			w.argsPool.Put(argsPtr)
+		}()
+		flatIdx = 0
+		paramIdx := 0
+
+		for i := 0; i < w.numIn; i++ {
+			paramType := w.argTypes[i] // use pre-cached type
+
+			if i == 0 && w.hasCtx {
+				args[i] = reflect.ValueOf(ctx)
+				continue
 			}
-			args[i] = goArg
-			flatIdx += consumed
-			paramIdx++
-		} else {
-			args[i] = reflect.Zero(paramType)
+
+			if paramIdx < len(w.paramTypes) && w.paramTypes[paramIdx] != nil {
+				ct := w.paramTypes[paramIdx]
+				goValPtr := reflect.New(paramType)
+				ptr := unsafe.Pointer(goValPtr.Pointer())
+				consumed, err := w.decoder.LiftFromStack(ct, stack[flatIdx:], ptr, mem)
+				if err != nil {
+					trapCanon(w.def.Name, "lift", err)
+				}
+				args[i] = goValPtr.Elem()
+				flatIdx += consumed
+				paramIdx++
+			} else if paramIdx < len(w.def.Params) {
+				witType := w.def.Params[paramIdx]
+				goArg, consumed, err := w.liftArg(witType, stack[flatIdx:], mem, paramType)
+				if err != nil {
+					trapCanon(w.def.Name, "lift", err)
+				}
+				args[i] = goArg
+				flatIdx += consumed
+				paramIdx++
+			} else {
+				args[i] = reflect.Zero(paramType)
+			}
 		}
+
 	}
 
 	var retptr uint32
-	if w.usesRetptr() && flatIdx < len(stack) {
+	if w.usesRetptr() {
+		if flatIdx >= len(stack) {
+			trapCanon(w.def.Name, "lift", fmt.Errorf("missing result pointer"))
+		}
 		retptr = uint32(stack[flatIdx])
+		if _, err := mem.Read(retptr, w.resultAreaSize); err != nil {
+			trapCanon(w.def.Name, "result pointer", err)
+		}
 	}
 
 	// Calling an Asyncify export from the host can reuse wazero's stack.
@@ -577,37 +652,105 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 		}
 		copy(originalArgs, stack)
 	}
-	results := w.handler.Call(args)
+	var directResults [2]reflect.Value
+	var results []reflect.Value
+	if w.typedInvoke != nil {
+		invoke := w.typedInvoke
+		if w.typedResume != nil && async != nil && async.IsRewinding(ctx) {
+			invoke = w.typedResume
+		}
+		value, hostErr, liftErr := invoke(ctx, w.decoder, w.paramTypes, stack, mem)
+		if liftErr != nil {
+			trapCanon(w.def.Name, "lift", liftErr)
+		}
+		directResults[0] = value
+		directResults[1] = nilHostError
+		if hostErr != nil {
+			directResults[1] = reflect.ValueOf(hostErr)
+		}
+		results = directResults[:]
+	} else {
+		results = w.handler.Call(args)
+	}
 	if async != nil && async.IsUnwinding(ctx) {
 		async.ParkHostArgs(originalArgs)
 		return
 	}
 
-	// Host handlers follow the Go (value, error) convention, but the Canonical ABI
-	// encoder represents a result<T,E> as map[string]any{"ok"/"err"}. Fold the two
-	// returns into that representation before lowering; otherwise the raw ok value
-	// fails to encode and the result area is left uninitialized.
-	if w.hasResultType() && len(results) == 2 {
-		var errType wit.Type
-		if len(w.def.Results) == 1 {
-			errType = resultErrType(w.def.Results[0])
-		}
-		folded := foldResultValue(results[0].Interface(), results[1].Interface(), errType)
-		results = []reflect.Value{reflect.ValueOf(folded)}
-	}
-
 	if w.usesRetptr() {
-		offset := uint32(0)
+		if w.hasResultType() && len(results) == 2 {
+			errVal := results[1].Interface()
+			if isNilHandlerError(errVal) {
+				if err := mem.WriteU8(retptr+w.resultOffsets[0], 0); err != nil {
+					trapCanon(w.def.Name, "store", err)
+				}
+				r := w.def.Results[0].(*wit.TypeDef).Kind.(*wit.Result)
+				if r.OK != nil {
+					payloadAddr := retptr + w.resultOffsets[0] + w.resultPayloadOffset
+					if w.resultSuccessType != nil {
+						val := results[0]
+						if val.Kind() == reflect.Pointer && w.resultSuccessType.Kind != transcoder.KindOption {
+							if val.IsNil() {
+								trapCanon(w.def.Name, "store", fmt.Errorf("nil result pointer"))
+							}
+							val = val.Elem()
+						}
+						valHolder := val
+						if !val.CanAddr() {
+							valHolder = reflect.New(val.Type()).Elem()
+							valHolder.Set(val)
+						}
+						ptr := unsafe.Pointer(valHolder.Addr().Pointer())
+						allocList := transcoder.NewAllocationList()
+						defer allocList.Release()
+						if err := w.encoder.StoreCompiledToMemory(payloadAddr, w.resultSuccessType, ptr, mem, alloc, allocList); err != nil {
+							runtime.KeepAlive(valHolder)
+							trapCanon(w.def.Name, "store", err)
+						}
+						runtime.KeepAlive(valHolder)
+					} else {
+						if err := w.storeResultToMemoryWithAlloc(r.OK, results[0].Interface(), payloadAddr, mem, alloc); err != nil {
+							trapCanon(w.def.Name, "store", err)
+						}
+					}
+				}
+			} else {
+				if err := mem.WriteU8(retptr+w.resultOffsets[0], 1); err != nil {
+					trapCanon(w.def.Name, "store", err)
+				}
+				if w.resultErrType != nil {
+					payloadAddr := retptr + w.resultOffsets[0] + w.resultPayloadOffset
+					errPayload := handlerErrPayload(errVal, w.resultErrType)
+					if err := w.storeResultToMemoryWithAlloc(w.resultErrType, errPayload, payloadAddr, mem, alloc); err != nil {
+						trapCanon(w.def.Name, "store", err)
+					}
+				}
+			}
+			return
+		}
+
 		for i, result := range results {
 			if i < len(w.def.Results) {
 				witType := w.def.Results[i]
+				offset := w.resultOffsets[i]
 				if err := w.storeResultToMemoryWithAlloc(witType, result.Interface(), retptr+offset, mem, alloc); err != nil {
 					trapCanon(w.def.Name, "store", err)
 				}
-				offset += resultSize(witType)
 			}
 		}
 	} else {
+		// Host handlers follow the Go (value, error) convention, but the Canonical ABI
+		// encoder represents a result<T,E> as map[string]any{"ok"/"err"}. Fold the two
+		// returns into that representation before lowering; otherwise the raw ok value
+		// fails to encode and the result area is left uninitialized.
+		if w.hasResultType() && len(results) == 2 {
+			var errType wit.Type
+			if len(w.def.Results) == 1 {
+				errType = resultErrType(w.def.Results[0])
+			}
+			folded := foldResultValue(results[0].Interface(), results[1].Interface(), errType)
+			results = []reflect.Value{reflect.ValueOf(folded)}
+		}
 		resultIdx := 0
 		for i, result := range results {
 			if i < len(w.resultTypes) && w.resultTypes[i] != nil {
@@ -804,6 +947,13 @@ func (w *LowerWrapper) lowerResultWithAlloc(witType wit.Type, value any, mem was
 	allocList := transcoder.NewAllocationList()
 	defer allocList.Release() // allocations owned by WASM caller
 	return w.encoder.EncodeParams([]wit.Type{witType}, []any{value}, mem, alloc, allocList)
+}
+
+// lowerCallMemory is borrowed only for one synchronous host invocation.
+// Nested calls acquire separate entries; no entry stays borrowed across a yield.
+type lowerCallMemory struct {
+	memory    WazeroMemory
+	allocator moduleAllocator
 }
 
 type moduleAllocator struct {
