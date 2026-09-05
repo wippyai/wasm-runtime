@@ -140,17 +140,102 @@ type Pollable interface {
 	Block(ctx context.Context)
 }
 
-// PollableResource is a basic pollable that can be manually set ready.
-type PollableResource struct {
-	ready bool
+// NotifyPollable is an optional interface for pollables that expose a notification channel.
+type NotifyPollable interface {
+	Pollable
+	Notify() <-chan struct{}
 }
 
+var closedPollableChan = func() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+// PollableResource is a basic pollable that can be manually set ready.
+// It is zero-value usable, synchronized, and safe for concurrent use.
+type PollableResource struct {
+	readyCh chan struct{}
+	mu      sync.Mutex
+	ready   bool
+	dropped bool
+}
+
+var (
+	_ Pollable       = (*PollableResource)(nil)
+	_ NotifyPollable = (*PollableResource)(nil)
+)
+
 func (p *PollableResource) Type() ResourceType { return ResourcePollable }
-func (p *PollableResource) Drop()              {}
-func (p *PollableResource) Ready() bool        { return p.ready }
-func (p *PollableResource) SetReady(r bool)    { p.ready = r }
-func (p *PollableResource) Block(ctx context.Context) {
+
+// Drop marks the pollable as dropped and ready, unblocking any waiters.
+// Once dropped, the pollable is terminal and cannot be revived by SetReady.
+func (p *PollableResource) Drop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.dropped {
+		return
+	}
+	p.dropped = true
 	p.ready = true
+	if p.readyCh != nil {
+		close(p.readyCh)
+		p.readyCh = nil
+	}
+}
+
+// Ready returns true if the resource is ready for I/O or has been dropped.
+func (p *PollableResource) Ready() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ready
+}
+
+// SetReady updates the readiness state. If the pollable has been dropped,
+// SetReady is a no-op and cannot revive or alter its terminal ready state.
+func (p *PollableResource) SetReady(r bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.dropped || p.ready == r {
+		return
+	}
+	p.ready = r
+	if r {
+		if p.readyCh != nil {
+			close(p.readyCh)
+			p.readyCh = nil
+		}
+	}
+}
+
+// Notify returns a channel that is closed if the resource is currently ready
+// or dropped. If the resource is not ready, it returns a channel that will close
+// when the state next becomes ready or dropped.
+func (p *PollableResource) Notify() <-chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ready || p.dropped {
+		return closedPollableChan
+	}
+	if p.readyCh == nil {
+		p.readyCh = make(chan struct{})
+	}
+	return p.readyCh
+}
+
+// Block waits until the resource becomes ready, is dropped, or ctx is canceled.
+// Block never fabricates readiness.
+func (p *PollableResource) Block(ctx context.Context) {
+	for {
+		if ctx.Err() != nil || p.Ready() {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.Notify():
+		}
+	}
 }
 
 // TimerPollable implements a time-based pollable that becomes ready at a deadline
@@ -162,6 +247,9 @@ type TimerPollable struct {
 func NewTimerPollable(deadline time.Time) *TimerPollable {
 	return &TimerPollable{deadline: deadline}
 }
+
+// Deadline exposes the readiness instant without allocating a timer.
+func (p *TimerPollable) Deadline() time.Time { return p.deadline }
 
 func (p *TimerPollable) Type() ResourceType { return ResourcePollable }
 func (p *TimerPollable) Drop()              {}
