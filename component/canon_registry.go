@@ -241,63 +241,57 @@ func (r *CanonRegistry) processLower(comp *Component, canon *CanonDef) error {
 // findFuncInInstanceType finds a function type and builds the internal type
 // index space for resolution. Returns nil if not found.
 func (r *CanonRegistry) findFuncInInstanceType(instType *InstanceType, exportName string) (*FuncType, map[uint32]Type) {
-	internalTypes := make(map[uint32]Type)
-	typeIdx := uint32(0)
-
-	// Build internal type index space: type decls (0x01), type aliases (0x03),
-	// and type exports with bounds (0x04 + kind 0x03) all contribute indices
-	for _, decl := range instType.Decls {
-		switch d := decl.DeclType.(type) {
-		case InstanceDeclType:
-			internalTypes[typeIdx] = d.Type
-			typeIdx++
-
-		case InstanceDeclAlias:
-			// Only type aliases (sort=0x03) add to the type index space
-			if d.Alias.Kind == SortType {
-				parsed, err := parseSingleAlias(d.Alias.Kind, d.Alias.Data)
-				if err == nil && parsed.TargetKind == 0x02 && r.resolver != nil {
-					if int(parsed.OuterIndex) < len(r.resolver.types) {
-						internalTypes[typeIdx] = r.resolver.types[parsed.OuterIndex]
-					} else {
-						internalTypes[typeIdx] = PrimValType{Type: PrimU32}
-					}
-				} else {
-					internalTypes[typeIdx] = PrimValType{Type: PrimU32}
-				}
-				typeIdx++
-			}
-
-		case InstanceDeclExport:
-			// Type exports (Kind=0x03) add to type index space
-			if d.Export.externDesc.Kind == 0x03 {
-				boundIdx := d.Export.externDesc.TypeIndex
-				if boundType, found := internalTypes[boundIdx]; found {
-					internalTypes[typeIdx] = boundType
-				} else {
-					internalTypes[typeIdx] = PrimValType{Type: PrimU32}
-				}
-				typeIdx++
-			}
-		}
+	var globalTypes []Type
+	if r.resolver != nil {
+		globalTypes = r.resolver.types
 	}
+	space := buildInstanceTypeIndexSpace(instType, globalTypes)
 
 	for _, decl := range instType.Decls {
-		if d, ok := decl.DeclType.(InstanceDeclExport); ok {
-			if decl.Name == exportName {
-				if d.Export.externDesc.Kind == 0x01 { // func
-					idx := d.Export.externDesc.TypeIndex
-					if t, ok := internalTypes[idx]; ok && t != nil {
-						if ft, ok := t.(*FuncType); ok {
-							return ft, internalTypes
-						}
-					}
-				}
-			}
+		d, ok := decl.DeclType.(InstanceDeclExport)
+		if !ok {
+			continue
+		}
+		name := decl.Name
+		if name == "" {
+			name = d.Export.Name
+		}
+		if name != exportName || d.Export.externDesc.Kind != ExternFunc {
+			continue
+		}
+		t, found := space.types[d.Export.externDesc.TypeIndex]
+		if !found || t == nil {
+			continue
+		}
+		if ft := funcTypeFromInstanceType(t, space.types, globalTypes); ft != nil {
+			return ft, space.types
 		}
 	}
 
 	return nil, nil
+}
+
+func funcTypeFromInstanceType(t Type, space map[uint32]Type, globalTypes []Type) *FuncType {
+	for i := 0; i < maxTypeResolveDepth; i++ {
+		switch x := t.(type) {
+		case *FuncType:
+			return x
+		case TypeIndexRef:
+			next, ok := space[x.Index]
+			if !ok {
+				return nil
+			}
+			t = next
+		case globalTypeRef:
+			if int(x.Index) >= len(globalTypes) {
+				return nil
+			}
+			t = globalTypes[x.Index]
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 func (r *CanonRegistry) findExportNameByFuncIdx(comp *Component, compFuncIdx uint32) string {

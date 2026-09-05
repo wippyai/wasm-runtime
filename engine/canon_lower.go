@@ -52,6 +52,7 @@ type LowerWrapper struct {
 	resultPayloadOffset uint32
 	resultAreaSize      uint32
 	hasCtx              bool
+	errorOnly           bool
 }
 
 func (w *LowerWrapper) Name() string {
@@ -141,7 +142,10 @@ func (w *LowerWrapper) compileTypes() error {
 	w.resultAreaSize = offset
 	numOut := handlerType.NumOut()
 	w.resultTypes = make([]*transcoder.CompiledType, len(w.def.Results))
-	isResult := w.hasResultType() && numOut == 2
+	w.errorOnly = w.hasResultType() && numOut == 1 &&
+		w.def.Results[0].(*wit.TypeDef).Kind.(*wit.Result).OK == nil &&
+		handlerType.Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem())
+	isResult := w.hasResultType() && (numOut == 2 || w.errorOnly)
 	if isResult {
 		r := w.def.Results[0].(*wit.TypeDef).Kind.(*wit.Result)
 		w.resultErrType = r.Err
@@ -674,6 +678,12 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 	if async != nil && async.IsUnwinding(ctx) {
 		async.ParkHostArgs(originalArgs)
 		return
+	}
+
+	if w.errorOnly {
+		directResults[0] = nilHostError
+		directResults[1] = results[0]
+		results = directResults[:]
 	}
 
 	if w.usesRetptr() {
