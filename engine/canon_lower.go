@@ -574,7 +574,7 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 
 	async := GetAsyncify(ctx)
 	if async != nil && async.IsRewinding(ctx) {
-		stack = restoreHostArgs(async.TakeHostArgs(), stack)
+		stack = async.restoreParkedArgs(stack)
 	}
 
 	if w.validateRaw != nil {

@@ -268,3 +268,38 @@ func TestLowerWrapper_LiftErrorTraps(t *testing.T) {
 	}()
 	w.BuildRawFunc()(ctx, inst.instance, []uint64{1 << 30, 100})
 }
+
+func TestParkedHostArgsOwnedAndReusable(t *testing.T) {
+	for _, size := range []int{0, 1, 16, 17, 40} {
+		a := NewAsyncify()
+		input := make([]uint64, size)
+		for i := range input {
+			input[i] = uint64(i + 1)
+		}
+		a.ParkHostArgs(input)
+		clear(input)
+		saved := a.TakeHostArgs()
+		a.ParkHostArgs(input)
+		for i, v := range saved {
+			if v != uint64(i+1) {
+				t.Fatalf("size %d owned arg %d changed: %d", size, i, v)
+			}
+		}
+		a.ClearHostArgs()
+		for _, length := range []int{0, size, size + 1} {
+			a.ParkHostArgs(saved)
+			target := make([]uint64, length)
+			restored := a.restoreParkedArgs(target)
+			a.ParkHostArgs(input)
+			for i, v := range saved {
+				if restored[i] != v {
+					t.Fatalf("size %d target %d argument %d changed", size, length, i)
+				}
+			}
+			a.ClearHostArgs()
+			if a.TakeHostArgs() != nil {
+				t.Fatal("clear retained arguments")
+			}
+		}
+	}
+}

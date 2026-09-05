@@ -52,16 +52,17 @@ type Asyncify struct {
 		startRewind api.Function
 		stopRewind  api.Function
 	}
-	memory      api.Memory
-	module      api.Module
-	stateGlobal api.MutableGlobal
-	dataGlobal  api.MutableGlobal
-	hostArgs    []uint64
-	mu          sync.Mutex
-	state       int32
-	dataAddr    uint32
-	stackSize   uint32
-	trusted     bool
+	memory         api.Memory
+	module         api.Module
+	stateGlobal    api.MutableGlobal
+	dataGlobal     api.MutableGlobal
+	hostArgs       []uint64
+	inlineHostArgs [16]uint64
+	mu             sync.Mutex
+	state          int32
+	dataAddr       uint32
+	stackSize      uint32
+	trusted        bool
 }
 
 const AsyncifyDataAddr uint32 = 16
@@ -276,20 +277,37 @@ func (a *Asyncify) ResetStack() {
 // ParkHostArgs copies the Canonical ABI host-call stack for the in-flight
 // unwind so rewind can restore retptr and arguments.
 func (a *Asyncify) ParkHostArgs(stack []uint64) {
-	saved := make([]uint64, len(stack))
-	copy(saved, stack)
 	a.mu.Lock()
-	a.hostArgs = saved
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	if len(stack) <= len(a.inlineHostArgs) {
+		a.hostArgs = a.inlineHostArgs[:len(stack)]
+	} else {
+		a.hostArgs = make([]uint64, len(stack))
+	}
+	copy(a.hostArgs, stack)
 }
 
-// TakeHostArgs returns and clears the parked host-call stack.
+// TakeHostArgs returns an owned copy of the parked host-call stack and clears it.
+// Inline storage must not escape: a subsequent ParkHostArgs can reuse it.
 func (a *Asyncify) TakeHostArgs() []uint64 {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	saved := a.hostArgs
+	if saved != nil && len(saved) <= len(a.inlineHostArgs) {
+		saved = make([]uint64, len(a.hostArgs))
+		copy(saved, a.hostArgs)
+	}
 	a.hostArgs = nil
-	a.mu.Unlock()
 	return saved
+}
+
+// restoreParkedArgs copies into the caller stack before reusing inline storage.
+func (a *Asyncify) restoreParkedArgs(stack []uint64) []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	stack = restoreHostArgs(a.hostArgs, stack)
+	a.hostArgs = nil
+	return stack
 }
 
 // ClearHostArgs drops any parked host-call stack.
