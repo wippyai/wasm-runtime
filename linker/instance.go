@@ -81,7 +81,7 @@ func (inst *Instance) resolveMemory() (api.Memory, api.Function) {
 		return inst.cachedMemory, inst.cachedAlloc
 	}
 	for _, mod := range inst.modules {
-		if m := mod.Memory(); isValidMemory(m) {
+		if m := mod.Memory(); isValidMemory(m) && mod.ExportedFunction("cabi_realloc") != nil {
 			inst.cachedMemory = m
 			inst.cachedAlloc = mod.ExportedFunction("cabi_realloc")
 			break
@@ -1619,49 +1619,47 @@ func (inst *Instance) createVirtualInstance(
 						// Canon lower - find the host function being lowered
 						compFuncIdx := coreEntry.FuncIndex
 						if def := inst.resolveCanonLowerFunc(compFuncIdx); def != nil {
-							// Get bound memory from MemoryIdx
-							var boundMem api.Memory
-							memIdx := int(coreEntry.MemoryIdx)
-							if memIdx >= 0 && memIdx < len(memSpace) {
-								entry := memSpace[memIdx]
-								if ci := inst.coreInstances[entry.instanceIdx]; ci != nil && ci.module != nil {
-									if mem := ci.module.Memory(); isValidMemory(mem) {
-										boundMem = mem
+							// The referenced core instance may not exist until after this
+							// virtual import instance. Resolve the exact canonical indices at call
+							// time; a shim's memory must never substitute for the guest memory.
+							boundDef := *def
+							original := def.Handler
+							memoryIndex := int(coreEntry.MemoryIdx)
+							reallocIndex := int(coreEntry.ReallocIdx)
+							var (
+								resolveOnce sync.Once
+								boundMemory api.Memory
+								allocator   api.Function
+								resolveErr  string
+							)
+							boundDef.Handler = func(ctx context.Context, caller api.Module, stack []uint64) {
+								resolveOnce.Do(func() {
+									if memoryIndex >= 0 {
+										if memoryIndex < len(memSpace) {
+											entry := memSpace[memoryIndex]
+											if ci := inst.coreInstances[entry.instanceIdx]; ci != nil && ci.module != nil {
+												boundMemory = ci.module.ExportedMemory(entry.exportName)
+											}
+										}
+										if !isValidMemory(boundMemory) {
+											resolveErr = "canonical import memory unavailable"
+											return
+										}
 									}
-								}
-							}
-							// Fallback: first module with memory
-							if !isValidMemory(boundMem) {
-								for _, mod := range inst.modules {
-									if mem := mod.Memory(); isValidMemory(mem) {
-										boundMem = mem
-										break
+									if reallocIndex >= 0 {
+										allocator = inst.getCoreFunc(comp, reallocIndex)
+										if allocator == nil {
+											resolveErr = "canonical import allocator unavailable"
+											return
+										}
 									}
+								})
+								if resolveErr != "" {
+									panic(resolveErr)
 								}
+								original(ctx, &boundModuleWrapper{Module: caller, boundMem: boundMemory, boundAlloc: allocator, allocName: "cabi_realloc"}, stack)
 							}
-
-							// Get bound realloc function from ReallocIdx
-							var boundRealloc api.Function
-							reallocIdx := int(coreEntry.ReallocIdx)
-							if reallocIdx >= 0 && reallocIdx < len(comp.CoreFuncIndexSpace) {
-								reallocEntry := comp.CoreFuncIndexSpace[reallocIdx]
-								if reallocEntry.Kind == component.CoreFuncAliasExport && reallocEntry.InstanceIdx < len(inst.coreInstances) {
-									ci := inst.coreInstances[reallocEntry.InstanceIdx]
-									if ci != nil && ci.module != nil {
-										boundRealloc = ci.module.ExportedFunction(reallocEntry.ExportName)
-									}
-								}
-							}
-
-							if isValidMemory(boundMem) {
-								entity.Source = BoundHostFunc{
-									Def:       def,
-									Memory:    boundMem,
-									Allocator: boundRealloc,
-								}
-							} else {
-								entity.Source = HostFunc{Def: def}
-							}
+							entity.Source = HostFunc{Def: &boundDef}
 						} else {
 							// Build descriptive path for error reporting
 							path := exp.Name
@@ -2080,7 +2078,13 @@ func (inst *Instance) resolveCanon(funcIdx uint32) *CanonExport {
 	}
 
 	// Resolve memory
-	canon.Memory = inst.Memory()
+	memSpace := buildCoreEntitySpace(comp, 0x02)
+	if int(info.MemoryIndex) < len(memSpace) {
+		entry := memSpace[info.MemoryIndex]
+		if ci := inst.coreInstances[entry.instanceIdx]; ci != nil && ci.module != nil {
+			canon.Memory = ci.module.ExportedMemory(entry.exportName)
+		}
+	}
 
 	// Resolve realloc
 	if info.ReallocIndex >= 0 {

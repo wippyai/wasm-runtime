@@ -88,7 +88,15 @@ func (la *LivenessAnalyzer) ComputeForCallSites(instrs []wasm.Instruction, callS
 
 		// Record liveness at call sites (before the call)
 		if siteSet.Has(uint32(i)) {
-			result[i] = live.ToSlice()
+			callLive := live.Clone()
+			for loopStart, bounds := range cfg.loopBodies {
+				if i >= bounds[0] && i <= bounds[1] {
+					if loopSet, ok := loopLocals[loopStart]; ok {
+						callLive.Union(loopSet)
+					}
+				}
+			}
+			result[i] = callLive.ToSlice()
 		}
 	}
 

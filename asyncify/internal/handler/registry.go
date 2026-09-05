@@ -156,6 +156,19 @@ func NewStack(fallback uint32) *Stack {
 	return &Stack{fallback: fallback}
 }
 
+// Snapshot returns a copy of the current stack entries.
+func (s *Stack) Snapshot() []StackEntry {
+	cp := make([]StackEntry, len(s.entries))
+	copy(cp, s.entries)
+	return cp
+}
+
+// Restore restores the stack entries from a snapshot.
+func (s *Stack) Restore(snapshot []StackEntry) {
+	s.entries = make([]StackEntry, len(snapshot))
+	copy(s.entries, snapshot)
+}
+
 // Push adds a value to the top of the stack.
 func (s *Stack) Push(localIdx uint32, valType wasm.ValType) {
 	s.entries = append(s.entries, StackEntry{LocalIdx: localIdx, Type: valType})

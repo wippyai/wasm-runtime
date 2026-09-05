@@ -49,6 +49,11 @@ type Config struct {
 	// 256 = 16MB, 1024 = 64MB, 4096 = 256MB
 	MemoryLimitPages uint32
 
+	// CloseOnContextDone instruments guest execution to terminate on context
+	// cancellation, including loops that never call a host import. Termination
+	// closes the instance; it is not a resumable scheduling quantum.
+	CloseOnContextDone bool
+
 	// EnableThreads enables the WebAssembly threads proposal (experimental).
 	// This allows atomic operations and shared memory within WASM modules.
 	// Note: Thread operations are guest-only and not exposed to host functions.
@@ -73,6 +78,9 @@ func NewWazeroEngineWithConfig(ctx context.Context, cfg *Config) (*WazeroEngine,
 	if cfg != nil && cfg.MemoryLimitPages > 0 {
 		runtimeCfg = runtimeCfg.WithMemoryLimitPages(cfg.MemoryLimitPages)
 	}
+	if cfg != nil && cfg.CloseOnContextDone {
+		runtimeCfg = runtimeCfg.WithCloseOnContextDone(true)
+	}
 
 	runtime := wazero.NewRuntimeWithConfig(ctx, runtimeCfg)
 	return &WazeroEngine{runtime: runtime}, nil
@@ -86,11 +94,13 @@ type CompileConfig struct {
 
 // InstanceConfig holds configuration for module instantiation
 type InstanceConfig struct {
-	Stdout          io.Writer
-	Stderr          io.Writer
-	Stdin           io.Reader
-	Env             map[string]string
-	Name            string
+	Stdout io.Writer
+	Stderr io.Writer
+	Stdin  io.Reader
+	Env    map[string]string
+	Name   string
+	// EntryExport selects the canonical executable whose Asyncify state owns this call.
+	EntryExport     string
 	DecodeOptions   transcoder.DecodeOptions
 	AsyncifyImports []string
 	Args            []string
@@ -947,6 +957,32 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 		return nil, fmt.Errorf("final module not found at index %d", lastMod.InstanceIndex)
 	}
 
+	// An adapter or fixup may be instantiated last. Select the executable
+	// through the entry's canonical core-function index, never allocator names.
+	var entryCanon *linker.CanonExport
+	if cfg != nil && cfg.EntryExport != "" {
+		lift := m.canonRegistry.FindLift(cfg.EntryExport)
+		if lift == nil || int(lift.CoreFuncIdx) >= len(m.validated.Raw.CoreFuncIndexSpace) {
+			inst.Close(ctx)
+			return nil, fmt.Errorf("entry export %q has no canonical executable", cfg.EntryExport)
+		}
+		owner := m.validated.Raw.CoreFuncIndexSpace[lift.CoreFuncIdx]
+		if owner.Kind != component.CoreFuncAliasExport {
+			inst.Close(ctx)
+			return nil, fmt.Errorf("entry export %q has unsupported executable ownership", cfg.EntryExport)
+		}
+		module = inst.GetModule(owner.InstanceIdx)
+		if module == nil {
+			inst.Close(ctx)
+			return nil, fmt.Errorf("entry export %q executable unavailable", cfg.EntryExport)
+		}
+		exp, ok := inst.GetExport(cfg.EntryExport)
+		if !ok || exp.Canon == nil {
+			inst.Close(ctx)
+			return nil, fmt.Errorf("entry export %q canonical binding unavailable", cfg.EntryExport)
+		}
+		entryCanon = exp.Canon
+	}
 	// Create WazeroInstance wrapper
 	wazInst := &WazeroInstance{
 		module:     m,
@@ -962,13 +998,20 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 	}
 
 	// Cache memory
-	if mem := inst.Memory(); hasMemory(mem) {
+	mem := inst.Memory()
+	if entryCanon != nil {
+		mem = entryCanon.Memory
+	}
+	if hasMemory(mem) {
 		wazInst.memory = &WazeroMemory{mem: mem}
 	}
 
 	// Cache allocator
 	var isSimpleAlloc bool
 	wazInst.allocFn = inst.Allocator()
+	if entryCanon != nil {
+		wazInst.allocFn = entryCanon.Realloc
+	}
 	if wazInst.allocFn != nil {
 		paramCount := len(wazInst.allocFn.Definition().ParamTypes())
 		isSimpleAlloc = paramCount < 4
@@ -1474,10 +1517,16 @@ func (m *WazeroModule) ExportNames() []string {
 // CallSession represents an in-progress async function call.
 // Use StartCall to create, Step to advance, and LiftResult to extract results.
 type CallSession struct {
-	instance    *WazeroInstance
-	fn          api.Function
-	paramTypes  []wit.Type
-	resultTypes []wit.Type
+	instance         *WazeroInstance
+	fn               api.Function
+	paramTypes       []wit.Type
+	resultTypes      []wit.Type
+	postReturn       api.Function
+	memory           *WazeroMemory
+	postReturnCalled bool
+	lifted           bool
+	liftedResult     any
+	liftErr          error
 }
 
 // StartCall prepares a call session by lowering params. Does not execute yet.
@@ -1523,11 +1572,32 @@ func (i *WazeroInstance) StartCall(ctx context.Context, funcName string, params 
 		return nil, err
 	}
 
+	var canon *linker.CanonExport
+	var postReturn api.Function
+	if i.linkerInst != nil {
+		if exp, ok := i.linkerInst.GetExport(funcName); ok && exp.Canon != nil {
+			canon = exp.Canon
+			postReturn = exp.Canon.PostReturn
+		}
+	}
+	if postReturn == nil && i.instance != nil {
+		postReturn = i.instance.ExportedFunction("cabi_post_" + funcName)
+	}
+
+	mem := i.memory
+	if canon != nil && canon.Memory != nil {
+		if mem == nil || mem.mem != canon.Memory {
+			mem = &WazeroMemory{mem: canon.Memory}
+		}
+	}
+
 	return &CallSession{
 		instance:    i,
 		fn:          fn,
 		paramTypes:  lift.Params,
 		resultTypes: lift.Results,
+		postReturn:  postReturn,
+		memory:      mem,
 	}, nil
 }
 
@@ -1541,18 +1611,97 @@ func (cs *CallSession) Step(ctx context.Context, yr *YieldResult) (StepResult, e
 
 // LiftResult converts raw wasm results to typed Go values after StepDone.
 func (cs *CallSession) LiftResult(ctx context.Context, rawResults []uint64) (any, error) {
-	if len(cs.resultTypes) == 0 {
-		return nil, nil
+	if cs == nil || cs.instance == nil {
+		return nil, fmt.Errorf("call session is nil")
 	}
 
-	copy(cs.instance.stackBuf, rawResults)
-	goResults, err := cs.instance.decoder.DecodeResults(cs.resultTypes, cs.instance.stackBuf, cs.instance.memory)
-	if err != nil {
-		return nil, fmt.Errorf("decode results: %w", err)
+	if cs.liftErr != nil {
+		return nil, cs.liftErr
+	}
+	if cs.lifted {
+		return cs.liftedResult, nil
 	}
 
+	mem := cs.memory
+	if mem == nil {
+		mem = cs.instance.memory
+	}
+
+	var goResults []any
+	if len(cs.resultTypes) > 0 {
+		// Canonical results exceeding one flat value are returned indirectly.
+		// The core result is the address of the result area, not its discriminant.
+		if usesRetptr(cs.resultTypes) {
+			if len(rawResults) != 1 {
+				cs.liftErr = fmt.Errorf("indirect result requires one return pointer")
+				return nil, cs.liftErr
+			}
+			if mem == nil {
+				cs.liftErr = fmt.Errorf("decode results: memory not available")
+				return nil, cs.liftErr
+			}
+			basePtr := uint32(rawResults[0])
+			if len(cs.resultTypes) == 1 {
+				val, err := cs.instance.decoder.LoadValue(cs.resultTypes[0], basePtr, mem)
+				if err != nil {
+					cs.liftErr = fmt.Errorf("decode results: %w", err)
+					return nil, cs.liftErr
+				}
+				goResults = []any{val}
+			} else {
+				offset := uint32(0)
+				lc := transcoder.NewLayoutCalculator()
+				goResults = make([]any, len(cs.resultTypes))
+				for idx, rt := range cs.resultTypes {
+					layout := lc.Calculate(rt)
+					if layout.Align > 0 {
+						offset = (offset + layout.Align - 1) &^ (layout.Align - 1)
+					}
+					val, err := cs.instance.decoder.LoadValue(rt, basePtr+offset, mem)
+					if err != nil {
+						cs.liftErr = fmt.Errorf("decode results: %w", err)
+						return nil, cs.liftErr
+					}
+					goResults[idx] = val
+					offset += layout.Size
+				}
+			}
+		} else {
+			expectedFlat := flatResultCount(cs.resultTypes)
+			if len(rawResults) < expectedFlat {
+				cs.liftErr = fmt.Errorf("decode results: expected %d raw results, got %d", expectedFlat, len(rawResults))
+				return nil, cs.liftErr
+			}
+			var err error
+			goResults, err = cs.instance.decoder.DecodeResults(cs.resultTypes, rawResults, mem)
+			if err != nil {
+				cs.liftErr = fmt.Errorf("decode results: %w", err)
+				return nil, cs.liftErr
+			}
+		}
+	}
+
+	// Post-return cleanup must run exactly once after successful lifting.
+	if cs.postReturn != nil && !cs.postReturnCalled {
+		cs.postReturnCalled = true
+		callCtx := ctx
+		if callCtx == nil {
+			callCtx = context.Background()
+		}
+		callCtx = cs.instance.prepareCallContext(callCtx)
+		if _, err := cs.postReturn.Call(callCtx, rawResults...); err != nil {
+			cs.liftErr = fmt.Errorf("post-return: %w", err)
+			return nil, cs.liftErr
+		}
+	}
+
+	cs.lifted = true
 	if len(goResults) == 1 {
-		return goResults[0], nil
+		cs.liftedResult = goResults[0]
+	} else if len(goResults) > 1 {
+		cs.liftedResult = goResults
+	} else {
+		cs.liftedResult = nil
 	}
-	return goResults, nil
+	return cs.liftedResult, nil
 }

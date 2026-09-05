@@ -18,9 +18,17 @@ import (
 	"github.com/wippyai/wasm-runtime/transcoder"
 )
 
+// CheckedHostFunction validates raw Canonical ABI arguments before lifting can
+// allocate host memory. Validation must be read-only and must not retain stack.
+type CheckedHostFunction struct {
+	Handler  any
+	Validate func(context.Context, api.Module, []uint64) error
+}
+
 // LowerWrapper wraps a Go function for Canonical ABI lowering.
 type LowerWrapper struct {
 	argsPool     sync.Pool
+	validateRaw  func(context.Context, api.Module, []uint64) error
 	handlerIf    any
 	handlerTyp   reflect.Type
 	compiler     *transcoder.Compiler
@@ -41,6 +49,10 @@ func (w *LowerWrapper) Name() string {
 }
 
 func NewLowerWrapper(def *component.LowerDef, handler any) (*LowerWrapper, error) {
+	var validateRaw func(context.Context, api.Module, []uint64) error
+	if checked, ok := handler.(CheckedHostFunction); ok {
+		handler, validateRaw = checked.Handler, checked.Validate
+	}
 	handlerVal := reflect.ValueOf(handler)
 	if handlerVal.Kind() != reflect.Func {
 		return nil, fmt.Errorf("handler must be a function, got %T", handler)
@@ -61,6 +73,7 @@ func NewLowerWrapper(def *component.LowerDef, handler any) (*LowerWrapper, error
 
 	w := &LowerWrapper{
 		def:          def,
+		validateRaw:  validateRaw,
 		handler:      handlerVal,
 		handlerTyp:   handlerType,
 		handlerIf:    handler,
@@ -121,7 +134,7 @@ func (w *LowerWrapper) compileTypes() error {
 }
 
 func (w *LowerWrapper) BuildRawFunc() api.GoModuleFunc {
-	if fastFn := w.tryBuildFastFunc(); fastFn != nil {
+	if fastFn := w.tryBuildFastFunc(); w.validateRaw == nil && fastFn != nil {
 		return fastFn
 	}
 
@@ -464,7 +477,6 @@ func (w *LowerWrapper) tryBuildBoolFastFunc(paramCount, resultCount int) api.GoM
 }
 
 func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []uint64) {
-	log := Logger()
 
 	// A wasi:cli/exit host call unwinds here as wazero's sys.ExitError. Apply the
 	// exit code via CloseWithExitCode (the module has already stopped) and stop;
@@ -480,22 +492,29 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 	}()
 
 	if mod == nil {
-		log.Error("callHandler: module is nil", zap.String("func", w.def.Name))
-		return
+		panic(fmt.Errorf("canonical host %s: module is nil", w.def.Name))
 	}
 	if mod.Memory() == nil {
-		log.Error("callHandler: module has no memory", zap.String("func", w.def.Name))
-		return
+		panic(fmt.Errorf("canonical host %s: module has no memory", w.def.Name))
 	}
 	mem := &WazeroMemory{mem: mod.Memory()}
 
 	allocFunc := mod.ExportedFunction(CabiRealloc)
 	if allocFunc == nil {
-		log.Error("callHandler: cabi_realloc not found", zap.String("func", w.def.Name))
-		return
+		panic(fmt.Errorf("canonical host %s: cabi_realloc not found", w.def.Name))
 	}
 	alloc := &moduleAllocator{ctx: ctx, allocFunc: allocFunc}
 
+	async := GetAsyncify(ctx)
+	if async != nil && async.IsRewinding(ctx) {
+		stack = restoreHostArgs(async.TakeHostArgs(), stack)
+	}
+
+	if w.validateRaw != nil {
+		if err := w.validateRaw(ctx, mod, stack); err != nil {
+			trapCanon(w.def.Name, "validate arguments", err)
+		}
+	}
 	argsPtr := w.argsPool.Get().(*[]reflect.Value)
 	args := *argsPtr
 	defer func() {
@@ -523,29 +542,19 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 			ptr := unsafe.Pointer(goValPtr.Pointer())
 			consumed, err := w.decoder.LiftFromStack(ct, stack[flatIdx:], ptr, mem)
 			if err != nil {
-				log.Warn("callHandler: LiftFromStack failed",
-					zap.String("func", w.def.Name),
-					zap.Int("param", paramIdx),
-					zap.Error(err))
-				args[i] = reflect.Zero(paramType)
-			} else {
-				args[i] = goValPtr.Elem()
-				flatIdx += consumed
+				trapCanon(w.def.Name, "lift", err)
 			}
+			args[i] = goValPtr.Elem()
+			flatIdx += consumed
 			paramIdx++
 		} else if paramIdx < len(w.def.Params) {
 			witType := w.def.Params[paramIdx]
 			goArg, consumed, err := w.liftArg(witType, stack[flatIdx:], mem, paramType)
 			if err != nil {
-				log.Warn("callHandler: liftArg failed",
-					zap.String("func", w.def.Name),
-					zap.Int("param", paramIdx),
-					zap.Error(err))
-				args[i] = reflect.Zero(paramType)
-			} else {
-				args[i] = goArg
-				flatIdx += consumed
+				trapCanon(w.def.Name, "lift", err)
 			}
+			args[i] = goArg
+			flatIdx += consumed
 			paramIdx++
 		} else {
 			args[i] = reflect.Zero(paramType)
@@ -557,14 +566,34 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 		retptr = uint32(stack[flatIdx])
 	}
 
+	// Calling an Asyncify export from the host can reuse wazero's stack.
+	// Preserve arguments before invoking the handler, not after it suspends.
+	var inlineArgs [32]uint64
+	var originalArgs []uint64
+	if async != nil {
+		if len(stack) <= len(inlineArgs) {
+			originalArgs = inlineArgs[:len(stack)]
+		} else {
+			originalArgs = make([]uint64, len(stack))
+		}
+		copy(originalArgs, stack)
+	}
 	results := w.handler.Call(args)
+	if async != nil && async.IsUnwinding(ctx) {
+		async.ParkHostArgs(originalArgs)
+		return
+	}
 
 	// Host handlers follow the Go (value, error) convention, but the Canonical ABI
 	// encoder represents a result<T,E> as map[string]any{"ok"/"err"}. Fold the two
 	// returns into that representation before lowering; otherwise the raw ok value
 	// fails to encode and the result area is left uninitialized.
 	if w.hasResultType() && len(results) == 2 {
-		folded := foldResultValue(results[0].Interface(), results[1].Interface())
+		var errType wit.Type
+		if len(w.def.Results) == 1 {
+			errType = resultErrType(w.def.Results[0])
+		}
+		folded := foldResultValue(results[0].Interface(), results[1].Interface(), errType)
 		results = []reflect.Value{reflect.ValueOf(folded)}
 	}
 
@@ -574,11 +603,7 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 			if i < len(w.def.Results) {
 				witType := w.def.Results[i]
 				if err := w.storeResultToMemoryWithAlloc(witType, result.Interface(), retptr+offset, mem, alloc); err != nil {
-					log.Error("callHandler: storeResultToMemory failed",
-						zap.String("func", w.def.Name),
-						zap.Int("result", i),
-						zap.Error(err))
-					return
+					trapCanon(w.def.Name, "store", err)
 				}
 				offset += resultSize(witType)
 			}
@@ -599,27 +624,19 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 				ptr := unsafe.Pointer(tmp.Pointer())
 				consumed, err := w.encoder.LowerToStack(ct, ptr, stack[resultIdx:], mem, alloc)
 				if err != nil {
-					log.Warn("callHandler: LowerToStack failed",
-						zap.String("func", w.def.Name),
-						zap.Int("result", i),
-						zap.Error(err))
-				} else {
-					resultIdx += consumed
+					trapCanon(w.def.Name, "store", err)
 				}
+				resultIdx += consumed
 			} else if i < len(w.def.Results) && resultIdx < len(stack) {
 				witType := w.def.Results[i]
 				flat, err := w.lowerResultWithAlloc(witType, result.Interface(), mem, alloc)
 				if err != nil {
-					log.Warn("callHandler: lowerResultWithAlloc failed",
-						zap.String("func", w.def.Name),
-						zap.Int("result", i),
-						zap.Error(err))
-				} else {
-					for _, v := range flat {
-						if resultIdx < len(stack) {
-							stack[resultIdx] = v
-							resultIdx++
-						}
+					trapCanon(w.def.Name, "store", err)
+				}
+				for _, v := range flat {
+					if resultIdx < len(stack) {
+						stack[resultIdx] = v
+						resultIdx++
 					}
 				}
 			}
@@ -631,11 +648,11 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 // map[string]any{"ok"/"err"} representation the Canonical ABI encoder expects for
 // a result<T,E>. On success the ok payload is the value; on failure the err
 // payload is the host error's WIT representation.
-func foldResultValue(okVal, errVal any) any {
+func foldResultValue(okVal, errVal any, errType wit.Type) any {
 	if isNilHandlerError(errVal) {
 		return map[string]any{"ok": okVal}
 	}
-	return map[string]any{"err": handlerErrPayload(errVal)}
+	return map[string]any{"err": handlerErrPayload(errVal, errType)}
 }
 
 func isNilHandlerError(v any) bool {
@@ -651,14 +668,40 @@ func isNilHandlerError(v any) bool {
 	}
 }
 
-// handlerErrPayload extracts the WIT error payload from a host error value. For
-// result<_, error-code> the payload is the enum discriminant, conventionally a
-// "Code" field on the host error struct; integer error values are used directly.
-func handlerErrPayload(errVal any) any {
+func resultErrType(t wit.Type) wit.Type {
+	td, ok := t.(*wit.TypeDef)
+	if !ok {
+		return nil
+	}
+	r, ok := td.Kind.(*wit.Result)
+	if !ok {
+		return nil
+	}
+	return r.Err
+}
+
+func isWITString(t wit.Type) bool {
+	_, ok := t.(wit.String)
+	return ok
+}
+
+// handlerErrPayload extracts the WIT error payload from a host error value.
+// result<_, string> uses the error message; result<_, error-code> uses a Code
+// field or integer discriminant.
+func handlerErrPayload(errVal any, errType wit.Type) any {
 	// Host error types may expose their exact WIT error payload (e.g. a variant
 	// like stream-error). Prefer that over structural reflection.
 	if p, ok := errVal.(interface{ WITErrorPayload() any }); ok {
 		return p.WITErrorPayload()
+	}
+	if isWITString(errType) {
+		switch e := errVal.(type) {
+		case string:
+			return e
+		case error:
+			return e.Error()
+		}
+		return fmt.Sprint(errVal)
 	}
 	rv := reflect.ValueOf(errVal)
 	for rv.Kind() == reflect.Pointer {
@@ -683,7 +726,27 @@ func handlerErrPayload(errVal any) any {
 	if rv.CanInt() {
 		return uint64(rv.Int())
 	}
+	if err, ok := errVal.(error); ok {
+		return err.Error()
+	}
 	return uint32(0)
+}
+
+func trapCanon(name, op string, err error) {
+	panic(fmt.Errorf("%s: %s: %w", name, op, err))
+}
+
+func restoreHostArgs(saved, stack []uint64) []uint64 {
+	if len(saved) == 0 {
+		return stack
+	}
+	if len(stack) < len(saved) {
+		out := make([]uint64, len(saved))
+		copy(out, saved)
+		return out
+	}
+	copy(stack, saved)
+	return stack
 }
 
 func (w *LowerWrapper) storeResultToMemoryWithAlloc(witType wit.Type, value any, addr uint32, mem wasmruntime.Memory, alloc wasmruntime.Allocator) error {

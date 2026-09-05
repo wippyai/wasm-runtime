@@ -20,7 +20,8 @@ const DefaultBufferSize = 65536
 // ResourceTable manages WASI preview2 resource handles.
 // It is an adapter over the unified resource.WASITable.
 type ResourceTable struct {
-	table *resource.WASITable
+	table  *resource.WASITable
+	budget *resourceBudget
 }
 
 // Resource is a WASI preview2 resource that can be managed by ResourceTable.
@@ -59,7 +60,12 @@ func NewResourceTable() *ResourceTable {
 
 // Add stores a resource and returns a stable handle.
 func (t *ResourceTable) Add(r Resource) uint32 {
-	return uint32(t.table.Add(&resourceAdapter{r}))
+	handle, err := t.TryAdd(r)
+	if err != nil {
+		r.Drop()
+		panic(err)
+	}
+	return handle
 }
 
 // Get returns the resource for a handle, or (nil, false) if invalid.
@@ -76,11 +82,6 @@ func (t *ResourceTable) Get(handle uint32) (Resource, bool) {
 
 // Remove calls Drop on the resource and removes it from the table.
 func (t *ResourceTable) Remove(handle uint32) {
-	if res, ok := t.table.Get(resource.Handle(handle)); ok {
-		if adapter, ok := res.(*resourceAdapter); ok {
-			adapter.resource.Drop()
-		}
-	}
 	t.table.Remove(resource.Handle(handle))
 }
 
@@ -92,6 +93,7 @@ func (t *ResourceTable) Clear() {
 // resourceAdapter adapts preview2.Resource to resource.WASIResource
 type resourceAdapter struct {
 	resource Resource
+	budget   *resourceBudget
 }
 
 func (a *resourceAdapter) WASIResourceType() resource.WASIResourceType {
@@ -100,6 +102,9 @@ func (a *resourceAdapter) WASIResourceType() resource.WASIResourceType {
 
 // Drop implements resource.Dropper to ensure resource cleanup
 func (a *resourceAdapter) Drop() {
+	if a.budget != nil {
+		defer a.budget.release(a.resource.Type())
+	}
 	if a.resource != nil {
 		a.resource.Drop()
 	}

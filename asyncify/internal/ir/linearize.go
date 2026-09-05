@@ -171,38 +171,42 @@ func (l *linearizer) emitIf(ifNode *IfNode) []wasm.Instruction {
 	// if (rewinding) { drop } else { local.set $cond }
 	result = append(result, l.emitRewindingCheck()...)
 	result = append(result, wasm.Instruction{
-		Opcode: wasm.OpIf,
-		Imm:    wasm.BlockImm{Type: -64}, // void
+		Opcode:    wasm.OpIf,
+		Imm:       wasm.BlockImm{Type: -64}, // void
+		Synthetic: true,
 	})
-	result = append(result, wasm.Instruction{Opcode: wasm.OpDrop})
-	result = append(result, wasm.Instruction{Opcode: wasm.OpElse})
+	result = append(result, wasm.Instruction{Opcode: wasm.OpDrop, Synthetic: true})
+	result = append(result, wasm.Instruction{Opcode: wasm.OpElse, Synthetic: true})
 	result = append(result, wasm.Instruction{
-		Opcode: wasm.OpLocalSet,
-		Imm:    wasm.LocalImm{LocalIdx: condLocal},
+		Opcode:    wasm.OpLocalSet,
+		Imm:       wasm.LocalImm{LocalIdx: condLocal},
+		Synthetic: true,
 	})
-	result = append(result, wasm.Instruction{Opcode: wasm.OpEnd})
+	result = append(result, wasm.Instruction{Opcode: wasm.OpEnd, Synthetic: true})
 
 	// Save params from stack (reverse order - last param was below condition)
 	// Also guard with rewinding check to preserve restored values during rewind
 	if len(paramLocals) > 0 {
 		result = append(result, l.emitRewindingCheck()...)
 		result = append(result, wasm.Instruction{
-			Opcode: wasm.OpIf,
-			Imm:    wasm.BlockImm{Type: -64}, // void
+			Opcode:    wasm.OpIf,
+			Imm:       wasm.BlockImm{Type: -64}, // void
+			Synthetic: true,
 		})
 		// During rewind: drop the params (they're restored from memory)
 		for range paramLocals {
-			result = append(result, wasm.Instruction{Opcode: wasm.OpDrop})
+			result = append(result, wasm.Instruction{Opcode: wasm.OpDrop, Synthetic: true})
 		}
-		result = append(result, wasm.Instruction{Opcode: wasm.OpElse})
+		result = append(result, wasm.Instruction{Opcode: wasm.OpElse, Synthetic: true})
 		// During normal: save params to locals
 		for i := len(paramLocals) - 1; i >= 0; i-- {
 			result = append(result, wasm.Instruction{
-				Opcode: wasm.OpLocalSet,
-				Imm:    wasm.LocalImm{LocalIdx: paramLocals[i]},
+				Opcode:    wasm.OpLocalSet,
+				Imm:       wasm.LocalImm{LocalIdx: paramLocals[i]},
+				Synthetic: true,
 			})
 		}
-		result = append(result, wasm.Instruction{Opcode: wasm.OpEnd})
+		result = append(result, wasm.Instruction{Opcode: wasm.OpEnd, Synthetic: true})
 	}
 
 	// Then branch condition
@@ -212,30 +216,34 @@ func (l *linearizer) emitIf(ifNode *IfNode) []wasm.Instruction {
 	if thenHasAsync && elseHasAsync {
 		// Both have async: just use saved condition
 		result = append(result, wasm.Instruction{
-			Opcode: wasm.OpLocalGet,
-			Imm:    wasm.LocalImm{LocalIdx: condLocal},
+			Opcode:    wasm.OpLocalGet,
+			Imm:       wasm.LocalImm{LocalIdx: condLocal},
+			Synthetic: true,
 		})
 	} else if thenHasAsync {
 		// rewinding || cond
 		result = append(result, l.emitRewindingCheck()...)
 		result = append(result, wasm.Instruction{
-			Opcode: wasm.OpLocalGet,
-			Imm:    wasm.LocalImm{LocalIdx: condLocal},
+			Opcode:    wasm.OpLocalGet,
+			Imm:       wasm.LocalImm{LocalIdx: condLocal},
+			Synthetic: true,
 		})
-		result = append(result, wasm.Instruction{Opcode: wasm.OpI32Or})
+		result = append(result, wasm.Instruction{Opcode: wasm.OpI32Or, Synthetic: true})
 	} else {
 		// !rewinding && cond
 		result = append(result, l.emitNotRewindingCheck()...)
 		result = append(result, wasm.Instruction{
-			Opcode: wasm.OpLocalGet,
-			Imm:    wasm.LocalImm{LocalIdx: condLocal},
+			Opcode:    wasm.OpLocalGet,
+			Imm:       wasm.LocalImm{LocalIdx: condLocal},
+			Synthetic: true,
 		})
-		result = append(result, wasm.Instruction{Opcode: wasm.OpI32And})
+		result = append(result, wasm.Instruction{Opcode: wasm.OpI32And, Synthetic: true})
 	}
 
 	result = append(result, wasm.Instruction{
-		Opcode: wasm.OpIf,
-		Imm:    wasm.BlockImm{Type: -64}, // void
+		Opcode:    wasm.OpIf,
+		Imm:       wasm.BlockImm{Type: -64}, // void
+		Synthetic: true,
 	})
 
 	// Load params at start of then body
@@ -259,7 +267,7 @@ func (l *linearizer) emitIf(ifNode *IfNode) []wasm.Instruction {
 		})
 	}
 
-	result = append(result, wasm.Instruction{Opcode: wasm.OpEnd})
+	result = append(result, wasm.Instruction{Opcode: wasm.OpEnd, Synthetic: true})
 
 	// Else branch (if present)
 	if ifNode.Else != nil {
@@ -269,33 +277,37 @@ func (l *linearizer) emitIf(ifNode *IfNode) []wasm.Instruction {
 		if thenHasAsync && elseHasAsync {
 			// Both have async: just use negated saved condition
 			result = append(result, wasm.Instruction{
-				Opcode: wasm.OpLocalGet,
-				Imm:    wasm.LocalImm{LocalIdx: condLocal},
+				Opcode:    wasm.OpLocalGet,
+				Imm:       wasm.LocalImm{LocalIdx: condLocal},
+				Synthetic: true,
 			})
-			result = append(result, wasm.Instruction{Opcode: wasm.OpI32Eqz})
+			result = append(result, wasm.Instruction{Opcode: wasm.OpI32Eqz, Synthetic: true})
 		} else if elseHasAsync {
 			// rewinding || !cond
 			result = append(result, l.emitRewindingCheck()...)
 			result = append(result, wasm.Instruction{
-				Opcode: wasm.OpLocalGet,
-				Imm:    wasm.LocalImm{LocalIdx: condLocal},
+				Opcode:    wasm.OpLocalGet,
+				Imm:       wasm.LocalImm{LocalIdx: condLocal},
+				Synthetic: true,
 			})
-			result = append(result, wasm.Instruction{Opcode: wasm.OpI32Eqz})
-			result = append(result, wasm.Instruction{Opcode: wasm.OpI32Or})
+			result = append(result, wasm.Instruction{Opcode: wasm.OpI32Eqz, Synthetic: true})
+			result = append(result, wasm.Instruction{Opcode: wasm.OpI32Or, Synthetic: true})
 		} else {
 			// !rewinding && !cond
 			result = append(result, l.emitNotRewindingCheck()...)
 			result = append(result, wasm.Instruction{
-				Opcode: wasm.OpLocalGet,
-				Imm:    wasm.LocalImm{LocalIdx: condLocal},
+				Opcode:    wasm.OpLocalGet,
+				Imm:       wasm.LocalImm{LocalIdx: condLocal},
+				Synthetic: true,
 			})
-			result = append(result, wasm.Instruction{Opcode: wasm.OpI32Eqz})
-			result = append(result, wasm.Instruction{Opcode: wasm.OpI32And})
+			result = append(result, wasm.Instruction{Opcode: wasm.OpI32Eqz, Synthetic: true})
+			result = append(result, wasm.Instruction{Opcode: wasm.OpI32And, Synthetic: true})
 		}
 
 		result = append(result, wasm.Instruction{
-			Opcode: wasm.OpIf,
-			Imm:    wasm.BlockImm{Type: -64}, // void
+			Opcode:    wasm.OpIf,
+			Imm:       wasm.BlockImm{Type: -64}, // void
+			Synthetic: true,
 		})
 
 		// Load params at start of else body
@@ -319,7 +331,7 @@ func (l *linearizer) emitIf(ifNode *IfNode) []wasm.Instruction {
 			})
 		}
 
-		result = append(result, wasm.Instruction{Opcode: wasm.OpEnd})
+		result = append(result, wasm.Instruction{Opcode: wasm.OpEnd, Synthetic: true})
 	}
 
 	// Load results (in order)
@@ -336,18 +348,18 @@ func (l *linearizer) emitIf(ifNode *IfNode) []wasm.Instruction {
 // emitRewindingCheck emits: global.get $state; i32.const $rewinding; i32.eq
 func (l *linearizer) emitRewindingCheck() []wasm.Instruction {
 	return []wasm.Instruction{
-		{Opcode: wasm.OpGlobalGet, Imm: wasm.GlobalImm{GlobalIdx: l.config.StateGlobal}},
-		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: l.config.StateRewinding}},
-		{Opcode: wasm.OpI32Eq},
+		{Opcode: wasm.OpGlobalGet, Imm: wasm.GlobalImm{GlobalIdx: l.config.StateGlobal}, Synthetic: true},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: l.config.StateRewinding}, Synthetic: true},
+		{Opcode: wasm.OpI32Eq, Synthetic: true},
 	}
 }
 
 // emitNotRewindingCheck emits: global.get $state; i32.const $rewinding; i32.ne
 func (l *linearizer) emitNotRewindingCheck() []wasm.Instruction {
 	return []wasm.Instruction{
-		{Opcode: wasm.OpGlobalGet, Imm: wasm.GlobalImm{GlobalIdx: l.config.StateGlobal}},
-		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: l.config.StateRewinding}},
-		{Opcode: wasm.OpI32Ne},
+		{Opcode: wasm.OpGlobalGet, Imm: wasm.GlobalImm{GlobalIdx: l.config.StateGlobal}, Synthetic: true},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: l.config.StateRewinding}, Synthetic: true},
+		{Opcode: wasm.OpI32Ne, Synthetic: true},
 	}
 }
 

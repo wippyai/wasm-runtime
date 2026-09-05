@@ -53,6 +53,7 @@ type Asyncify struct {
 		stopRewind  api.Function
 	}
 	memory    api.Memory
+	hostArgs  []uint64
 	mu        sync.Mutex
 	state     int32
 	dataAddr  uint32
@@ -199,6 +200,7 @@ func (a *Asyncify) StopRewind(ctx context.Context) error {
 
 // ResetStack resets the stack pointer. Call before each new async operation.
 func (a *Asyncify) ResetStack() {
+	a.ClearHostArgs()
 	if a.memory != nil {
 		stackPtr := a.dataAddr + 8
 		if !a.memory.WriteUint32Le(a.dataAddr, stackPtr) {
@@ -207,6 +209,32 @@ func (a *Asyncify) ResetStack() {
 				zap.Uint32("stackPtr", stackPtr))
 		}
 	}
+}
+
+// ParkHostArgs copies the Canonical ABI host-call stack for the in-flight
+// unwind so rewind can restore retptr and arguments.
+func (a *Asyncify) ParkHostArgs(stack []uint64) {
+	saved := make([]uint64, len(stack))
+	copy(saved, stack)
+	a.mu.Lock()
+	a.hostArgs = saved
+	a.mu.Unlock()
+}
+
+// TakeHostArgs returns and clears the parked host-call stack.
+func (a *Asyncify) TakeHostArgs() []uint64 {
+	a.mu.Lock()
+	saved := a.hostArgs
+	a.hostArgs = nil
+	a.mu.Unlock()
+	return saved
+}
+
+// ClearHostArgs drops any parked host-call stack.
+func (a *Asyncify) ClearHostArgs() {
+	a.mu.Lock()
+	a.hostArgs = nil
+	a.mu.Unlock()
 }
 
 type CommandID = uint16
@@ -285,6 +313,7 @@ func (s *Scheduler) Execute(ctx context.Context, fn api.Function, args ...uint64
 // Step advances execution. Pass nil for first call, or YieldResult to resume.
 func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, error) {
 	if err := ctx.Err(); err != nil {
+		s.asyncify.ClearHostArgs()
 		return StepResult{Error: err, ErrorKind: ClassifyError(err)}, err
 	}
 	if !s.initialized {
@@ -296,6 +325,7 @@ func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, erro
 		s.result = yr.Value
 		s.err = yr.Error
 		if s.err != nil {
+			s.asyncify.ClearHostArgs()
 			return StepResult{Error: s.err, ErrorKind: ClassifyError(s.err)}, s.err
 		}
 		if err := s.asyncify.StartRewind(ctx); err != nil {
@@ -305,6 +335,10 @@ func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, erro
 	}
 
 	results, callErr := s.fn.Call(ctx, s.args...)
+	if callErr != nil {
+		s.asyncify.ClearHostArgs()
+		return StepResult{Error: callErr, ErrorKind: ClassifyError(callErr)}, callErr
+	}
 
 	if s.asyncify.IsUnwinding(ctx) {
 		if err := s.asyncify.StopUnwind(ctx); err != nil {
@@ -340,6 +374,9 @@ func (s *Scheduler) Reset() {
 	s.result = 0
 	s.err = nil
 	s.initialized = false
+	if s.asyncify != nil {
+		s.asyncify.ClearHostArgs()
+	}
 }
 
 // Run executes with internal event loop. Convenience wrapper over Execute/Step.
