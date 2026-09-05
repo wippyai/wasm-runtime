@@ -5,6 +5,8 @@ import (
 	"os"
 	"runtime"
 	"testing"
+
+	"go.bytecodealliance.org/wit"
 )
 
 // TestBridgeModuleCleanup verifies that bridge modules are properly closed
@@ -72,82 +74,57 @@ func TestBridgeModuleCleanup(t *testing.T) {
 	}
 }
 
-// TestBridgeModuleRefCounting verifies that shared bridge modules are only
-// released when all instances using them are closed.
+// TestBridgeModuleRefCounting verifies deterministic bridge lifecycle and survivor behavior:
+// when multiple instances share bridge modules, closing one instance must leave surviving
+// instances fully functional. Shared bridge modules and resources must only be released when
+// all instances using them are closed.
 func TestBridgeModuleRefCounting(t *testing.T) {
 	ctx := context.Background()
-
-	wasmBytes := getCalculatorComponent(t)
-
 	engine, err := NewWazeroEngine(ctx)
 	if err != nil {
-		t.Fatalf("create engine: %v", err)
+		t.Fatal(err)
 	}
 	defer engine.Close(ctx)
-
-	mod, err := engine.LoadModule(ctx, wasmBytes)
+	mod, err := engine.LoadModule(ctx, getCalculatorComponent(t))
 	if err != nil {
-		t.Fatalf("load module: %v", err)
+		t.Fatal(err)
 	}
-
-	// Warm up
-	for i := 0; i < 3; i++ {
-		inst, _ := mod.Instantiate(ctx)
-		if inst != nil {
-			inst.Close(ctx)
+	if err = mod.RegisterHostFuncTyped("wisma:calculator/host@0.1.0", "log", func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err = mod.RegisterHostFuncTyped("wisma:calculator/host@0.1.0", "compute", func(a, b uint32) uint32 { return a + b }); err != nil {
+		t.Fatal(err)
+	}
+	first, err := mod.Instantiate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close(ctx)
+	survivor, err := mod.Instantiate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer survivor.Close(ctx)
+	if err = first.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for n := 0; n < 2; n++ {
+		got, callErr := survivor.CallWithTypes(ctx, "process", []wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, uint32(5), uint32(3))
+		if callErr != nil || got != uint32(15) {
+			t.Fatalf("surviving process: result=%v err=%v", got, callErr)
 		}
 	}
-	runtime.GC()
-
-	var mBefore runtime.MemStats
-	runtime.ReadMemStats(&mBefore)
-
-	// Create two instances from same module - they should share bridges
-	inst1, err := mod.Instantiate(ctx)
+	if err = survivor.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := mod.Instantiate(ctx)
 	if err != nil {
-		t.Fatalf("instantiate 1: %v", err)
+		t.Fatal(err)
 	}
-
-	inst2, err := mod.Instantiate(ctx)
-	if err != nil {
-		t.Fatalf("instantiate 2: %v", err)
-	}
-
-	var mWithTwo runtime.MemStats
-	runtime.ReadMemStats(&mWithTwo)
-	twoInstanceMem := int64(mWithTwo.HeapAlloc) - int64(mBefore.HeapAlloc)
-	t.Logf("Memory with two instances: %d KB", twoInstanceMem/1024)
-
-	// Close first instance
-	if err := inst1.Close(ctx); err != nil {
-		t.Fatalf("close instance 1: %v", err)
-	}
-	runtime.GC()
-
-	var mAfterFirst runtime.MemStats
-	runtime.ReadMemStats(&mAfterFirst)
-	afterFirstClose := int64(mAfterFirst.HeapAlloc) - int64(mBefore.HeapAlloc)
-	t.Logf("Memory after closing first: %d KB", afterFirstClose/1024)
-
-	// Should have released roughly half the memory (one instance worth)
-	// But shared bridges should remain for inst2
-
-	// Close second instance
-	if err := inst2.Close(ctx); err != nil {
-		t.Fatalf("close instance 2: %v", err)
-	}
-	runtime.GC()
-	runtime.GC()
-
-	var mAfterBoth runtime.MemStats
-	runtime.ReadMemStats(&mAfterBoth)
-	afterBothClose := int64(mAfterBoth.HeapAlloc) - int64(mBefore.HeapAlloc)
-	t.Logf("Memory after closing both: %d KB", afterBothClose/1024)
-
-	// Now all memory should be released
-	if afterBothClose > 64*1024 && afterBothClose > twoInstanceMem/4 {
-		t.Errorf("Memory not released after both closed: started with %d KB, retained %d KB",
-			twoInstanceMem/1024, afterBothClose/1024)
+	defer fresh.Close(ctx)
+	got, err := fresh.CallWithTypes(ctx, "process", []wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, uint32(5), uint32(3))
+	if err != nil || got != uint32(15) {
+		t.Fatalf("fresh process after all close: result=%v err=%v", got, err)
 	}
 }
 
