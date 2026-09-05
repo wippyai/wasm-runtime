@@ -421,7 +421,7 @@ func TestCallSession_PostReturn_TrapAndRepeatedLiftPreservesFailure(t *testing.T
 func TestCallSession_PostReturn_CancellationPreserved(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("pre-cancelled context returns wrapped error and preserves failure", func(t *testing.T) {
+	t.Run("pre-canceled context returns wrapped error and preserves failure", func(t *testing.T) {
 		_, inst, cleanup := setupPostReturnInstance(t)
 		defer cleanup()
 
@@ -435,10 +435,10 @@ func TestCallSession_PostReturn_CancellationPreserved(t *testing.T) {
 			t.Fatalf("Step: %v", err)
 		}
 
-		cancelledCtx, cancel := context.WithCancel(ctx)
-		cancel() // cancelled before post-return call
+		canceledCtx, cancel := context.WithCancel(ctx)
+		cancel() // canceled before post-return call
 
-		val, err := session.LiftResult(cancelledCtx, stepRes.Results)
+		val, err := session.LiftResult(canceledCtx, stepRes.Results)
 		if err == nil {
 			t.Fatalf("expected cancellation error, got val=%v", val)
 		}

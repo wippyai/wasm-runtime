@@ -3,9 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
-	"go.bytecodealliance.org/wit"
 	"strings"
 	"testing"
+
+	"go.bytecodealliance.org/wit"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"

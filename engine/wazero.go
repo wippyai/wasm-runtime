@@ -1518,15 +1518,15 @@ func (m *WazeroModule) ExportNames() []string {
 // Use StartCall to create, Step to advance, and LiftResult to extract results.
 type CallSession struct {
 	instance         *WazeroInstance
-	fn               api.Function
-	paramTypes       []wit.Type
-	resultTypes      []wit.Type
-	postReturn       api.Function
 	memory           *WazeroMemory
-	postReturnCalled bool
-	lifted           bool
+	fn               api.Function
+	postReturn       api.Function
 	liftedResult     any
 	liftErr          error
+	paramTypes       []wit.Type
+	resultTypes      []wit.Type
+	postReturnCalled bool
+	lifted           bool
 }
 
 // StartCall prepares a call session by lowering params. Does not execute yet.

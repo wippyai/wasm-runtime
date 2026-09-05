@@ -354,10 +354,6 @@ func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, erro
 		return StepResult{Status: StepContinue, PendingOp: op}, nil
 	}
 
-	if callErr != nil {
-		return StepResult{Error: callErr, ErrorKind: ClassifyError(callErr)}, callErr
-	}
-
 	if !s.asyncify.IsNormal(ctx) {
 		err := fmt.Errorf("scheduler: unexpected state after call")
 		return StepResult{Error: err, ErrorKind: KindInternal}, err

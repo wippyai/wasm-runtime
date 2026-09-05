@@ -390,7 +390,7 @@ func runRepeatSuspendTwoModule(t *testing.T, mainWat, shimWat string) {
 	}
 	t.Cleanup(func() { _ = mod.Close(ctx) })
 
-	driveRecvSendLoop(t, ctx, mod, &calls, &recvIdx, recvResults, &sendArgs)
+	driveRecvSendLoop(ctx, t, mod, &calls, &recvIdx, recvResults, &sendArgs)
 }
 
 func runRepeatSuspendRetptr(t *testing.T, mainWat string, mainAsync []string, shimWat string, shimAsync []string) {
@@ -474,10 +474,10 @@ func runRepeatSuspendRetptr(t *testing.T, mainWat string, mainAsync []string, sh
 	t.Cleanup(func() { _ = mainMod.Close(ctx) })
 	guestMem = mainMod.Memory()
 
-	driveRecvSendLoop(t, ctx, mainMod, &calls, &recvIdx, recvResults, &sendArgs)
+	driveRecvSendLoop(ctx, t, mainMod, &calls, &recvIdx, recvResults, &sendArgs)
 }
 
-func driveRecvSendLoop(t *testing.T, ctx context.Context, mod api.Module, calls *[]string, recvIdx *int, recvResults []uint64, sendArgs *[]uint64) {
+func driveRecvSendLoop(ctx context.Context, t *testing.T, mod api.Module, calls *[]string, recvIdx *int, recvResults []uint64, sendArgs *[]uint64) {
 	t.Helper()
 	a := NewAsyncify()
 	if err := a.Init(mod); err != nil {

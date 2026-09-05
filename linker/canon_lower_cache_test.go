@@ -71,11 +71,12 @@ func TestCanonLower_LazyResolutionAndCacheIsolation(t *testing.T) {
 		if !ok {
 			t.Fatal("failed to read memory")
 		}
-		if b[0] == 0xAA {
+		switch b[0] {
+		case 0xAA:
 			observedMarkerA = append(observedMarkerA, b[0])
-		} else if b[0] == 0xBB {
+		case 0xBB:
 			observedMarkerB = append(observedMarkerB, b[0])
-		} else {
+		default:
 			t.Fatalf("unexpected marker: 0x%02x", b[0])
 		}
 	}, nil, nil)

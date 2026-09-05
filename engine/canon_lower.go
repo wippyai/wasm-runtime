@@ -477,7 +477,6 @@ func (w *LowerWrapper) tryBuildBoolFastFunc(paramCount, resultCount int) api.GoM
 }
 
 func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []uint64) {
-
 	// A wasi:cli/exit host call unwinds here as wazero's sys.ExitError. Apply the
 	// exit code via CloseWithExitCode (the module has already stopped) and stop;
 	// any other panic re-throws so genuine faults still surface.
