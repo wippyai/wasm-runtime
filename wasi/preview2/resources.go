@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wippyai/wasm-runtime/resource"
@@ -1088,14 +1090,29 @@ const (
 	UDPStateClosed
 )
 
-// UDPSocketResource represents a UDP socket with optional connected mode.
+// UDPSocketResource represents a UDP socket with optional connected mode
+// and socket-owned bounded datagram pumps.
 type UDPSocketResource struct {
+	pendingOp            TCPNetworkOperation
+	bindNotify           chan struct{}
 	pendingErr           error
 	conn                 interface{}
+	recvErr              error
+	sendErr              error
+	recvCond             *sync.Cond
+	sendCond             *sync.Cond
+	recvDone             chan struct{}
+	sendDone             chan struct{}
+	recvQ                []UDPDatagram
+	sendQ                []UDPDatagram
 	remoteAddr           string
 	localAddr            string
+	incomingPoll         PollableResource
+	outgoingPoll         PollableResource
 	receiveBufferSize    uint64
 	sendBufferSize       uint64
+	dropOnce             sync.Once
+	mu                   sync.Mutex
 	incomingStreamHandle uint32
 	outgoingStreamHandle uint32
 	localPort            uint16
@@ -1103,74 +1120,172 @@ type UDPSocketResource struct {
 	state                UDPState
 	unicastHopLimit      uint8
 	family               uint8
+	sendInflight         bool
+	pumpsStarted         bool
+	dropped              bool
 }
 
 func NewUDPSocketResource(family uint8) *UDPSocketResource {
-	return &UDPSocketResource{
+	s := &UDPSocketResource{
 		family:            family,
 		state:             UDPStateUnbound,
 		unicastHopLimit:   64,
 		receiveBufferSize: DefaultBufferSize,
 		sendBufferSize:    DefaultBufferSize,
 	}
+	s.recvCond = sync.NewCond(&s.mu)
+	s.sendCond = sync.NewCond(&s.mu)
+	s.outgoingPoll.SetReady(true)
+	return s
 }
 
 func (s *UDPSocketResource) Type() ResourceType { return ResourceUDPSocket }
 func (s *UDPSocketResource) Drop() {
-	if s.conn != nil {
-		if c, ok := s.conn.(interface{ Close() error }); ok {
-			_ = c.Close()
-		}
-		s.conn = nil
-	}
-	s.state = UDPStateClosed
+	s.dropOnce.Do(s.closeJoinClear)
 }
-func (s *UDPSocketResource) Family() uint8           { return s.family }
-func (s *UDPSocketResource) State() UDPState         { return s.state }
-func (s *UDPSocketResource) SetState(state UDPState) { s.state = state }
-func (s *UDPSocketResource) IsBound() bool           { return s.state == UDPStateBound }
+func (s *UDPSocketResource) Family() uint8 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.family
+}
+func (s *UDPSocketResource) State() UDPState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
+}
+func (s *UDPSocketResource) SetState(state UDPState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dropped {
+		s.state = state
+	}
+}
+func (s *UDPSocketResource) IsBound() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state == UDPStateBound
+}
 
 // LocalAddr returns the local address
-func (s *UDPSocketResource) LocalAddr() string  { return s.localAddr }
-func (s *UDPSocketResource) LocalPort() uint16  { return s.localPort }
-func (s *UDPSocketResource) RemoteAddr() string { return s.remoteAddr }
-func (s *UDPSocketResource) RemotePort() uint16 { return s.remotePort }
+func (s *UDPSocketResource) LocalAddr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.localAddr
+}
+func (s *UDPSocketResource) LocalPort() uint16 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.localPort
+}
+func (s *UDPSocketResource) RemoteAddr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.remoteAddr
+}
+func (s *UDPSocketResource) RemotePort() uint16 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.remotePort
+}
 
 func (s *UDPSocketResource) SetLocalAddr(addr string, port uint16) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.localAddr = addr
 	s.localPort = port
 }
 
 func (s *UDPSocketResource) SetRemoteAddr(addr string, port uint16) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.remoteAddr = addr
 	s.remotePort = port
 }
 
 // Conn returns the underlying connection
-func (s *UDPSocketResource) Conn() interface{}        { return s.conn }
-func (s *UDPSocketResource) SetConn(conn interface{}) { s.conn = conn }
+func (s *UDPSocketResource) Conn() interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn
+}
+func (s *UDPSocketResource) SetConn(conn interface{}) {
+	s.mu.Lock()
+	if s.conn != nil && conn != nil && reflect.TypeOf(conn).Comparable() && s.conn == conn {
+		s.mu.Unlock()
+		return
+	}
+	if !s.dropped && s.state != UDPStateClosed && s.conn == nil {
+		s.conn = conn
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	if c, ok := conn.(interface{ Close() error }); ok {
+		_ = c.Close()
+	}
+}
 
 // PendingError returns the pending error if any
-func (s *UDPSocketResource) PendingError() error       { return s.pendingErr }
-func (s *UDPSocketResource) SetPendingError(err error) { s.pendingErr = err }
-func (s *UDPSocketResource) ClearPendingError()        { s.pendingErr = nil }
+func (s *UDPSocketResource) PendingError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingErr
+}
+func (s *UDPSocketResource) SetPendingError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingErr = err
+}
+func (s *UDPSocketResource) ClearPendingError() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingErr = nil
+}
 
 // StreamHandles returns the incoming and outgoing stream handles
 func (s *UDPSocketResource) StreamHandles() (uint32, uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.incomingStreamHandle, s.outgoingStreamHandle
 }
 func (s *UDPSocketResource) SetStreamHandles(incoming, outgoing uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.incomingStreamHandle = incoming
 	s.outgoingStreamHandle = outgoing
 }
 
 // UnicastHopLimit returns the unicast hop limit
-func (s *UDPSocketResource) UnicastHopLimit() uint8        { return s.unicastHopLimit }
-func (s *UDPSocketResource) SetUnicastHopLimit(v uint8)    { s.unicastHopLimit = v }
-func (s *UDPSocketResource) ReceiveBufferSize() uint64     { return s.receiveBufferSize }
-func (s *UDPSocketResource) SetReceiveBufferSize(v uint64) { s.receiveBufferSize = v }
-func (s *UDPSocketResource) SendBufferSize() uint64        { return s.sendBufferSize }
-func (s *UDPSocketResource) SetSendBufferSize(v uint64)    { s.sendBufferSize = v }
+func (s *UDPSocketResource) UnicastHopLimit() uint8 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unicastHopLimit
+}
+func (s *UDPSocketResource) SetUnicastHopLimit(v uint8) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unicastHopLimit = v
+}
+func (s *UDPSocketResource) ReceiveBufferSize() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.receiveBufferSize
+}
+func (s *UDPSocketResource) SetReceiveBufferSize(v uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.receiveBufferSize = v
+}
+func (s *UDPSocketResource) SendBufferSize() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sendBufferSize
+}
+func (s *UDPSocketResource) SetSendBufferSize(v uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sendBufferSize = v
+}
 
 // IncomingDatagramStreamResource wraps a UDP socket for receiving datagrams.
 type IncomingDatagramStreamResource struct {
@@ -1179,6 +1294,7 @@ type IncomingDatagramStreamResource struct {
 		addr string
 		port uint16
 	}
+	dropped atomic.Bool
 }
 
 func NewIncomingDatagramStreamResource(socket *UDPSocketResource, remoteAddr string, remotePort uint16) *IncomingDatagramStreamResource {
@@ -1192,8 +1308,13 @@ func NewIncomingDatagramStreamResource(socket *UDPSocketResource, remoteAddr str
 	return r
 }
 
-func (s *IncomingDatagramStreamResource) Type() ResourceType         { return ResourceInputStream }
-func (s *IncomingDatagramStreamResource) Drop()                      {}
+func (s *IncomingDatagramStreamResource) Type() ResourceType { return ResourceInputStream }
+func (s *IncomingDatagramStreamResource) Drop() {
+	if s.dropped.Swap(true) || s.socket == nil {
+		return
+	}
+	wakeUDPReadiness(&s.socket.incomingPoll)
+}
 func (s *IncomingDatagramStreamResource) Socket() *UDPSocketResource { return s.socket }
 func (s *IncomingDatagramStreamResource) RemoteAddr() (string, uint16, bool) {
 	if s.remote == nil {
@@ -1209,6 +1330,7 @@ type OutgoingDatagramStreamResource struct {
 		addr string
 		port uint16
 	}
+	dropped atomic.Bool
 }
 
 func NewOutgoingDatagramStreamResource(socket *UDPSocketResource, remoteAddr string, remotePort uint16) *OutgoingDatagramStreamResource {
@@ -1222,8 +1344,13 @@ func NewOutgoingDatagramStreamResource(socket *UDPSocketResource, remoteAddr str
 	return r
 }
 
-func (s *OutgoingDatagramStreamResource) Type() ResourceType         { return ResourceOutputStream }
-func (s *OutgoingDatagramStreamResource) Drop()                      {}
+func (s *OutgoingDatagramStreamResource) Type() ResourceType { return ResourceOutputStream }
+func (s *OutgoingDatagramStreamResource) Drop() {
+	if s.dropped.Swap(true) || s.socket == nil {
+		return
+	}
+	wakeUDPReadiness(&s.socket.outgoingPoll)
+}
 func (s *OutgoingDatagramStreamResource) Socket() *UDPSocketResource { return s.socket }
 func (s *OutgoingDatagramStreamResource) RemoteAddr() (string, uint16, bool) {
 	if s.remote == nil {
