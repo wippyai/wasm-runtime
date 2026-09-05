@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -601,11 +602,15 @@ const (
 
 // TCPSocketResource represents a TCP socket with full connection lifecycle.
 type TCPSocketResource struct {
+	input              *TCPInputStreamResource
+	output             *TCPOutputStreamResource
 	listener           interface{}
 	pendingErr         error
 	conn               interface{}
 	localAddr          string
 	remoteAddr         string
+	mu                 sync.Mutex
+	dropOnce           sync.Once
 	keepAliveIdleTime  uint64
 	keepAliveInterval  uint64
 	receiveBufferSize  uint64
@@ -620,6 +625,7 @@ type TCPSocketResource struct {
 	hopLimit           uint8
 	state              TCPState
 	family             uint8
+	dropped            bool
 }
 
 func NewTCPSocketResource(family uint8) *TCPSocketResource {
@@ -638,151 +644,339 @@ func NewTCPSocketResource(family uint8) *TCPSocketResource {
 
 func (s *TCPSocketResource) Type() ResourceType { return ResourceTCPSocket }
 func (s *TCPSocketResource) Drop() {
-	if s.conn != nil {
-		if c, ok := s.conn.(interface{ Close() error }); ok {
+	s.dropOnce.Do(func() {
+		s.mu.Lock()
+		s.dropped = true
+		s.state = TCPStateClosed
+		conn, listener, input, output := s.conn, s.listener, s.input, s.output
+		s.conn = nil
+		s.listener = nil
+		s.mu.Unlock()
+		if input != nil {
+			input.Drop()
+		}
+		if output != nil {
+			output.Drop()
+		}
+		if c, ok := conn.(interface{ Close() error }); ok {
 			_ = c.Close()
 		}
-		s.conn = nil
-	}
-	if s.listener != nil {
-		if l, ok := s.listener.(interface{ Close() error }); ok {
+		if l, ok := listener.(interface{ Close() error }); ok {
 			_ = l.Close()
 		}
-		s.listener = nil
-	}
-	s.state = TCPStateClosed
+		if input != nil && input.buffer != nil {
+			input.buffer.WaitClosed()
+		}
+		if output != nil && output.buffer != nil {
+			output.buffer.WaitClosed()
+		}
+	})
 }
-func (s *TCPSocketResource) Family() uint8           { return s.family }
-func (s *TCPSocketResource) State() TCPState         { return s.state }
-func (s *TCPSocketResource) SetState(state TCPState) { s.state = state }
-func (s *TCPSocketResource) IsListening() bool       { return s.state == TCPStateListening }
-func (s *TCPSocketResource) IsConnected() bool       { return s.state == TCPStateConnected }
+func (s *TCPSocketResource) Family() uint8   { s.mu.Lock(); defer s.mu.Unlock(); return s.family }
+func (s *TCPSocketResource) State() TCPState { s.mu.Lock(); defer s.mu.Unlock(); return s.state }
+func (s *TCPSocketResource) SetState(state TCPState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dropped {
+		s.state = state
+	}
+}
+func (s *TCPSocketResource) IsListening() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state == TCPStateListening
+}
+func (s *TCPSocketResource) IsConnected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state == TCPStateConnected
+}
 
 // LocalAddr returns the local address
-func (s *TCPSocketResource) LocalAddr() string  { return s.localAddr }
-func (s *TCPSocketResource) LocalPort() uint16  { return s.localPort }
-func (s *TCPSocketResource) RemoteAddr() string { return s.remoteAddr }
-func (s *TCPSocketResource) RemotePort() uint16 { return s.remotePort }
+func (s *TCPSocketResource) LocalAddr() string { s.mu.Lock(); defer s.mu.Unlock(); return s.localAddr }
+func (s *TCPSocketResource) LocalPort() uint16 { s.mu.Lock(); defer s.mu.Unlock(); return s.localPort }
+func (s *TCPSocketResource) RemoteAddr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.remoteAddr
+}
+func (s *TCPSocketResource) RemotePort() uint16 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.remotePort
+}
 
 func (s *TCPSocketResource) SetLocalAddr(addr string, port uint16) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.localAddr = addr
 	s.localPort = port
 }
 
 func (s *TCPSocketResource) SetRemoteAddr(addr string, port uint16) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.remoteAddr = addr
 	s.remotePort = port
 }
 
 // Conn returns the underlying connection
-func (s *TCPSocketResource) Conn() interface{}         { return s.conn }
-func (s *TCPSocketResource) SetConn(conn interface{})  { s.conn = conn }
-func (s *TCPSocketResource) Listener() interface{}     { return s.listener }
-func (s *TCPSocketResource) SetListener(l interface{}) { s.listener = l }
+func (s *TCPSocketResource) Conn() interface{} { s.mu.Lock(); defer s.mu.Unlock(); return s.conn }
+func (s *TCPSocketResource) SetConn(conn interface{}) {
+	s.mu.Lock()
+	if !s.dropped {
+		s.conn = conn
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	if c, ok := conn.(interface{ Close() error }); ok {
+		_ = c.Close()
+	}
+}
+func (s *TCPSocketResource) Listener() interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listener
+}
+func (s *TCPSocketResource) SetListener(listener interface{}) {
+	s.mu.Lock()
+	if !s.dropped {
+		s.listener = listener
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	if c, ok := listener.(interface{ Close() error }); ok {
+		_ = c.Close()
+	}
+}
 
 // PendingError returns the pending error if any
-func (s *TCPSocketResource) PendingError() error       { return s.pendingErr }
-func (s *TCPSocketResource) SetPendingError(err error) { s.pendingErr = err }
-func (s *TCPSocketResource) ClearPendingError()        { s.pendingErr = nil }
+func (s *TCPSocketResource) PendingError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingErr
+}
+func (s *TCPSocketResource) SetPendingError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingErr = err
+}
+func (s *TCPSocketResource) ClearPendingError() { s.mu.Lock(); defer s.mu.Unlock(); s.pendingErr = nil }
 
 // StreamHandles returns the input and output stream handles
 func (s *TCPSocketResource) StreamHandles() (uint32, uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.inputStreamHandle, s.outputStreamHandle
 }
 func (s *TCPSocketResource) SetStreamHandles(input, output uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.inputStreamHandle = input
 	s.outputStreamHandle = output
 }
 
 // HopLimit returns the hop limit
-func (s *TCPSocketResource) HopLimit() uint8               { return s.hopLimit }
-func (s *TCPSocketResource) SetHopLimit(v uint8)           { s.hopLimit = v }
-func (s *TCPSocketResource) ReceiveBufferSize() uint64     { return s.receiveBufferSize }
-func (s *TCPSocketResource) SetReceiveBufferSize(v uint64) { s.receiveBufferSize = v }
-func (s *TCPSocketResource) SendBufferSize() uint64        { return s.sendBufferSize }
-func (s *TCPSocketResource) SetSendBufferSize(v uint64)    { s.sendBufferSize = v }
-func (s *TCPSocketResource) ListenBacklogSize() uint64     { return s.listenBacklogSize }
-func (s *TCPSocketResource) SetListenBacklogSize(v uint64) { s.listenBacklogSize = v }
+func (s *TCPSocketResource) HopLimit() uint8     { s.mu.Lock(); defer s.mu.Unlock(); return s.hopLimit }
+func (s *TCPSocketResource) SetHopLimit(v uint8) { s.mu.Lock(); defer s.mu.Unlock(); s.hopLimit = v }
+func (s *TCPSocketResource) ReceiveBufferSize() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.receiveBufferSize
+}
+func (s *TCPSocketResource) SetReceiveBufferSize(v uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.receiveBufferSize = v
+}
+func (s *TCPSocketResource) SendBufferSize() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sendBufferSize
+}
+func (s *TCPSocketResource) SetSendBufferSize(v uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sendBufferSize = v
+}
+func (s *TCPSocketResource) ListenBacklogSize() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listenBacklogSize
+}
+func (s *TCPSocketResource) SetListenBacklogSize(v uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listenBacklogSize = v
+}
 
 // KeepAliveEnabled returns whether keep-alive is enabled
-func (s *TCPSocketResource) KeepAliveEnabled() bool        { return s.keepAliveEnabled }
-func (s *TCPSocketResource) SetKeepAliveEnabled(v bool)    { s.keepAliveEnabled = v }
-func (s *TCPSocketResource) KeepAliveIdleTime() uint64     { return s.keepAliveIdleTime }
-func (s *TCPSocketResource) SetKeepAliveIdleTime(v uint64) { s.keepAliveIdleTime = v }
-func (s *TCPSocketResource) KeepAliveInterval() uint64     { return s.keepAliveInterval }
-func (s *TCPSocketResource) SetKeepAliveInterval(v uint64) { s.keepAliveInterval = v }
-func (s *TCPSocketResource) KeepAliveCount() uint32        { return s.keepAliveCount }
-func (s *TCPSocketResource) SetKeepAliveCount(v uint32)    { s.keepAliveCount = v }
-
-// TCPInputStreamResource wraps a TCP connection for reading.
-type TCPInputStreamResource struct {
-	socket *TCPSocketResource
-	closed bool
+func (s *TCPSocketResource) KeepAliveEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keepAliveEnabled
 }
+func (s *TCPSocketResource) SetKeepAliveEnabled(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keepAliveEnabled = v
+}
+func (s *TCPSocketResource) KeepAliveIdleTime() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keepAliveIdleTime
+}
+func (s *TCPSocketResource) SetKeepAliveIdleTime(v uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keepAliveIdleTime = v
+}
+func (s *TCPSocketResource) KeepAliveInterval() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keepAliveInterval
+}
+func (s *TCPSocketResource) SetKeepAliveInterval(v uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keepAliveInterval = v
+}
+func (s *TCPSocketResource) KeepAliveCount() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keepAliveCount
+}
+func (s *TCPSocketResource) SetKeepAliveCount(v uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keepAliveCount = v
+}
+
+// TCPInputStreamResource reads a bounded host buffer; network reads run off-worker.
+type TCPInputStreamResource struct{ buffer *tcpInputBuffer }
 
 func NewTCPInputStreamResource(socket *TCPSocketResource) *TCPInputStreamResource {
-	return &TCPInputStreamResource{socket: socket}
+	if socket == nil {
+		return &TCPInputStreamResource{}
+	}
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	if socket.input != nil {
+		return socket.input
+	}
+	stream := &TCPInputStreamResource{}
+	if conn, ok := socket.conn.(net.Conn); ok && !socket.dropped {
+		stream.buffer = newTCPInputBuffer(conn, DefaultBufferSize)
+	}
+	socket.input = stream
+	return stream
 }
-
-func (s *TCPInputStreamResource) Type() ResourceType { return ResourceInputStream }
+func (*TCPInputStreamResource) Type() ResourceType { return ResourceInputStream }
 func (s *TCPInputStreamResource) Drop() {
-	s.closed = true
+	if s.buffer != nil {
+		s.buffer.Drop()
+	}
 }
-
 func (s *TCPInputStreamResource) Read(length uint64) ([]byte, error) {
-	if s.closed {
+	if s.buffer == nil {
 		return nil, &StreamError{Closed: true}
 	}
-	if s.socket == nil || s.socket.conn == nil {
-		return nil, &StreamError{Closed: true}
+	return s.buffer.Read(length)
+}
+func (s *TCPInputStreamResource) Ready() bool { return s.buffer == nil || s.buffer.Ready() }
+func (s *TCPInputStreamResource) Notify() <-chan struct{} {
+	if s.buffer == nil {
+		return closedPollableChan
 	}
-	conn, ok := s.socket.conn.(interface{ Read([]byte) (int, error) })
-	if !ok {
-		return nil, &StreamError{Closed: true}
+	return s.buffer.Notify()
+}
+func (s *TCPInputStreamResource) Subscribe() Pollable { return (*tcpInputPollable)(s) }
+
+// A subscription borrows its stream. Dropping it does not close the parent.
+type tcpInputPollable TCPInputStreamResource
+
+func (*tcpInputPollable) Type() ResourceType        { return ResourcePollable }
+func (*tcpInputPollable) Drop()                     {}
+func (p *tcpInputPollable) Ready() bool             { return (*TCPInputStreamResource)(p).Ready() }
+func (p *tcpInputPollable) Notify() <-chan struct{} { return (*TCPInputStreamResource)(p).Notify() }
+func (p *tcpInputPollable) Block(ctx context.Context) {
+	for !p.Ready() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.Notify():
+		}
 	}
-	buf := make([]byte, length)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, &StreamError{Closed: true}
-	}
-	return buf[:n], nil
 }
 
-// TCPOutputStreamResource wraps a TCP connection for writing.
-type TCPOutputStreamResource struct {
-	socket *TCPSocketResource
-	closed bool
-}
+// TCPOutputStreamResource queues bounded output; network writes run off-worker.
+type TCPOutputStreamResource struct{ buffer *tcpOutputBuffer }
 
 func NewTCPOutputStreamResource(socket *TCPSocketResource) *TCPOutputStreamResource {
-	return &TCPOutputStreamResource{socket: socket}
+	if socket == nil {
+		return &TCPOutputStreamResource{}
+	}
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	if socket.output != nil {
+		return socket.output
+	}
+	stream := &TCPOutputStreamResource{}
+	if conn, ok := socket.conn.(net.Conn); ok && !socket.dropped {
+		stream.buffer = newTCPOutputBuffer(conn, DefaultBufferSize)
+	}
+	socket.output = stream
+	return stream
 }
-
-func (s *TCPOutputStreamResource) Type() ResourceType { return ResourceOutputStream }
+func (*TCPOutputStreamResource) Type() ResourceType { return ResourceOutputStream }
 func (s *TCPOutputStreamResource) Drop() {
-	s.closed = true
+	if s.buffer != nil {
+		s.buffer.Drop()
+	}
 }
-
 func (s *TCPOutputStreamResource) Write(data []byte) error {
-	if s.closed {
+	if s.buffer == nil {
 		return &StreamError{Closed: true}
 	}
-	if s.socket == nil || s.socket.conn == nil {
-		return &StreamError{Closed: true}
-	}
-	conn, ok := s.socket.conn.(interface{ Write([]byte) (int, error) })
-	if !ok {
-		return &StreamError{Closed: true}
-	}
-	_, err := conn.Write(data)
-	return err
+	return s.buffer.Write(data)
 }
-
 func (s *TCPOutputStreamResource) CheckWrite() (uint64, error) {
-	if s.closed || s.socket == nil || s.socket.conn == nil {
+	if s.buffer == nil {
 		return 0, &StreamError{Closed: true}
 	}
-	return DefaultBufferSize, nil
+	return s.buffer.CheckWrite()
+}
+func (s *TCPOutputStreamResource) Flush() error {
+	if s.buffer == nil {
+		return &StreamError{Closed: true}
+	}
+	return s.buffer.Flush()
+}
+func (s *TCPOutputStreamResource) Ready() bool { return s.buffer == nil || s.buffer.Ready() }
+func (s *TCPOutputStreamResource) Notify() <-chan struct{} {
+	if s.buffer == nil {
+		return closedPollableChan
+	}
+	return s.buffer.Notify()
+}
+func (s *TCPOutputStreamResource) Subscribe() Pollable { return (*tcpOutputPollable)(s) }
+
+type tcpOutputPollable TCPOutputStreamResource
+
+func (*tcpOutputPollable) Type() ResourceType        { return ResourcePollable }
+func (*tcpOutputPollable) Drop()                     {}
+func (p *tcpOutputPollable) Ready() bool             { return (*TCPOutputStreamResource)(p).Ready() }
+func (p *tcpOutputPollable) Notify() <-chan struct{} { return (*TCPOutputStreamResource)(p).Notify() }
+func (p *tcpOutputPollable) Block(ctx context.Context) {
+	for !p.Ready() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.Notify():
+		}
+	}
 }
 
 // UDPState represents the state of a UDP socket
