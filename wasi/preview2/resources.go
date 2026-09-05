@@ -1358,26 +1358,3 @@ func (s *OutgoingDatagramStreamResource) RemoteAddr() (string, uint16, bool) {
 	}
 	return s.remote.addr, s.remote.port, true
 }
-
-// ResolveAddressStreamResource iterates over DNS resolution results.
-type ResolveAddressStreamResource struct {
-	addresses []string
-	offset    int
-}
-
-func NewResolveAddressStreamResource(addresses []string) *ResolveAddressStreamResource {
-	return &ResolveAddressStreamResource{
-		addresses: addresses,
-	}
-}
-
-func (r *ResolveAddressStreamResource) Type() ResourceType { return ResourceIPNameLookup }
-func (r *ResolveAddressStreamResource) Drop()              {}
-func (r *ResolveAddressStreamResource) ReadNext() *string {
-	if r.offset >= len(r.addresses) {
-		return nil
-	}
-	addr := r.addresses[r.offset]
-	r.offset++
-	return &addr
-}
