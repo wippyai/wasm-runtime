@@ -930,7 +930,10 @@ func (s *TCPSocketResource) SetKeepAliveCount(v uint32) {
 }
 
 // TCPInputStreamResource reads a bounded host buffer; network reads run off-worker.
-type TCPInputStreamResource struct{ buffer *tcpInputBuffer }
+type TCPInputStreamResource struct {
+	socket *TCPSocketResource
+	buffer *tcpInputBuffer
+}
 
 func NewTCPInputStreamResource(socket *TCPSocketResource) *TCPInputStreamResource {
 	if socket == nil {
@@ -941,13 +944,22 @@ func NewTCPInputStreamResource(socket *TCPSocketResource) *TCPInputStreamResourc
 	if socket.input != nil {
 		return socket.input
 	}
-	stream := &TCPInputStreamResource{}
-	if conn, ok := socket.conn.(net.Conn); ok && !socket.dropped {
+	stream := &TCPInputStreamResource{socket: socket}
+	if conn, ok := socket.conn.(net.Conn); ok && !socket.dropped && socket.state != TCPStateClosed {
 		stream.buffer = newTCPInputBuffer(conn, DefaultBufferSize)
 	}
 	socket.input = stream
 	return stream
 }
+
+// AbortSocket idempotently aborts the entire owning TCP socket and joins both pumps.
+func (s *TCPInputStreamResource) AbortSocket() {
+	if s == nil || s.socket == nil {
+		return
+	}
+	s.socket.Drop()
+}
+
 func (*TCPInputStreamResource) Type() ResourceType { return ResourceInputStream }
 func (s *TCPInputStreamResource) Drop() {
 	if s.buffer != nil {
@@ -987,7 +999,10 @@ func (p *tcpInputPollable) Block(ctx context.Context) {
 }
 
 // TCPOutputStreamResource queues bounded output; network writes run off-worker.
-type TCPOutputStreamResource struct{ buffer *tcpOutputBuffer }
+type TCPOutputStreamResource struct {
+	socket *TCPSocketResource
+	buffer *tcpOutputBuffer
+}
 
 func NewTCPOutputStreamResource(socket *TCPSocketResource) *TCPOutputStreamResource {
 	if socket == nil {
@@ -998,13 +1013,22 @@ func NewTCPOutputStreamResource(socket *TCPSocketResource) *TCPOutputStreamResou
 	if socket.output != nil {
 		return socket.output
 	}
-	stream := &TCPOutputStreamResource{}
-	if conn, ok := socket.conn.(net.Conn); ok && !socket.dropped {
+	stream := &TCPOutputStreamResource{socket: socket}
+	if conn, ok := socket.conn.(net.Conn); ok && !socket.dropped && socket.state != TCPStateClosed {
 		stream.buffer = newTCPOutputBuffer(conn, DefaultBufferSize)
 	}
 	socket.output = stream
 	return stream
 }
+
+// AbortSocket idempotently aborts the entire owning TCP socket and joins both pumps.
+func (s *TCPOutputStreamResource) AbortSocket() {
+	if s == nil || s.socket == nil {
+		return
+	}
+	s.socket.Drop()
+}
+
 func (*TCPOutputStreamResource) Type() ResourceType { return ResourceOutputStream }
 func (s *TCPOutputStreamResource) Drop() {
 	if s.buffer != nil {
