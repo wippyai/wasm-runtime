@@ -990,18 +990,8 @@ func (inst *Instance) createSynthBridgeFrom(ctx context.Context, name string, vi
 			return nil, nil
 		}
 
-		compiled, compileErr := inst.pre.linker.runtime.CompileModule(ctx, synthWasm)
-		if compileErr != nil {
-			return nil, compileErr
-		}
-
 		modConfig := wazero.NewModuleConfig().WithName(name)
-		mod, instErr := inst.pre.linker.runtime.InstantiateModule(ctx, compiled, modConfig)
-		if instErr != nil {
-			compiled.Close(ctx)
-			return nil, instErr
-		}
-		return mod, nil
+		return inst.pre.linker.runtime.InstantiateWithConfig(ctx, synthWasm, modConfig)
 	})
 	if err != nil {
 		return false, err
@@ -1130,18 +1120,8 @@ func (inst *Instance) createSynthBridgeFromModule(ctx context.Context, name stri
 			return nil, nil
 		}
 
-		compiled, compileErr := inst.pre.linker.runtime.CompileModule(ctx, synthWasm)
-		if compileErr != nil {
-			return nil, compileErr
-		}
-
 		modConfig := wazero.NewModuleConfig().WithName(name)
-		mod, instErr := inst.pre.linker.runtime.InstantiateModule(ctx, compiled, modConfig)
-		if instErr != nil {
-			compiled.Close(ctx)
-			return nil, instErr
-		}
-		return mod, nil
+		return inst.pre.linker.runtime.InstantiateWithConfig(ctx, synthWasm, modConfig)
 	})
 	if err != nil {
 		// Clean up host module if we created it but synth module failed
@@ -1347,18 +1327,8 @@ func (inst *Instance) createGlobalBridges(ctx context.Context, instanceIdx, modu
 				return nil, nil
 			}
 
-			compiled, compileErr := inst.pre.linker.runtime.CompileModule(ctx, synthWasm)
-			if compileErr != nil {
-				return nil, compileErr
-			}
-
 			modConfig := wazero.NewModuleConfig().WithName(importModName)
-			bridgeMod, instErr := inst.pre.linker.runtime.InstantiateModule(ctx, compiled, modConfig)
-			if instErr != nil {
-				compiled.Close(ctx)
-				return nil, instErr
-			}
-			return bridgeMod, nil
+			return inst.pre.linker.runtime.InstantiateWithConfig(ctx, synthWasm, modConfig)
 		})
 		if err != nil {
 			return instError("global_bridge", instanceIdx, importModName, "synthetic bridge creation failed", err)
