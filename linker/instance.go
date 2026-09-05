@@ -687,49 +687,36 @@ func (inst *Instance) createBridgeFrom(ctx context.Context, name string, source 
 
 	needsReplace := source.module != nil && inst.virtualBridges[name]
 
+	buildHost := func() (api.Module, error) {
+		builder := inst.pre.linker.runtime.NewHostModuleBuilder(name)
+		for _, exp := range exports {
+			builder.NewFunctionBuilder().
+				WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
+				Export(exportName(exp.Name))
+		}
+		return builder.Instantiate(ctx)
+	}
+
 	if needsReplace {
 		_, _, err := inst.pre.linker.getOrReplaceHostModule(ctx, name,
 			func(existing api.Module) bool { return existing != nil && !inst.virtualBridges[name] },
-			func() (api.Module, error) {
-				builder := inst.pre.linker.runtime.NewHostModuleBuilder(name)
-				for _, exp := range exports {
-					builder.NewFunctionBuilder().
-						WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
-						Export(exportName(exp.Name))
-				}
-				return builder.Instantiate(ctx)
-			})
+			buildHost)
 		if err != nil {
 			return false, err
 		}
 		delete(inst.virtualBridges, name)
-	} else {
-		_, _, err := inst.pre.linker.getOrCreateHostModule(ctx, name, func() (api.Module, error) {
-			builder := inst.pre.linker.runtime.NewHostModuleBuilder(name)
-			for _, exp := range exports {
-				builder.NewFunctionBuilder().
-					WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
-					Export(exportName(exp.Name))
-			}
-			return builder.Instantiate(ctx)
-		})
+	} else if source.virtual != nil {
+		// A virtual import must remain registered while this instance uses it.
+		// Acquire once per name under hostModuleMu, before a concurrent final
+		// release can close a reused module.
+		_, _, err := inst.pre.linker.getOrCreateHostModuleAndAcquire(ctx, name, inst.bridgeModules, buildHost)
 		if err != nil {
 			return false, err
 		}
-		if source.virtual != nil && !inst.bridgeModules[name] {
-			// Virtual bridges re-export functions from a core instance via
-			// ForwardingWrapper, which captures concrete, per-instance
-			// api.Function values, so a bridge is only valid while the instance
-			// it was built from is alive. Ref-count it across the instances that
-			// share it and free it when the last one closes; the next
-			// instantiation then rebuilds a fresh bridge bound to its own core
-			// instead of reusing one left bound to a previous (now-closed)
-			// instance's core, which would trap on the first call. Guard on
-			// bridgeModules so a name reached twice in one instantiation adds a
-			// single ref, balanced with the one release on Close. Stateless
-			// host-only bridges resolve memory per call and stay shared.
-			inst.bridgeModules[name] = true
-			inst.pre.linker.addBridgeRefs(map[string]bool{name: true})
+	} else {
+		_, _, err := inst.pre.linker.getOrCreateHostModule(ctx, name, buildHost)
+		if err != nil {
+			return false, err
 		}
 	}
 
