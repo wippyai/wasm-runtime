@@ -1478,11 +1478,17 @@ func (m *WazeroMemory) ReadU64(offset uint32) (uint64, error) {
 }
 
 func (m *WazeroMemory) WriteU8(offset uint32, value uint8) error {
-	return m.Write(offset, []byte{value})
+	if !m.mem.WriteByte(offset, value) {
+		return fmt.Errorf("write out of bounds: offset=%d, length=1", offset)
+	}
+	return nil
 }
 
 func (m *WazeroMemory) WriteU16(offset uint32, value uint16) error {
-	return m.Write(offset, []byte{byte(value), byte(value >> 8)})
+	if !m.mem.WriteUint16Le(offset, value) {
+		return fmt.Errorf("write out of bounds: offset=%d, length=2", offset)
+	}
+	return nil
 }
 
 func (m *WazeroMemory) WriteU32(offset uint32, value uint32) error {
