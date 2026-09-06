@@ -13,9 +13,25 @@ func (p *Parser) parseFunc(funcIdx *uint32) error {
 	var exports []string
 	localMap := make(map[string]uint32)
 	var localIdx uint32
-
-	ft := ast.FuncType{}
+	var tu typeUse
+	var typeIdx uint32
+	var ft ast.FuncType
+	resolved := false
 	body := ast.FuncBody{}
+
+	resolve := func() error {
+		if resolved {
+			return nil
+		}
+		resolved = true
+		var err error
+		typeIdx, ft, err = p.resolveTypeUse(tu, localMap)
+		if err != nil {
+			return err
+		}
+		localIdx = uint32(len(ft.Params))
+		return nil
+	}
 
 	for {
 		t := p.peek()
@@ -34,6 +50,9 @@ func (p *Parser) parseFunc(funcIdx *uint32) error {
 		}
 
 		if t.Type != token.LParen {
+			if err := resolve(); err != nil {
+				return err
+			}
 			instrs, err := p.parseInstrs(localMap)
 			if err != nil {
 				return err
@@ -84,58 +103,33 @@ func (p *Parser) parseFunc(funcIdx *uint32) error {
 				}
 				switch clause.Value {
 				case "param":
-					for {
-						pt := p.peek()
-						if pt == nil || pt.Type == token.RParen {
-							p.next()
-							break
-						}
-						if pt.Type == token.Ident && strings.HasPrefix(pt.Value, "$") {
-							p.next()
-							continue
-						}
-						vt, err := p.parseValType()
-						if err != nil {
-							return err
-						}
-						ft.Params = append(ft.Params, vt)
-					}
-				case "result":
-					for {
-						pt := p.peek()
-						if pt == nil || pt.Type == token.RParen {
-							p.next()
-							break
-						}
-						vt, err := p.parseValType()
-						if err != nil {
-							return err
-						}
-						ft.Results = append(ft.Results, vt)
-					}
-				case "type":
-					idx, err := p.parseIdx(p.typeMap)
-					if err != nil {
+					if err := p.parseTypeUseParams(&tu); err != nil {
 						return err
 					}
-					if idx < uint32(len(p.mod.Types)) {
-						ft = p.mod.Types[idx]
+				case "result":
+					if err := p.parseTypeUseResults(&tu); err != nil {
+						return err
 					}
-					if _, err := p.expect(token.RParen); err != nil {
+				case "type":
+					if err := p.parseTypeUseType(&tu); err != nil {
 						return err
 					}
 				default:
 					return fmt.Errorf("unexpected clause in import func: %s", clause.Value)
 				}
 			}
-			typeIdx := p.findOrAddType(ft)
+			typeIdx, ft, err = p.resolveTypeUse(tu, nil)
+			if err != nil {
+				return err
+			}
+			ftCopy := ft
 			imp := ast.Import{
 				Module: modName.Value,
 				Name:   importName.Value,
 				Desc: ast.ImportDesc{
 					Kind:    ast.KindFunc,
 					TypeIdx: typeIdx,
-					Type:    &ft,
+					Type:    &ftCopy,
 				},
 			}
 			if name != "" {
@@ -156,60 +150,33 @@ func (p *Parser) parseFunc(funcIdx *uint32) error {
 			}
 
 		case "type":
-			idx, err := p.parseIdx(p.typeMap)
-			if err != nil {
-				return err
+			if resolved {
+				return fmt.Errorf("type use after locals")
 			}
-			if idx < uint32(len(p.mod.Types)) {
-				ft = p.mod.Types[idx]
-				localIdx = uint32(len(ft.Params))
-			}
-			if _, err := p.expect(token.RParen); err != nil {
+			if err := p.parseTypeUseType(&tu); err != nil {
 				return err
 			}
 
 		case "param":
-			for {
-				t := p.peek()
-				if t == nil || t.Type == token.RParen {
-					p.next()
-					break
-				}
-				if t.Type == token.Ident && strings.HasPrefix(t.Value, "$") {
-					pname := t.Value
-					p.next()
-					vt, err := p.parseValType()
-					if err != nil {
-						return err
-					}
-					localMap[pname] = localIdx
-					localIdx++
-					ft.Params = append(ft.Params, vt)
-					continue
-				}
-				vt, err := p.parseValType()
-				if err != nil {
-					return err
-				}
-				localIdx++
-				ft.Params = append(ft.Params, vt)
+			if resolved {
+				return fmt.Errorf("param after locals")
+			}
+			if err := p.parseTypeUseParams(&tu); err != nil {
+				return err
 			}
 
 		case "result":
-			for {
-				t := p.peek()
-				if t == nil || t.Type == token.RParen {
-					p.next()
-					break
-				}
-				vt, err := p.parseValType()
-				if err != nil {
-					return err
-				}
-				ft.Results = append(ft.Results, vt)
+			if resolved {
+				return fmt.Errorf("result after locals")
+			}
+			if err := p.parseTypeUseResults(&tu); err != nil {
+				return err
 			}
 
 		case "local":
+			if err := resolve(); err != nil {
+				return err
+			}
 			for {
 				t := p.peek()
 				if t == nil || t.Type == token.RParen {
@@ -222,6 +189,9 @@ func (p *Parser) parseFunc(funcIdx *uint32) error {
 					vt, err := p.parseValType()
 					if err != nil {
 						return err
+					}
+					if _, exists := localMap[lname]; exists {
+						return fmt.Errorf("duplicate local identifier: %s", lname)
 					}
 					localMap[lname] = localIdx
 					localIdx++
@@ -237,6 +207,9 @@ func (p *Parser) parseFunc(funcIdx *uint32) error {
 			}
 
 		default:
+			if err := resolve(); err != nil {
+				return err
+			}
 			p.pos--
 			instrs, err := p.parseInstrs(localMap)
 			if err != nil {
@@ -249,13 +222,15 @@ func (p *Parser) parseFunc(funcIdx *uint32) error {
 		}
 	}
 
+	if err := resolve(); err != nil {
+		return err
+	}
+
 	body.Code = append(body.Code, ast.Instr{Opcode: ast.OpEnd})
 
 	if name != "" {
 		p.funcMap[name] = *funcIdx
 	}
-
-	typeIdx := p.findOrAddType(ft)
 
 	p.mod.Funcs = append(p.mod.Funcs, ast.FuncEntry{TypeIdx: typeIdx})
 	p.mod.Code = append(p.mod.Code, body)
