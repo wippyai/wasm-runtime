@@ -110,11 +110,6 @@ func (p *Parser) parseBrTableLabels() ([]uint32, error) {
 }
 
 func (p *Parser) parseCallIndirectArgs() (tableIdx, typeIdx uint32, err error) {
-	var inlineParams []ast.ValType
-	var inlineResults []ast.ValType
-	hasType := false
-
-	// Try to parse table index
 	if t := p.peek(); t != nil && (t.Type == token.Number || (t.Type == token.Ident && strings.HasPrefix(t.Value, "$"))) {
 		saved := p.pos
 		idx, parseErr := p.parseIdx(p.tableMap)
@@ -130,81 +125,13 @@ func (p *Parser) parseCallIndirectArgs() (tableIdx, typeIdx uint32, err error) {
 		}
 	}
 
-	// Parse type, param, result
-parseLoop:
-	for {
-		tok := p.peek()
-		if tok == nil || tok.Type != token.LParen {
-			break
-		}
-		saved := p.pos
-		p.next()
-		identTok := p.peek()
-		if identTok == nil || identTok.Type != token.Ident {
-			p.pos = saved
-			break
-		}
-		p.next()
-
-		switch identTok.Value {
-		case "type":
-			idx, parseErr := p.parseIdx(p.typeMap)
-			if parseErr != nil {
-				return 0, 0, parseErr
-			}
-			typeIdx = idx
-			hasType = true
-			if _, parseErr := p.expect(token.RParen); parseErr != nil {
-				return 0, 0, parseErr
-			}
-		case "param":
-			for {
-				pt := p.peek()
-				if pt == nil || pt.Type == token.RParen {
-					break
-				}
-				vt, parseErr := p.parseValType()
-				if parseErr != nil {
-					return 0, 0, parseErr
-				}
-				inlineParams = append(inlineParams, vt)
-			}
-			if _, parseErr := p.expect(token.RParen); parseErr != nil {
-				return 0, 0, parseErr
-			}
-		case "result":
-			for {
-				rt := p.peek()
-				if rt == nil || rt.Type == token.RParen {
-					break
-				}
-				vt, parseErr := p.parseValType()
-				if parseErr != nil {
-					return 0, 0, parseErr
-				}
-				inlineResults = append(inlineResults, vt)
-			}
-			if _, parseErr := p.expect(token.RParen); parseErr != nil {
-				return 0, 0, parseErr
-			}
-		default:
-			p.pos = saved
-			break parseLoop
-		}
+	tu, parseErr := p.parseTypeUseClauses()
+	if parseErr != nil {
+		return 0, 0, parseErr
 	}
-	if !hasType && (len(inlineParams) > 0 || len(inlineResults) > 0) {
-		ft := ast.FuncType{Params: inlineParams, Results: inlineResults}
-		for i, t := range p.mod.Types {
-			if t.Equal(ft) {
-				typeIdx = uint32(i)
-				hasType = true
-				break
-			}
-		}
-		if !hasType {
-			typeIdx = uint32(len(p.mod.Types))
-			p.mod.Types = append(p.mod.Types, ft)
-		}
+	typeIdx, _, parseErr = p.resolveTypeUse(tu, nil)
+	if parseErr != nil {
+		return 0, 0, parseErr
 	}
 	return tableIdx, typeIdx, nil
 }

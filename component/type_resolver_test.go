@@ -800,7 +800,7 @@ func TestTypeResolver_ResolveInternalType_NestedRef(t *testing.T) {
 	}
 }
 
-func TestTypeResolver_ResolveInternalType_FallbackToGlobal(t *testing.T) {
+func TestTypeResolver_ResolveInternalType_InstanceIndexOutOfRange(t *testing.T) {
 	globalTypes := []Type{
 		PrimValType{Type: PrimS64},
 	}
@@ -808,14 +808,9 @@ func TestTypeResolver_ResolveInternalType_FallbackToGlobal(t *testing.T) {
 
 	internalTypes := map[uint32]Type{}
 
-	// Index 0 not in internal types, falls back to global
-	result, err := r.resolveInternalType(TypeIndexRef{Index: 0}, internalTypes)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if _, ok := result.(wit.S64); !ok {
-		t.Errorf("expected wit.S64 from global, got %T", result)
+	_, err := r.resolveInternalType(TypeIndexRef{Index: 0}, internalTypes)
+	if err == nil {
+		t.Fatal("expected error for instance type index outside instance type space")
 	}
 }
 
@@ -835,8 +830,10 @@ func TestTypeResolver_ResolveTypeAlias(t *testing.T) {
 					Export: exportDecl{
 						Name: "my-type",
 						externDesc: externDesc{
-							Kind:      0x03, // Type export
-							TypeIndex: 0,    // Points to the type at index 0
+							Kind:      ExternType,
+							TypeIndex: 0,
+							BoundKind: 0x00,
+							HasBound:  true,
 						},
 					},
 				},
@@ -940,8 +937,10 @@ func TestTypeResolver_ResolveTypeAlias_InternalTypeNotFound(t *testing.T) {
 					Export: exportDecl{
 						Name: "missing-type",
 						externDesc: externDesc{
-							Kind:      0x03,
-							TypeIndex: 99, // Doesn't exist
+							Kind:      ExternType,
+							TypeIndex: 99,
+							BoundKind: 0x00,
+							HasBound:  true,
 						},
 					},
 				},

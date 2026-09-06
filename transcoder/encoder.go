@@ -1278,6 +1278,27 @@ func (e *Encoder) StoreToMemory(witType wit.Type, value any, addr uint32, mem Me
 	return e.storeValue(witType, value, addr, mem, alloc, allocList, nil)
 }
 
+// StoreCompiledToMemory writes a value at ptr using its compiled type ct to guest
+// linear memory at addr using Canonical ABI memory layout.
+// Both ct and ptr must be non-nil. The caller must ensure that the memory layout
+// at ptr matches the Go type that ct was compiled against.
+func (e *Encoder) StoreCompiledToMemory(addr uint32, ct *CompiledType, ptr unsafe.Pointer, mem Memory, alloc Allocator, allocList *AllocationList) error {
+	if ct == nil {
+		return errors.New(errors.PhaseEncode, errors.KindNilPointer).
+			Detail("compiled type cannot be nil").
+			Build()
+	}
+	if ptr == nil {
+		return errors.New(errors.PhaseEncode, errors.KindNilPointer).
+			Detail("data pointer cannot be nil").
+			Build()
+	}
+	if _, err := mem.Read(addr, ct.WitSize); err != nil {
+		return err
+	}
+	return e.encodeFieldToMemory(addr, ct, ptr, mem, alloc, allocList, nil)
+}
+
 func (e *Encoder) storeValue(witType wit.Type, value any, addr uint32, mem Memory, alloc Allocator, allocList *AllocationList, path []string) error {
 	switch t := witType.(type) {
 	case wit.Bool:

@@ -52,11 +52,17 @@ type Asyncify struct {
 		startRewind api.Function
 		stopRewind  api.Function
 	}
-	memory    api.Memory
-	mu        sync.Mutex
-	state     int32
-	dataAddr  uint32
-	stackSize uint32
+	memory         api.Memory
+	module         api.Module
+	stateGlobal    api.MutableGlobal
+	dataGlobal     api.MutableGlobal
+	hostArgs       []uint64
+	inlineHostArgs [16]uint64
+	mu             sync.Mutex
+	state          int32
+	dataAddr       uint32
+	stackSize      uint32
+	trusted        bool
 }
 
 const AsyncifyDataAddr uint32 = 16
@@ -74,6 +80,9 @@ func NewAsyncify() *Asyncify {
 		stackSize: AsyncifyDefaultStackSize,
 	}
 }
+
+// DirectGlobals reports whether trusted generated controls can use mutable globals.
+func (a *Asyncify) DirectGlobals() bool { return a.stateGlobal != nil && a.dataGlobal != nil }
 
 func (a *Asyncify) SetStackSize(size uint32) {
 	a.stackSize = size
@@ -101,6 +110,19 @@ func (a *Asyncify) Init(mod api.Module) error {
 
 	if a.exports.getState == nil {
 		return fmt.Errorf("asyncify: module missing asyncify_get_state export (run wasm-opt --asyncify)")
+	}
+
+	a.module = mod
+	a.stateGlobal, a.dataGlobal = nil, nil
+	// Provenance is supplied only by the engine after its embedded transform.
+	// Export names alone never enable this path. Keep other pointer widths on
+	// the original function path, whose guest code defines their semantics.
+	if a.trusted {
+		state, stateOK := mod.ExportedGlobal("asyncify_state").(api.MutableGlobal)
+		data, dataOK := mod.ExportedGlobal("asyncify_data").(api.MutableGlobal)
+		if stateOK && dataOK && state.Type() == api.ValueTypeI32 && data.Type() == api.ValueTypeI32 {
+			a.stateGlobal, a.dataGlobal = state, data
+		}
 	}
 
 	stackPtr := a.dataAddr + 8
@@ -149,7 +171,40 @@ func (a *Asyncify) IsRewinding(_ context.Context) bool {
 	return atomic.LoadInt32(&a.state) == 2
 }
 
+// directControl handles only successful transitions of our generated wasm32
+// controls. Exceptional cases use the original functions below, preserving their
+// trap types, guest-global side effects, and module cancellation behavior.
+func (a *Asyncify) directControl(ctx context.Context, expected, next int32, start bool) bool {
+	if !a.DirectGlobals() || a.module == nil || ctx.Err() != nil || a.module.IsClosed() {
+		return false
+	}
+	if a.stateGlobal.Get() != uint64(expected) {
+		return false
+	}
+	addr := a.dataGlobal.Get()
+	if start {
+		addr = uint64(a.dataAddr)
+	}
+	if addr > uint64(^uint32(0)-4) {
+		return false
+	}
+	ptr, ptrOK := a.memory.ReadUint32Le(uint32(addr))
+	end, endOK := a.memory.ReadUint32Le(uint32(addr + 4))
+	if !ptrOK || !endOK || ptr > end {
+		return false
+	}
+	a.stateGlobal.Set(uint64(next))
+	if start {
+		a.dataGlobal.Set(addr)
+	}
+	atomic.StoreInt32(&a.state, next)
+	return true
+}
+
 func (a *Asyncify) StartUnwind(ctx context.Context) error {
+	if a.directControl(ctx, 0, 1, true) {
+		return nil
+	}
 	if a.exports.startUnwind != nil {
 		_, err := a.exports.startUnwind.Call(ctx, uint64(a.dataAddr))
 		if err == nil {
@@ -162,6 +217,9 @@ func (a *Asyncify) StartUnwind(ctx context.Context) error {
 }
 
 func (a *Asyncify) StopUnwind(ctx context.Context) error {
+	if a.directControl(ctx, 1, 0, false) {
+		return nil
+	}
 	if a.exports.stopUnwind != nil {
 		_, err := a.exports.stopUnwind.Call(ctx)
 		if err == nil {
@@ -174,6 +232,9 @@ func (a *Asyncify) StopUnwind(ctx context.Context) error {
 }
 
 func (a *Asyncify) StartRewind(ctx context.Context) error {
+	if a.directControl(ctx, 0, 2, true) {
+		return nil
+	}
 	if a.exports.startRewind != nil {
 		_, err := a.exports.startRewind.Call(ctx, uint64(a.dataAddr))
 		if err == nil {
@@ -186,6 +247,9 @@ func (a *Asyncify) StartRewind(ctx context.Context) error {
 }
 
 func (a *Asyncify) StopRewind(ctx context.Context) error {
+	if a.directControl(ctx, 2, 0, false) {
+		return nil
+	}
 	if a.exports.stopRewind != nil {
 		_, err := a.exports.stopRewind.Call(ctx)
 		if err == nil {
@@ -199,6 +263,7 @@ func (a *Asyncify) StopRewind(ctx context.Context) error {
 
 // ResetStack resets the stack pointer. Call before each new async operation.
 func (a *Asyncify) ResetStack() {
+	a.ClearHostArgs()
 	if a.memory != nil {
 		stackPtr := a.dataAddr + 8
 		if !a.memory.WriteUint32Le(a.dataAddr, stackPtr) {
@@ -207,6 +272,49 @@ func (a *Asyncify) ResetStack() {
 				zap.Uint32("stackPtr", stackPtr))
 		}
 	}
+}
+
+// ParkHostArgs copies the Canonical ABI host-call stack for the in-flight
+// unwind so rewind can restore retptr and arguments.
+func (a *Asyncify) ParkHostArgs(stack []uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(stack) <= len(a.inlineHostArgs) {
+		a.hostArgs = a.inlineHostArgs[:len(stack)]
+	} else {
+		a.hostArgs = make([]uint64, len(stack))
+	}
+	copy(a.hostArgs, stack)
+}
+
+// TakeHostArgs returns an owned copy of the parked host-call stack and clears it.
+// Inline storage must not escape: a subsequent ParkHostArgs can reuse it.
+func (a *Asyncify) TakeHostArgs() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	saved := a.hostArgs
+	if saved != nil && len(saved) <= len(a.inlineHostArgs) {
+		saved = make([]uint64, len(a.hostArgs))
+		copy(saved, a.hostArgs)
+	}
+	a.hostArgs = nil
+	return saved
+}
+
+// restoreParkedArgs copies into the caller stack before reusing inline storage.
+func (a *Asyncify) restoreParkedArgs(stack []uint64) []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	stack = restoreHostArgs(a.hostArgs, stack)
+	a.hostArgs = nil
+	return stack
+}
+
+// ClearHostArgs drops any parked host-call stack.
+func (a *Asyncify) ClearHostArgs() {
+	a.mu.Lock()
+	a.hostArgs = nil
+	a.mu.Unlock()
 }
 
 type CommandID = uint16
@@ -285,6 +393,7 @@ func (s *Scheduler) Execute(ctx context.Context, fn api.Function, args ...uint64
 // Step advances execution. Pass nil for first call, or YieldResult to resume.
 func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, error) {
 	if err := ctx.Err(); err != nil {
+		s.asyncify.ClearHostArgs()
 		return StepResult{Error: err, ErrorKind: ClassifyError(err)}, err
 	}
 	if !s.initialized {
@@ -296,6 +405,7 @@ func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, erro
 		s.result = yr.Value
 		s.err = yr.Error
 		if s.err != nil {
+			s.asyncify.ClearHostArgs()
 			return StepResult{Error: s.err, ErrorKind: ClassifyError(s.err)}, s.err
 		}
 		if err := s.asyncify.StartRewind(ctx); err != nil {
@@ -305,6 +415,10 @@ func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, erro
 	}
 
 	results, callErr := s.fn.Call(ctx, s.args...)
+	if callErr != nil {
+		s.asyncify.ClearHostArgs()
+		return StepResult{Error: callErr, ErrorKind: ClassifyError(callErr)}, callErr
+	}
 
 	if s.asyncify.IsUnwinding(ctx) {
 		if err := s.asyncify.StopUnwind(ctx); err != nil {
@@ -318,10 +432,6 @@ func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, erro
 		op := s.pendingOp
 		s.pendingOp = nil
 		return StepResult{Status: StepContinue, PendingOp: op}, nil
-	}
-
-	if callErr != nil {
-		return StepResult{Error: callErr, ErrorKind: ClassifyError(callErr)}, callErr
 	}
 
 	if !s.asyncify.IsNormal(ctx) {
@@ -340,6 +450,9 @@ func (s *Scheduler) Reset() {
 	s.result = 0
 	s.err = nil
 	s.initialized = false
+	if s.asyncify != nil {
+		s.asyncify.ClearHostArgs()
+	}
 }
 
 // Run executes with internal event loop. Convenience wrapper over Execute/Step.

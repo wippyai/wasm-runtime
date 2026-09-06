@@ -489,49 +489,23 @@ func (p *Parser) parseImport(funcIdx, globalIdx, tableIdx, memIdx *uint32) error
 			p.next()
 		}
 
-		var ft ast.FuncType
-		if tok := p.peek(); tok != nil && tok.Type == token.LParen {
-			saved := p.pos
-			p.next()
-			t2, err := p.expect(token.Ident)
-			if err != nil {
-				return err
-			}
-			if t2.Value == "type" {
-				typeIdx, err := p.parseIdx(p.typeMap)
-				if err != nil {
-					return err
-				}
-				if _, err := p.expect(token.RParen); err != nil {
-					return err
-				}
-				if int(typeIdx) >= len(p.mod.Types) {
-					return fmt.Errorf("type index %d out of range", typeIdx)
-				}
-				ft = p.mod.Types[typeIdx]
-				imp.Desc.TypeIdx = typeIdx
-			} else {
-				p.pos = saved
-				if err := p.parseFuncSig(&ft); err != nil {
-					return err
-				}
-				p.mod.Types = append(p.mod.Types, ft)
-				imp.Desc.TypeIdx = uint32(len(p.mod.Types) - 1)
-			}
-		} else {
-			if err := p.parseFuncSig(&ft); err != nil {
-				return err
-			}
-			p.mod.Types = append(p.mod.Types, ft)
-			imp.Desc.TypeIdx = uint32(len(p.mod.Types) - 1)
+		tu, err := p.parseTypeUseClauses()
+		if err != nil {
+			return err
+		}
+		typeIdx, ft, err := p.resolveTypeUse(tu, nil)
+		if err != nil {
+			return err
 		}
 
 		if _, err := p.expect(token.RParen); err != nil {
 			return err
 		}
 
+		ftCopy := ft
 		imp.Desc.Kind = ast.KindFunc
-		imp.Desc.Type = &ft
+		imp.Desc.TypeIdx = typeIdx
+		imp.Desc.Type = &ftCopy
 		if fname != "" {
 			p.funcMap[fname] = *funcIdx
 		}

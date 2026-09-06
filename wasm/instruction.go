@@ -11,6 +11,9 @@ import (
 type Instruction struct {
 	Imm    interface{}
 	Opcode byte
+	// Synthetic marks transformer routing that must also execute during rewind.
+	// It is internal metadata and is never encoded into the binary.
+	Synthetic bool
 }
 
 // BlockImm holds the block type for block, loop, if, and try instructions.

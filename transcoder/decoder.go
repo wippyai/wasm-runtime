@@ -411,6 +411,10 @@ func (d *Decoder) decodeOptionFromMemory(addr uint32, ct *CompiledType, ptr unsa
 		return nil
 	}
 
+	if disc != 1 {
+		return errors.InvalidDiscriminant(errors.PhaseDecode, path, uint32(disc), 1)
+	}
+
 	// Some: allocate and decode
 	payloadOffset := alignTo(1, ct.ElemType.WitAlign)
 

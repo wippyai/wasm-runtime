@@ -27,11 +27,21 @@ type InstancePre struct {
 	compFuncSources     map[uint32]compFuncSource
 	canonLifts          map[uint32]*canonLiftInfo
 	typeResolver        *component.TypeResolver
+	transformedModules  []bool
 	bindings            []resolvedBinding
 	topoOrder           []int
 	compiled            []wazero.CompiledModule
 	numExports          int
 	numInstances        int
+}
+
+// isCoreModuleTransformed reports whether the core module at index i was transformed
+// by the embedded asyncify transformer in this load.
+func (pre *InstancePre) isCoreModuleTransformed(i int) bool {
+	if pre == nil || i < 0 || i >= len(pre.transformedModules) {
+		return false
+	}
+	return pre.transformedModules[i]
 }
 
 // canonLiftInfo holds pre-parsed canonical lift information
@@ -63,8 +73,9 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 	}
 
 	pre := &InstancePre{
-		linker:    l,
-		component: c,
+		linker:             l,
+		component:          c,
+		transformedModules: make([]bool, len(c.Raw.CoreModules)),
 	}
 
 	// Compile all core modules (CoreModules is [][]byte)
@@ -75,7 +86,8 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 		// Apply asyncify transform if enabled and module isn't already asyncified
 		if l.options.AsyncifyTransform && !asyncify.IsAsyncified(modBytes) {
 			transformed, err := asyncify.Transform(modBytes, asyncify.Config{
-				AsyncImports: l.options.AsyncifyImports,
+				AsyncImports:  l.options.AsyncifyImports,
+				ExportGlobals: true,
 			})
 			if err != nil {
 				for j, cm := range pre.compiled {
@@ -88,6 +100,7 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 				return nil, instError("compile", i, "", "asyncify transform failed", err)
 			}
 			modBytes = transformed
+			pre.transformedModules[i] = true
 		}
 
 		compiled, err := l.runtime.CompileModule(ctx, modBytes)

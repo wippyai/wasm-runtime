@@ -252,101 +252,9 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 
 		case "call_indirect", "return_call_indirect":
 			isReturn := name == "return_call_indirect"
-			tableIdx := uint32(0)
-			typeIdx := uint32(0)
-			var inlineParams []ast.ValType
-			var inlineResults []ast.ValType
-			hasType := false
-
-			if t := p.peek(); t != nil && (t.Type == token.Number || (t.Type == token.Ident && strings.HasPrefix(t.Value, "$"))) {
-				saved := p.pos
-				idx, err := p.parseIdx(p.tableMap)
-				if err == nil {
-					t2 := p.peek()
-					if t2 != nil && t2.Type == token.LParen {
-						tableIdx = idx
-					} else {
-						p.pos = saved
-					}
-				} else {
-					p.pos = saved
-				}
-			}
-
-		parseTypeLoop:
-			for {
-				tok := p.peek()
-				if tok == nil || tok.Type != token.LParen {
-					break
-				}
-				saved := p.pos
-				p.next()
-				identTok := p.peek()
-				if identTok == nil || identTok.Type != token.Ident {
-					p.pos = saved
-					break
-				}
-				p.next()
-
-				switch identTok.Value {
-				case "type":
-					idx, err := p.parseIdx(p.typeMap)
-					if err != nil {
-						return nil, err
-					}
-					typeIdx = idx
-					hasType = true
-					if _, err := p.expect(token.RParen); err != nil {
-						return nil, err
-					}
-				case "param":
-					for {
-						pt := p.peek()
-						if pt == nil || pt.Type == token.RParen {
-							break
-						}
-						vt, err := p.parseValType()
-						if err != nil {
-							return nil, err
-						}
-						inlineParams = append(inlineParams, vt)
-					}
-					if _, err := p.expect(token.RParen); err != nil {
-						return nil, err
-					}
-				case "result":
-					for {
-						rt := p.peek()
-						if rt == nil || rt.Type == token.RParen {
-							break
-						}
-						vt, err := p.parseValType()
-						if err != nil {
-							return nil, err
-						}
-						inlineResults = append(inlineResults, vt)
-					}
-					if _, err := p.expect(token.RParen); err != nil {
-						return nil, err
-					}
-				default:
-					p.pos = saved
-					break parseTypeLoop
-				}
-			}
-			if !hasType && (len(inlineParams) > 0 || len(inlineResults) > 0) {
-				ft := ast.FuncType{Params: inlineParams, Results: inlineResults}
-				for i, t := range p.mod.Types {
-					if t.Equal(ft) {
-						typeIdx = uint32(i)
-						hasType = true
-						break
-					}
-				}
-				if !hasType {
-					typeIdx = uint32(len(p.mod.Types))
-					p.mod.Types = append(p.mod.Types, ft)
-				}
+			tableIdx, typeIdx, err := p.parseCallIndirectArgs()
+			if err != nil {
+				return nil, err
 			}
 
 			for {
@@ -762,84 +670,41 @@ func (p *Parser) parseOperands(localMap map[string]uint32, count int) ([]ast.Ins
 func (p *Parser) parseBlockType() (ast.BlockType, error) {
 	bt := ast.BlockType{Simple: ast.BlockTypeEmpty, TypeIdx: -1}
 
-parseBlockLoop:
-	for {
-		t := p.peek()
-		if t == nil || t.Type != token.LParen {
-			break
-		}
-
-		saved := p.pos
-		p.next()
-		t, err := p.expect(token.Ident)
-		if err != nil {
-			return bt, err
-		}
-
-		switch t.Value {
-		case "type":
-			idx, err := p.parseIdx(p.typeMap)
-			if err != nil {
-				return bt, err
-			}
-			if _, err := p.expect(token.RParen); err != nil {
-				return bt, err
-			}
-			bt.TypeIdx = int32(idx)
-			if int(idx) < len(p.mod.Types) {
-				ft := p.mod.Types[idx]
-				bt.Params = ft.Params
-				bt.Results = ft.Results
-			}
-			return bt, nil
-		case "param":
-			for {
-				if pt := p.peek(); pt == nil || pt.Type == token.RParen {
-					break
-				}
-				vt, err := p.parseValType()
-				if err != nil {
-					return bt, err
-				}
-				bt.Params = append(bt.Params, vt)
-			}
-			if _, err := p.expect(token.RParen); err != nil {
-				return bt, err
-			}
-		case "result":
-			for {
-				if rt := p.peek(); rt == nil || rt.Type == token.RParen {
-					break
-				}
-				vt, err := p.parseValType()
-				if err != nil {
-					return bt, err
-				}
-				bt.Results = append(bt.Results, vt)
-			}
-			if _, err := p.expect(token.RParen); err != nil {
-				return bt, err
-			}
-		default:
-			p.pos = saved
-			break parseBlockLoop
+	tu, err := p.parseTypeUseClauses()
+	if err != nil {
+		return bt, err
+	}
+	// Block parameters are operand-stack values, not named function locals.
+	for _, name := range tu.paramNames {
+		if name != "" {
+			return bt, fmt.Errorf("block parameters cannot have identifiers")
 		}
 	}
 
+	if tu.typeIdx != nil {
+		idx, ft, err := p.resolveTypeUse(tu, nil)
+		if err != nil {
+			return bt, err
+		}
+		bt.TypeIdx = int32(idx)
+		bt.Params = ft.Params
+		bt.Results = ft.Results
+		return bt, nil
+	}
+
+	if !tu.hasInline {
+		return bt, nil
+	}
+
+	bt.Params = tu.params
+	bt.Results = tu.results
 	if len(bt.Params) == 0 && len(bt.Results) == 0 {
 		bt.Simple = ast.BlockTypeEmpty
 	} else if len(bt.Params) == 0 && len(bt.Results) == 1 {
 		bt.Simple = byte(bt.Results[0])
 	} else {
-		ft := ast.FuncType{Params: bt.Params, Results: bt.Results}
-		for i, t := range p.mod.Types {
-			if t.Equal(ft) {
-				bt.TypeIdx = int32(i)
-				return bt, nil
-			}
-		}
-		bt.TypeIdx = int32(len(p.mod.Types))
-		p.mod.Types = append(p.mod.Types, ft)
+		idx := p.findOrAddType(ast.FuncType{Params: bt.Params, Results: bt.Results})
+		bt.TypeIdx = int32(idx)
 	}
 
 	return bt, nil

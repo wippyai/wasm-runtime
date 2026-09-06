@@ -1,6 +1,7 @@
 package component
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -99,9 +100,33 @@ type Import struct {
 }
 
 type Export struct {
-	Name      string
-	Sort      byte
-	SortIndex uint32
+	ExternType *ExportExternType
+	Name       string
+	Attributes []ExportAttribute
+	SortIndex  uint32
+	Sort       byte
+	CoreSort   byte
+	NameKind   byte
+}
+
+// Export attribute kinds (Binary.md attribute production)
+const (
+	ExportAttrImplements    byte = 0x00
+	ExportAttrVersionSuffix byte = 0x01
+	ExportAttrExternalID    byte = 0x02
+)
+
+type ExportAttribute struct {
+	Value string
+	Kind  byte
+}
+
+type ExportExternType struct {
+	ValueType ValType
+	TypeIndex uint32
+	Kind      byte
+	BoundKind byte
+	HasBound  bool
 }
 
 type CoreInstance struct {
@@ -412,47 +437,48 @@ func DecodeWithOptions(data []byte, opts DecodeOptions) (*Component, error) {
 			}
 		case 8:
 			startIdx := len(comp.Canons)
-			parsed, err := ParseCanonSection(sectionData)
+			parsed, err := ParseCanonSectionEntries(sectionData)
 			if err != nil {
 				return nil, fmt.Errorf("parse canon section %d: %w", sectionCount, err)
 			}
-			comp.Canons = append(comp.Canons, Canon{
-				Parsed:  parsed,
-				RawData: sectionData,
-			})
-			// Track section order
-			comp.SectionOrder = append(comp.SectionOrder, SectionMarker{
-				Kind:       SectionCanon,
-				StartIndex: startIdx,
-				Count:      1,
-			})
-			// Canon operations create core funcs
-			if parsed != nil {
-				switch parsed.Kind {
+			for _, def := range parsed {
+				comp.Canons = append(comp.Canons, Canon{
+					Parsed:  def,
+					RawData: sectionData,
+				})
+				if def == nil {
+					continue
+				}
+				switch def.Kind {
 				case CanonLower:
 					comp.CoreFuncIndexSpace = append(comp.CoreFuncIndexSpace, CoreFuncEntry{
 						Kind:       CoreFuncCanonLower,
-						FuncIndex:  parsed.FuncIndex,
-						MemoryIdx:  int32(parsed.GetMemoryIndex()),
-						ReallocIdx: parsed.GetReallocIndex(),
+						FuncIndex:  def.FuncIndex,
+						MemoryIdx:  int32(def.GetMemoryIndex()),
+						ReallocIdx: def.GetReallocIndex(),
 					})
 				case CanonResourceDrop:
 					comp.CoreFuncIndexSpace = append(comp.CoreFuncIndexSpace, CoreFuncEntry{
 						Kind:     CoreFuncResourceDrop,
-						Resource: parsed.ResourceType,
+						Resource: def.ResourceType,
 					})
 				case CanonResourceNew:
 					comp.CoreFuncIndexSpace = append(comp.CoreFuncIndexSpace, CoreFuncEntry{
 						Kind:     CoreFuncResourceNew,
-						Resource: parsed.ResourceType,
+						Resource: def.ResourceType,
 					})
 				case CanonResourceRep:
 					comp.CoreFuncIndexSpace = append(comp.CoreFuncIndexSpace, CoreFuncEntry{
 						Kind:     CoreFuncResourceRep,
-						Resource: parsed.ResourceType,
+						Resource: def.ResourceType,
 					})
 				}
 			}
+			comp.SectionOrder = append(comp.SectionOrder, SectionMarker{
+				Kind:       SectionCanon,
+				StartIndex: startIdx,
+				Count:      len(parsed),
+			})
 		case 9:
 			start, err := parseStartSection(sectionData)
 			if err != nil {
@@ -485,6 +511,19 @@ func DecodeWithOptions(data []byte, opts DecodeOptions) (*Component, error) {
 			exports, err := decodeExports(sectionData)
 			if err != nil {
 				return nil, fmt.Errorf("decode exports: %w", err)
+			}
+			if opts.ParseTypes {
+				for _, exp := range exports {
+					if exp.Sort != SortType {
+						continue
+					}
+					// An export introduces an alias in its sort's index space.
+					// Preserve the definition so later imports/lifts can use it.
+					if uint64(exp.SortIndex) >= uint64(len(comp.TypeIndexSpace)) {
+						return nil, fmt.Errorf("export %q: type index %d out of range", exp.Name, exp.SortIndex)
+					}
+					comp.TypeIndexSpace = append(comp.TypeIndexSpace, comp.TypeIndexSpace[exp.SortIndex])
+				}
 			}
 			comp.Exports = append(comp.Exports, exports...)
 			comp.SectionOrder = append(comp.SectionOrder, SectionMarker{
@@ -751,6 +790,8 @@ func decodeImports(data []byte) ([]Import, error) {
 	return imports, nil
 }
 
+// decodeExports parses section_11(vec(<export>)).
+// Binary.md: export ::= na:<nameattributes> si:<sortidx> et?:<externtype>?
 func decodeExports(data []byte) ([]Export, error) {
 	r := getReader(data)
 	defer putReader(r)
@@ -760,61 +801,250 @@ func decodeExports(data []byte) ([]Export, error) {
 		return nil, err
 	}
 
-	// Sanity check on count
 	if count > 100000 {
 		return nil, fmt.Errorf("export count %d exceeds maximum", count)
+	}
+	if uint64(count) > uint64(r.Len()) {
+		return nil, fmt.Errorf("export count %d exceeds remaining section bytes %d", count, r.Len())
 	}
 
 	exports := make([]Export, 0, count)
 
 	for i := uint32(0); i < count; i++ {
-		nameKind, err := readByte(r)
+		exp, err := decodeExport(r)
 		if err != nil {
-			return nil, fmt.Errorf("export %d: read name kind: %w", i, err)
+			return nil, fmt.Errorf("export %d: %w", i, err)
 		}
+		exports = append(exports, exp)
+	}
 
-		nameLen, err := readLEB128(r)
-		if err != nil {
-			return nil, fmt.Errorf("export %d: read name length: %w", i, err)
-		}
-
-		// Sanity check on name length
-		if nameLen > 10000 {
-			return nil, fmt.Errorf("export %d: name length %d exceeds maximum", i, nameLen)
-		}
-
-		nameBytes := make([]byte, nameLen)
-		if _, err := io.ReadFull(r, nameBytes); err != nil {
-			return nil, fmt.Errorf("export %d: read name: %w", i, err)
-		}
-
-		_ = nameKind
-
-		sort, err := readByte(r)
-		if err != nil {
-			return nil, fmt.Errorf("export %d: read sort: %w", i, err)
-		}
-
-		if sort == SortCore {
-			_, err := readByte(r)
-			if err != nil {
-				return nil, fmt.Errorf("export %d: read core sort: %w", i, err)
-			}
-		}
-
-		sortIndex, err := readLEB128(r)
-		if err != nil {
-			return nil, fmt.Errorf("export %d: read sort index: %w", i, err)
-		}
-
-		exports = append(exports, Export{
-			Name:      string(nameBytes),
-			Sort:      sort,
-			SortIndex: sortIndex,
-		})
+	if r.Len() != 0 {
+		return nil, fmt.Errorf("export section has %d trailing bytes", r.Len())
 	}
 
 	return exports, nil
+}
+
+func decodeExport(r *bytes.Reader) (Export, error) {
+	nameKind, name, attrs, err := parseExportNameAttributes(r)
+	if err != nil {
+		return Export{}, err
+	}
+
+	sort, coreSort, sortIndex, err := parseExportSortIdx(r)
+	if err != nil {
+		return Export{}, err
+	}
+
+	externType, err := parseOptionalExportExternType(r)
+	if err != nil {
+		return Export{}, err
+	}
+
+	return Export{
+		Name:       name,
+		Sort:       sort,
+		CoreSort:   coreSort,
+		SortIndex:  sortIndex,
+		NameKind:   nameKind,
+		Attributes: attrs,
+		ExternType: externType,
+	}, nil
+}
+
+func parseExportNameAttributes(r *bytes.Reader) (byte, string, []ExportAttribute, error) {
+	kind, err := readByte(r)
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("read name kind: %w", err)
+	}
+
+	name, err := readExportString(r)
+	if err != nil {
+		return 0, "", nil, err
+	}
+
+	switch kind {
+	case 0x00, 0x01:
+		return kind, name, nil, nil
+	case 0x02:
+		attrs, err := parseExportAttributes(r)
+		if err != nil {
+			return 0, "", nil, err
+		}
+		return kind, name, attrs, nil
+	default:
+		return 0, "", nil, fmt.Errorf("unknown nameattributes kind 0x%02x", kind)
+	}
+}
+
+func parseExportAttributes(r *bytes.Reader) ([]ExportAttribute, error) {
+	count, err := readLEB128(r)
+	if err != nil {
+		return nil, fmt.Errorf("read attribute count: %w", err)
+	}
+	if uint64(count) > uint64(r.Len()) {
+		return nil, fmt.Errorf("attribute count %d exceeds remaining section bytes %d", count, r.Len())
+	}
+
+	attrs := make([]ExportAttribute, 0, count)
+	seen := [3]bool{}
+	for i := uint32(0); i < count; i++ {
+		kind, err := readByte(r)
+		if err != nil {
+			return nil, fmt.Errorf("attribute %d: read kind: %w", i, err)
+		}
+		if kind > ExportAttrExternalID {
+			return nil, fmt.Errorf("attribute %d: unknown kind 0x%02x", i, kind)
+		}
+		if seen[kind] {
+			return nil, fmt.Errorf("attribute %d: duplicate kind 0x%02x", i, kind)
+		}
+		seen[kind] = true
+		value, err := readExportString(r)
+		if err != nil {
+			return nil, fmt.Errorf("attribute %d: %w", i, err)
+		}
+		attrs = append(attrs, ExportAttribute{Kind: kind, Value: value})
+	}
+	return attrs, nil
+}
+
+func parseExportSortIdx(r *bytes.Reader) (byte, byte, uint32, error) {
+	sort, err := readByte(r)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("read sort: %w", err)
+	}
+
+	var coreSort byte
+	switch sort {
+	case SortCore:
+		coreSort, err = readByte(r)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("read core sort: %w", err)
+		}
+		if !validCoreSort(coreSort) {
+			return 0, 0, 0, fmt.Errorf("unknown core sort 0x%02x", coreSort)
+		}
+	case SortFunc, SortValue, SortType, SortComponent, SortInstance:
+	default:
+		return 0, 0, 0, fmt.Errorf("unknown sort 0x%02x", sort)
+	}
+
+	index, err := readLEB128(r)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("read sort index: %w", err)
+	}
+	return sort, coreSort, index, nil
+}
+
+func validCoreSort(sort byte) bool {
+	switch sort {
+	case 0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x11, 0x12:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseOptionalExportExternType(r *bytes.Reader) (*ExportExternType, error) {
+	disc, err := readByte(r)
+	if err != nil {
+		return nil, fmt.Errorf("read externtype option: %w", err)
+	}
+	switch disc {
+	case 0x00:
+		return nil, nil
+	case 0x01:
+		et, err := parseExportExternType(r)
+		if err != nil {
+			return nil, err
+		}
+		return &et, nil
+	default:
+		return nil, fmt.Errorf("unknown externtype option 0x%02x", disc)
+	}
+}
+
+func parseExportExternType(r *bytes.Reader) (ExportExternType, error) {
+	kind, err := readByte(r)
+	if err != nil {
+		return ExportExternType{}, fmt.Errorf("read externtype kind: %w", err)
+	}
+
+	et := ExportExternType{Kind: kind}
+	switch kind {
+	case ExternCoreModule:
+		extra, err := readByte(r)
+		if err != nil {
+			return ExportExternType{}, fmt.Errorf("read core module extra byte: %w", err)
+		}
+		if extra != 0x11 {
+			return ExportExternType{}, fmt.Errorf("expected 0x11 after core module externtype, got 0x%02x", extra)
+		}
+		et.TypeIndex, err = readLEB128(r)
+		if err != nil {
+			return ExportExternType{}, fmt.Errorf("read core module type index: %w", err)
+		}
+	case ExternFunc, ExternComponent, ExternInstance:
+		et.TypeIndex, err = readLEB128(r)
+		if err != nil {
+			return ExportExternType{}, fmt.Errorf("read type index: %w", err)
+		}
+	case ExternValue:
+		et.HasBound = true
+		et.BoundKind, err = readByte(r)
+		if err != nil {
+			return ExportExternType{}, fmt.Errorf("read value bound kind: %w", err)
+		}
+		switch et.BoundKind {
+		case 0x00:
+			et.TypeIndex, err = readLEB128(r)
+			if err != nil {
+				return ExportExternType{}, fmt.Errorf("read value index: %w", err)
+			}
+		case 0x01:
+			et.ValueType, err = parseValType(r)
+			if err != nil {
+				return ExportExternType{}, fmt.Errorf("read value type: %w", err)
+			}
+		default:
+			return ExportExternType{}, fmt.Errorf("unknown value bound kind 0x%02x", et.BoundKind)
+		}
+	case ExternType:
+		et.HasBound = true
+		et.BoundKind, err = readByte(r)
+		if err != nil {
+			return ExportExternType{}, fmt.Errorf("read type bound kind: %w", err)
+		}
+		switch et.BoundKind {
+		case 0x00:
+			et.TypeIndex, err = readLEB128(r)
+			if err != nil {
+				return ExportExternType{}, fmt.Errorf("read type index: %w", err)
+			}
+		case 0x01:
+		default:
+			return ExportExternType{}, fmt.Errorf("unknown type bound kind 0x%02x", et.BoundKind)
+		}
+	default:
+		return ExportExternType{}, fmt.Errorf("unknown externtype kind 0x%02x", kind)
+	}
+	return et, nil
+}
+
+func readExportString(r *bytes.Reader) (string, error) {
+	nameLen, err := readLEB128(r)
+	if err != nil {
+		return "", fmt.Errorf("read name length: %w", err)
+	}
+	if nameLen > 10000 {
+		return "", fmt.Errorf("name length %d exceeds maximum", nameLen)
+	}
+	nameBytes := make([]byte, nameLen)
+	if _, err := io.ReadFull(r, nameBytes); err != nil {
+		return "", fmt.Errorf("read name: %w", err)
+	}
+	return string(nameBytes), nil
 }
 
 func readLEB128(r io.Reader) (uint32, error) {

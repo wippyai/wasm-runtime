@@ -15,8 +15,17 @@ type Runtime struct {
 	hosts  *HostRegistry
 }
 
+// Config defines engine-level limits shared by this runtime's instances.
+type Config = engine.Config
+
 func New(ctx context.Context) (*Runtime, error) {
-	eng, err := engine.NewWazeroEngine(ctx)
+	return NewWithConfig(ctx, nil)
+}
+
+// NewWithConfig creates a runtime with explicit engine limits. A nil config
+// preserves New's defaults. Per-call cancellation requires CloseOnContextDone.
+func NewWithConfig(ctx context.Context, cfg *Config) (*Runtime, error) {
+	eng, err := engine.NewWazeroEngineWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, errors.Load("create engine", err)
 	}

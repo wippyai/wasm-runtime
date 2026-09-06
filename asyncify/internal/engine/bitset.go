@@ -12,6 +12,13 @@ func NewBitSet(maxVal int) *BitSet {
 	return &BitSet{bits: make([]uint64, words)}
 }
 
+// Clone returns a copy of the BitSet.
+func (b *BitSet) Clone() *BitSet {
+	newBits := make([]uint64, len(b.bits))
+	copy(newBits, b.bits)
+	return &BitSet{bits: newBits}
+}
+
 // Set adds val to the set.
 func (b *BitSet) Set(val uint32) {
 	word := val / 64

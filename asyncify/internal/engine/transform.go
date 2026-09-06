@@ -108,10 +108,12 @@ func (ft *FunctionTransformer) Transform(funcIdx uint32, body *wasm.FuncBody, as
 
 	// Linearize control flow for asyncify - transforms result-bearing
 	// blocks and if/else to handle rewind correctly
+	var linearizedLocals []uint32
 	allocLocal := func(vt wasm.ValType) uint32 {
 		idx := uint32(numOriginalLocals)
 		numOriginalLocals++
 		body.Locals = append(body.Locals, wasm.LocalEntry{Count: 1, ValType: vt})
+		linearizedLocals = append(linearizedLocals, idx)
 		return idx
 	}
 
@@ -196,7 +198,7 @@ func (ft *FunctionTransformer) Transform(funcIdx uint32, body *wasm.FuncBody, as
 		localTypes = append(localTypes, vt)
 	}
 
-	code, err := ft.transformLinear(instrs, callSites, funcType, scratchStart, localTypes, body)
+	code, err := ft.transformLinear(instrs, callSites, funcType, scratchStart, localTypes, body, linearizedLocals)
 	if err != nil {
 		return err
 	}
@@ -250,11 +252,30 @@ func (ft *FunctionTransformer) simulateStackForCallSites(
 
 	// Simple stack simulation
 	var stack []stackEntry
+	var ifSimSnapshots [][]stackEntry
+	var ctrlSimStack []byte
 
 	for i, instr := range instrs {
 		// Skip trailing End
 		if i == len(instrs)-1 && instr.Opcode == wasm.OpEnd {
 			continue
+		}
+
+		switch instr.Opcode {
+		case wasm.OpBlock, wasm.OpLoop, wasm.OpIf:
+			ctrlSimStack = append(ctrlSimStack, instr.Opcode)
+		case wasm.OpElse:
+			if len(ifSimSnapshots) > 0 {
+				stack = append([]stackEntry(nil), ifSimSnapshots[len(ifSimSnapshots)-1]...)
+			}
+		case wasm.OpEnd:
+			if len(ctrlSimStack) > 0 {
+				k := ctrlSimStack[len(ctrlSimStack)-1]
+				ctrlSimStack = ctrlSimStack[:len(ctrlSimStack)-1]
+				if k == wasm.OpIf && len(ifSimSnapshots) > 0 {
+					ifSimSnapshots = ifSimSnapshots[:len(ifSimSnapshots)-1]
+				}
+			}
 		}
 
 		// Check if this is an async call site
@@ -300,6 +321,10 @@ func (ft *FunctionTransformer) simulateStackForCallSites(
 
 		// Simulate stack effects for non-async instructions
 		ft.simulateInstrStack(&stack, instr, allocTemp, localTypes)
+
+		if instr.Opcode == wasm.OpIf {
+			ifSimSnapshots = append(ifSimSnapshots, append([]stackEntry(nil), stack...))
+		}
 	}
 
 	return result, allocatedTypes, simNextLocal, nil
@@ -466,6 +491,7 @@ func (ft *FunctionTransformer) transformLinear(
 	scratchStart uint32,
 	localTypes []wasm.ValType,
 	body *wasm.FuncBody,
+	linearizedLocals []uint32,
 ) ([]byte, error) {
 	// Pre-size emitter: transformed code is typically 3-5x larger
 	estimatedSize := len(instrs) * 12
@@ -479,6 +505,9 @@ func (ft *FunctionTransformer) transformLinear(
 
 	// Compute live locals union for prelude
 	liveUnion := computeLiveUnion(callSites)
+	for _, l := range linearizedLocals {
+		liveUnion[l] = true
+	}
 
 	// Pre-allocate result locals for each call site
 	// Map from call site index to its pre-allocated result locals
@@ -569,6 +598,9 @@ func (ft *FunctionTransformer) transformLinear(
 	// to skip re-execution during rewind
 	inNormalGuard := false
 
+	var ifSnapshots [][]handler.StackEntry
+	var ctrlStack []byte
+
 	// Helper to close the normal guard if open
 	closeNormalGuard := func() {
 		if inNormalGuard {
@@ -596,9 +628,21 @@ func (ft *FunctionTransformer) transformLinear(
 		switch instr.Opcode {
 		case wasm.OpBlock, wasm.OpLoop, wasm.OpIf:
 			controlDepth++
+			ctrlStack = append(ctrlStack, instr.Opcode)
+		case wasm.OpElse:
+			if len(ifSnapshots) > 0 {
+				ctx.Stack.Restore(ifSnapshots[len(ifSnapshots)-1])
+			}
 		case wasm.OpEnd:
 			if controlDepth > 0 {
 				controlDepth--
+			}
+			if len(ctrlStack) > 0 {
+				k := ctrlStack[len(ctrlStack)-1]
+				ctrlStack = ctrlStack[:len(ctrlStack)-1]
+				if k == wasm.OpIf && len(ifSnapshots) > 0 {
+					ifSnapshots = ifSnapshots[:len(ifSnapshots)-1]
+				}
 			}
 		}
 
@@ -612,12 +656,31 @@ func (ft *FunctionTransformer) transformLinear(
 			continue
 		}
 
-		// Check if this instruction is control flow (should not be guarded)
-		if isControlFlowInstruction(instr.Opcode) {
-			// Close normal guard before control flow instructions
+		if instr.Synthetic {
+			// Synthetic instruction: routing must execute unconditionally across rewind and normal
 			closeNormalGuard()
-			// Emit control flow instruction directly
 			if err := ft.emitSingleInstruction(ctx, instr); err != nil {
+				return nil, err
+			}
+			if instr.Opcode == wasm.OpIf {
+				ifSnapshots = append(ifSnapshots, ctx.Stack.Snapshot())
+			}
+			continue
+		}
+
+		if isStructuralControlFlow(instr.Opcode) {
+			// Structural control flow: open/close blocks unconditionally
+			closeNormalGuard()
+			if err := ft.emitSingleInstruction(ctx, instr); err != nil {
+				return nil, err
+			}
+			if instr.Opcode == wasm.OpIf {
+				ifSnapshots = append(ifSnapshots, ctx.Stack.Snapshot())
+			}
+		} else if isBranchOrReturn(instr.Opcode) {
+			// Guest branch/return: must only execute during normal execution, not rewinding
+			closeNormalGuard()
+			if err := ft.emitBranchOrReturn(ctx, instr); err != nil {
 				return nil, err
 			}
 		} else {
@@ -830,27 +893,95 @@ func (ft *FunctionTransformer) emitSavePath(em *codegen.Emitter, localStackPtr, 
 }
 
 // needsSingleStackValue returns true if the opcode consumes exactly one value from stack
-// for control flow purposes (condition check). Does NOT include drop since that's handled
-// by its own handler which just pops from simulated stack without emitting code.
+// for control flow purposes (condition check).
 func needsSingleStackValue(op byte) bool {
+	return op == wasm.OpIf
+}
+
+// isStructuralControlFlow returns true if the opcode opens or closes block structure.
+func isStructuralControlFlow(op byte) bool {
 	switch op {
-	case wasm.OpIf, wasm.OpBrIf, wasm.OpBrTable, wasm.OpBrOnNull, wasm.OpBrOnNonNull:
+	case wasm.OpBlock, wasm.OpLoop, wasm.OpIf, wasm.OpElse, wasm.OpEnd:
 		return true
 	}
 	return false
 }
 
-// isControlFlowInstruction returns true if the opcode is a control flow instruction
-// that should not be wrapped in a normal-state guard block.
-// Control flow instructions structure the code and must be emitted unconditionally.
-func isControlFlowInstruction(op byte) bool {
+// isBranchOrReturn returns true if the opcode is an original branch or return instruction
+// that should not execute during rewind.
+func isBranchOrReturn(op byte) bool {
 	switch op {
-	case wasm.OpBlock, wasm.OpLoop, wasm.OpIf, wasm.OpElse, wasm.OpEnd,
-		wasm.OpBr, wasm.OpBrIf, wasm.OpBrTable, wasm.OpReturn,
+	case wasm.OpBr, wasm.OpBrIf, wasm.OpBrTable, wasm.OpReturn,
 		wasm.OpBrOnNull, wasm.OpBrOnNonNull:
 		return true
 	}
 	return false
+}
+
+func (ft *FunctionTransformer) emitBranchOrReturn(ctx *handler.Context, instr wasm.Instruction) error {
+	switch instr.Opcode {
+	case wasm.OpBr:
+		imm := instr.Imm.(wasm.BranchImm)
+		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal)
+		ctx.Emit.BrIf(imm.LabelIdx)
+	case wasm.OpBrIf:
+		imm := instr.Imm.(wasm.BranchImm)
+		if ctx.Stack.Len() > 0 {
+			entry := ctx.Stack.PopTyped()
+			ctx.Emit.LocalGet(entry.LocalIdx)
+		}
+		// br_if treats every nonzero i32 as true, including even values.
+		ctx.Emit.I32Eqz().I32Eqz()
+		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal)
+		ctx.Emit.I32And()
+		ctx.Emit.BrIf(imm.LabelIdx)
+	case wasm.OpBrTable:
+		imm := instr.Imm.(wasm.BrTableImm)
+		var indexLocal uint32
+		if ctx.Stack.Len() > 0 {
+			indexLocal = ctx.Stack.Pop()
+		}
+		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
+		newLabels := make([]uint32, len(imm.Labels))
+		for i, l := range imm.Labels {
+			newLabels[i] = l + 1
+		}
+		newDefault := imm.Default + 1
+		ctx.Emit.LocalGet(indexLocal)
+		ctx.Emit.BrTable(newLabels, newDefault)
+		ctx.Emit.End()
+	case wasm.OpReturn:
+		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
+		ft.emitReturn(ctx)
+		ctx.Emit.End()
+	case wasm.OpBrOnNull:
+		imm := instr.Imm.(wasm.BranchImm)
+		var refLocal uint32
+		if ctx.Stack.Len() > 0 {
+			refLocal = ctx.Stack.Pop()
+		}
+		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
+		ctx.Emit.LocalGet(refLocal)
+		ctx.Emit.EmitInstr(wasm.Instruction{
+			Opcode: wasm.OpBrOnNull,
+			Imm:    wasm.BranchImm{LabelIdx: imm.LabelIdx + 1},
+		})
+		ctx.Emit.End()
+	case wasm.OpBrOnNonNull:
+		imm := instr.Imm.(wasm.BranchImm)
+		var refLocal uint32
+		if ctx.Stack.Len() > 0 {
+			refLocal = ctx.Stack.Pop()
+		}
+		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
+		ctx.Emit.LocalGet(refLocal)
+		ctx.Emit.EmitInstr(wasm.Instruction{
+			Opcode: wasm.OpBrOnNonNull,
+			Imm:    wasm.BranchImm{LabelIdx: imm.LabelIdx + 1},
+		})
+		ctx.Emit.End()
+	}
+	return nil
 }
 
 // emitSingleInstruction emits a single non-async instruction, preserving control flow.

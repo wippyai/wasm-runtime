@@ -658,18 +658,30 @@ func (v *StreamingValidator) processCanonSection(data []byte) error {
 		return err
 	}
 
-	parsed, err := ParseCanonSection(data)
+	parsed, err := ParseCanonSectionEntries(data)
 	if err != nil {
 		return err
 	}
 
+	for i, def := range parsed {
+		if err := v.applyCanon(current, def); err != nil {
+			return fmt.Errorf("canon %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+func (v *StreamingValidator) applyCanon(current *arena.State, parsed *CanonDef) error {
+	if parsed == nil {
+		return fmt.Errorf("nil canon")
+	}
+
 	switch parsed.Kind {
 	case CanonLower:
-		// Lower creates a core function from a component function
 		current.AddCoreFunc(0)
 
 	case CanonLift:
-		// Lift creates a component function from a core function
 		funcTypeID, err := current.GetType(parsed.TypeIndex)
 		if err != nil {
 			return fmt.Errorf("canon lift has %d types available: %w", current.TypeCount(), err)
@@ -680,27 +692,21 @@ func (v *StreamingValidator) processCanonSection(data []byte) error {
 		current.AddFunc(funcTypeID.ID)
 
 	case CanonResourceNew:
-		// resource.new creates a core function
 		current.AddCoreFunc(0)
 
 	case CanonResourceDrop:
-		// resource.drop creates a core function
 		current.AddCoreFunc(0)
 
 	case CanonResourceRep:
-		// resource.rep creates a core function
 		current.AddCoreFunc(0)
 
 	case CanonResourceDropAsync:
-		// resource.drop-async creates a core function
 		current.AddCoreFunc(0)
 
 	case CanonTaskCancel:
-		// task.cancel creates a core function
 		current.AddCoreFunc(0)
 
 	case CanonSubtaskCancel:
-		// subtask.cancel creates a core function
 		current.AddCoreFunc(0)
 
 	default:
@@ -723,9 +729,23 @@ func (v *StreamingValidator) processExportSection(data []byte) error {
 	}
 
 	for _, exp := range exports {
-		// Function exports (Sort=0x01) add to component func index space
-		if exp.Sort == 0x01 {
-			current.AddFunc(0)
+		if exp.Sort == SortFunc {
+			// An export aliases an existing function, including its type.
+			if uint64(exp.SortIndex) >= uint64(current.FuncCount()) {
+				return fmt.Errorf("export %q: func index %d out of range", exp.Name, exp.SortIndex)
+			}
+			ty, err := current.GetFunc(exp.SortIndex)
+			if err != nil {
+				return fmt.Errorf("export %q: %w", exp.Name, err)
+			}
+			current.AddFunc(ty)
+		}
+		if exp.Sort == SortType {
+			ty, err := current.GetType(exp.SortIndex)
+			if err != nil {
+				return fmt.Errorf("export %q: %w", exp.Name, err)
+			}
+			current.AddType(ty)
 		}
 	}
 

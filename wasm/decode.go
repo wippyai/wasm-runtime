@@ -17,6 +17,10 @@ var (
 
 // ParseModule parses a WebAssembly binary module
 func ParseModule(data []byte) (*Module, error) {
+	return parseModule(data, false)
+}
+
+func parseModule(data []byte, metadataOnly bool) (*Module, error) {
 	r := binary.NewReader(bytes.NewReader(data))
 
 	// Check magic number
@@ -66,6 +70,13 @@ func ParseModule(data []byte) (*Module, error) {
 		sectionSize, err := r.ReadU32()
 		if err != nil {
 			return nil, r.WrapError("section size", err)
+		}
+
+		if metadataOnly && (sectionID == SectionCode || sectionID == SectionData) {
+			if err := r.Skip(int(sectionSize)); err != nil {
+				return nil, r.WrapError("section data", err)
+			}
+			continue
 		}
 
 		sectionData, err := r.ReadBytes(int(sectionSize))
@@ -192,7 +203,7 @@ func parseCustomSection(r *binary.Reader, m *Module) error {
 }
 
 func parseTypeSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -269,7 +280,7 @@ func parseTypeSection(r *binary.Reader, m *Module) error {
 			m.Types = append(m.Types, ft)
 
 		case RecTypeByte: // 0x4E - recursive type group
-			recCount, err := r.ReadU32()
+			recCount, err := r.ReadVectorCount()
 			if err != nil {
 				return err
 			}
@@ -322,7 +333,7 @@ func parseTypeSection(r *binary.Reader, m *Module) error {
 
 func skipFuncType(r *binary.Reader) error {
 	// Skip params
-	paramCount, err := r.ReadU32()
+	paramCount, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -338,7 +349,7 @@ func skipFuncType(r *binary.Reader) error {
 		}
 	}
 	// Skip results
-	resultCount, err := r.ReadU32()
+	resultCount, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -387,7 +398,7 @@ func readSubTypeWithPrefix(r *binary.Reader, form byte) (SubType, error) {
 	switch form {
 	case SubTypeByte, SubFinalByte: // 0x50, 0x4F - sub with parents
 		sub.Final = form == SubFinalByte
-		parentCount, err := r.ReadU32()
+		parentCount, err := r.ReadVectorCount()
 		if err != nil {
 			return SubType{}, err
 		}
@@ -469,7 +480,7 @@ func readCompType(r *binary.Reader) (CompType, error) {
 }
 
 func readStructType(r *binary.Reader) (StructType, error) {
-	fieldCount, err := r.ReadU32()
+	fieldCount, err := r.ReadVectorCount()
 	if err != nil {
 		return StructType{}, err
 	}
@@ -532,7 +543,7 @@ func readStorageType(r *binary.Reader) (StorageType, error) {
 }
 
 func parseImportSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -593,7 +604,7 @@ func parseImportSection(r *binary.Reader, m *Module) error {
 }
 
 func parseFunctionSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -608,7 +619,7 @@ func parseFunctionSection(r *binary.Reader, m *Module) error {
 }
 
 func parseTableSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -623,7 +634,7 @@ func parseTableSection(r *binary.Reader, m *Module) error {
 }
 
 func parseMemorySection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -638,7 +649,7 @@ func parseMemorySection(r *binary.Reader, m *Module) error {
 }
 
 func parseGlobalSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -661,7 +672,7 @@ func parseGlobalSection(r *binary.Reader, m *Module) error {
 }
 
 func parseExportSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -697,7 +708,7 @@ func parseStartSection(r *binary.Reader, m *Module) error {
 }
 
 func parseElementSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -754,7 +765,7 @@ func parseElementSection(r *binary.Reader, m *Module) error {
 		}
 
 		// Read the vector of indices or expressions
-		vecCount, err := r.ReadU32()
+		vecCount, err := r.ReadVectorCount()
 		if err != nil {
 			return err
 		}
@@ -783,7 +794,7 @@ func parseElementSection(r *binary.Reader, m *Module) error {
 }
 
 func parseCodeSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -800,7 +811,7 @@ func parseCodeSection(r *binary.Reader, m *Module) error {
 
 		br := binary.NewReader(bytes.NewReader(bodyData))
 
-		localCount, err := br.ReadU32()
+		localCount, err := br.ReadVectorCount()
 		if err != nil {
 			return err
 		}
@@ -841,7 +852,7 @@ func parseCodeSection(r *binary.Reader, m *Module) error {
 }
 
 func parseDataSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -898,7 +909,7 @@ func parseDataCountSection(r *binary.Reader, m *Module) error {
 }
 
 func parseTagSection(r *binary.Reader, m *Module) error {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return err
 	}
@@ -915,7 +926,7 @@ func parseTagSection(r *binary.Reader, m *Module) error {
 // readExtValTypes reads value types with full extended type information.
 // Returns both extended types (for GC support) and simplified ValType slice (for compatibility).
 func readExtValTypes(r *binary.Reader) ([]ExtValType, []ValType, error) {
-	count, err := r.ReadU32()
+	count, err := r.ReadVectorCount()
 	if err != nil {
 		return nil, nil, err
 	}
