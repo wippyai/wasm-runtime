@@ -56,25 +56,21 @@ func (h LocalSetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	return nil
 }
 
-// LocalTeeHandler copies the top stack value to a local without consuming it.
+// LocalTeeHandler assigns a local and preserves the operand's value.
 //
-// WebAssembly's local.tee is equivalent to: dup -> local.set -> (value remains)
-// In our flattened model, we pop the source temporary, emit the store to the
-// target local, then push the target local index onto the simulated stack.
-// This way the "remaining" value is now tracked as being in the target local.
-//
-// This is a slight semantic change from the original local.tee behavior where
-// the stack value stays on the operand stack. In flattened form, the target
-// local itself becomes the new "stack slot". This works correctly because
-// subsequent operations will read from that local.
+// The stack value must remain a snapshot: a later local.set must not change it.
+// Store the value in a temporary distinct from the mutable guest local, matching
+// the temporary allocated for local.tee by the transform's stack simulation.
 type LocalTeeHandler struct{}
 
 func (h LocalTeeHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	imm := instr.Imm.(wasm.LocalImm)
 	src := ctx.Stack.Pop()
+	localType := ctx.TypeOf(imm.LocalIdx)
+	tmp := ctx.AllocTemp(localType)
 
-	ctx.Emit.LocalGet(src).LocalSet(imm.LocalIdx)
-	ctx.Stack.Push(imm.LocalIdx, ctx.TypeOf(imm.LocalIdx))
+	ctx.Emit.LocalGet(src).LocalTee(imm.LocalIdx).LocalSet(tmp)
+	ctx.Stack.Push(tmp, localType)
 
 	return nil
 }
