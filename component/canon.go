@@ -1,6 +1,7 @@
 package component
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 )
@@ -34,7 +35,7 @@ const (
 // CanonDef holds parsed canonical ABI operation data
 type CanonDef struct {
 	Options      []CanonOption
-	RawData      []byte
+	RawData      []byte // Borrowed complete section bytes, shared by entries in a vector.
 	FuncIndex    uint32
 	TypeIndex    uint32
 	ResourceType uint32
@@ -48,36 +49,61 @@ type CanonOption struct {
 	Encoding byte
 }
 
-// ParseCanonSection parses a Canon section (section 8).
-// Despite vec encoding, component-model-async spec mandates exactly 1 canon per section.
+// ParseCanonSection parses a canonical section containing exactly one entry.
+//
+// Deprecated: Use ParseCanonSectionEntries to support canonical section vectors.
 func ParseCanonSection(data []byte) (*CanonDef, error) {
+	entries, err := ParseCanonSectionEntries(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) != 1 {
+		return nil, fmt.Errorf("expected 1 canon in section, got %d", len(entries))
+	}
+	return entries[0], nil
+}
+
+// ParseCanonSectionEntries parses a Canon section (section 8).
+// Binary.md: section_8(vec(<canon>)) — entries are returned in index order.
+func ParseCanonSectionEntries(data []byte) ([]*CanonDef, error) {
 	r := getReader(data)
 	defer putReader(r)
 
-	// Read vec count (should be 1)
 	count, err := readLEB128(r)
 	if err != nil {
 		return nil, fmt.Errorf("read canon vec count: %w", err)
 	}
-	if count != 1 {
-		return nil, fmt.Errorf("expected 1 canon in section, got %d", count)
+	if uint64(count) > uint64(r.Len()) {
+		return nil, fmt.Errorf("canon count %d exceeds remaining section bytes %d", count, r.Len())
 	}
 
-	// Read canon kind
+	canons := make([]*CanonDef, 0, count)
+	for i := uint32(0); i < count; i++ {
+		canon, err := parseCanonDef(r)
+		if err != nil {
+			return nil, fmt.Errorf("canon %d: %w", i, err)
+		}
+		canon.RawData = data
+		canons = append(canons, canon)
+	}
+	if r.Len() != 0 {
+		return nil, fmt.Errorf("canon section has %d trailing bytes", r.Len())
+	}
+
+	return canons, nil
+}
+
+func parseCanonDef(r *bytes.Reader) (*CanonDef, error) {
 	kind, err := readByte(r)
 	if err != nil {
 		return nil, fmt.Errorf("read canon kind: %w", err)
 	}
 
-	canon := &CanonDef{
-		Kind:    kind,
-		RawData: data,
-	}
+	canon := &CanonDef{Kind: kind}
 
 	switch kind {
 	case CanonLift:
 		// lift: 0x00 0x00 core_func:u32 opts:vec(canonopt) type:u32
-		// Read second discriminant (must be 0x00 in current spec)
 		subKind, err := readByte(r)
 		if err != nil {
 			return nil, fmt.Errorf("read lift sub-kind: %w", err)
@@ -86,21 +112,18 @@ func ParseCanonSection(data []byte) (*CanonDef, error) {
 			return nil, fmt.Errorf("unknown lift sub-kind: 0x%02x", subKind)
 		}
 
-		// Read core function index
 		funcIdx, err := readLEB128(r)
 		if err != nil {
 			return nil, fmt.Errorf("read core func index: %w", err)
 		}
 		canon.FuncIndex = funcIdx
 
-		// Read options vec
 		opts, err := readCanonOptions(r)
 		if err != nil {
 			return nil, fmt.Errorf("read options: %w", err)
 		}
 		canon.Options = opts
 
-		// Read type index
 		typeIdx, err := readLEB128(r)
 		if err != nil {
 			return nil, fmt.Errorf("read type index: %w", err)
@@ -109,7 +132,6 @@ func ParseCanonSection(data []byte) (*CanonDef, error) {
 
 	case CanonLower:
 		// lower: 0x01 0x00 func:u32 opts:vec(canonopt)
-		// Read second discriminant (must be 0x00 in current spec)
 		subKind, err := readByte(r)
 		if err != nil {
 			return nil, fmt.Errorf("read lower sub-kind: %w", err)
@@ -118,14 +140,12 @@ func ParseCanonSection(data []byte) (*CanonDef, error) {
 			return nil, fmt.Errorf("unknown lower sub-kind: 0x%02x", subKind)
 		}
 
-		// Read component function index
 		funcIdx, err := readLEB128(r)
 		if err != nil {
 			return nil, fmt.Errorf("read func index: %w", err)
 		}
 		canon.FuncIndex = funcIdx
 
-		// Read options vec
 		opts, err := readCanonOptions(r)
 		if err != nil {
 			return nil, fmt.Errorf("read options: %w", err)
@@ -133,7 +153,6 @@ func ParseCanonSection(data []byte) (*CanonDef, error) {
 		canon.Options = opts
 
 	case CanonResourceNew, CanonResourceDrop, CanonResourceRep, CanonResourceDropAsync:
-		// Resource operations: kind resource:u32
 		resourceType, err := readLEB128(r)
 		if err != nil {
 			return nil, fmt.Errorf("read resource type: %w", err)
@@ -150,12 +169,17 @@ func ParseCanonSection(data []byte) (*CanonDef, error) {
 	return canon, nil
 }
 
-func readCanonOptions(r io.Reader) ([]CanonOption, error) {
+func readCanonOptions(r *bytes.Reader) ([]CanonOption, error) {
 	count, err := readLEB128(r)
 	if err != nil {
 		return nil, fmt.Errorf("read option count: %w", err)
 	}
 
+	// Every option consumes at least one byte. Reject forged vector counts
+	// before they can cause a large allocation from a tiny section.
+	if uint64(count) > uint64(r.Len()) {
+		return nil, fmt.Errorf("option count %d exceeds remaining section bytes %d", count, r.Len())
+	}
 	opts := make([]CanonOption, 0, count)
 	for i := uint32(0); i < count; i++ {
 		opt, err := readCanonOption(r)

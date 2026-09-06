@@ -62,15 +62,16 @@ func TestParseCanonSimple(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			canon, err := ParseCanonSection(tt.data)
+			canons, err := ParseCanonSectionEntries(tt.data)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseCanonSection() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ParseCanonSectionEntries() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !tt.wantErr && canon == nil {
-				t.Error("ParseCanonSection() returned nil canon without error")
-			}
 			if !tt.wantErr {
+				if len(canons) != 1 || canons[0] == nil {
+					t.Fatalf("ParseCanonSectionEntries() returned %d canons, want 1", len(canons))
+				}
+				canon := canons[0]
 				t.Logf("Parsed canon: kind=%d, funcIdx=%d, opts=%d",
 					canon.Kind, canon.FuncIndex, len(canon.Options))
 			}
@@ -138,51 +139,92 @@ func TestCanonDef_GetStringEncoding(t *testing.T) {
 	}
 }
 
-func TestParseCanonSection_InvalidCount(t *testing.T) {
+func TestParseCanonSectionEntries_VectorOfTwoLowers(t *testing.T) {
 	data := []byte{
-		0x02, // vec count = 2 (invalid, must be 1)
-		0x00, // kind
+		0x02,                   // vec count = 2
+		0x01, 0x00, 0x00, 0x00, // lower func 0, no opts
+		0x01, 0x00, 0x02, 0x00, // lower func 2, no opts
 	}
 
-	_, err := ParseCanonSection(data)
-	if err == nil {
-		t.Error("expected error for vec count != 1")
+	canons, err := ParseCanonSectionEntries(data)
+	if err != nil {
+		t.Fatalf("ParseCanonSectionEntries() error = %v", err)
+	}
+	if len(canons) != 2 {
+		t.Fatalf("len = %d, want 2", len(canons))
+	}
+	if canons[0].Kind != CanonLower || canons[0].FuncIndex != 0 {
+		t.Errorf("canons[0] = kind %d func %d, want lower func 0", canons[0].Kind, canons[0].FuncIndex)
+	}
+	if canons[1].Kind != CanonLower || canons[1].FuncIndex != 2 {
+		t.Errorf("canons[1] = kind %d func %d, want lower func 2", canons[1].Kind, canons[1].FuncIndex)
 	}
 }
 
-func TestParseCanonSection_UnknownKind(t *testing.T) {
+func TestParseCanonSectionEntries_EmptyVector(t *testing.T) {
+	canons, err := ParseCanonSectionEntries([]byte{0x00})
+	if err != nil {
+		t.Fatalf("empty vec: %v", err)
+	}
+	if len(canons) != 0 {
+		t.Fatalf("len = %d, want 0", len(canons))
+	}
+}
+
+func TestParseCanonSectionEntries_TrailingBytes(t *testing.T) {
+	data := []byte{
+		0x01,
+		0x01, 0x00, 0x00, 0x00,
+		0x00,
+	}
+	if _, err := ParseCanonSectionEntries(data); err == nil {
+		t.Fatal("expected error for trailing bytes")
+	}
+}
+
+func TestParseCanonSectionEntries_TruncatedVector(t *testing.T) {
+	data := []byte{
+		0x02,
+		0x01, 0x00, 0x00, 0x00,
+	}
+	if _, err := ParseCanonSectionEntries(data); err == nil {
+		t.Fatal("expected error for truncated vector")
+	}
+}
+
+func TestParseCanonSectionEntries_UnknownKind(t *testing.T) {
 	data := []byte{
 		0x01, // vec count = 1
 		0xFF, // unknown kind
 	}
 
-	_, err := ParseCanonSection(data)
+	_, err := ParseCanonSectionEntries(data)
 	if err == nil {
 		t.Error("expected error for unknown kind")
 	}
 }
 
-func TestParseCanonSection_LiftInvalidSubKind(t *testing.T) {
+func TestParseCanonSectionEntries_LiftInvalidSubKind(t *testing.T) {
 	data := []byte{
 		0x01, // vec count = 1
 		0x00, // kind = lift
 		0x01, // subkind = 1 (invalid, must be 0)
 	}
 
-	_, err := ParseCanonSection(data)
+	_, err := ParseCanonSectionEntries(data)
 	if err == nil {
 		t.Error("expected error for invalid lift sub-kind")
 	}
 }
 
-func TestParseCanonSection_LowerInvalidSubKind(t *testing.T) {
+func TestParseCanonSectionEntries_LowerInvalidSubKind(t *testing.T) {
 	data := []byte{
 		0x01, // vec count = 1
 		0x01, // kind = lower
 		0x01, // subkind = 1 (invalid, must be 0)
 	}
 
-	_, err := ParseCanonSection(data)
+	_, err := ParseCanonSectionEntries(data)
 	if err == nil {
 		t.Error("expected error for invalid lower sub-kind")
 	}
