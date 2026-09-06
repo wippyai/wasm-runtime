@@ -7,7 +7,7 @@ The grammar reference is [Component Model Binary.md at 8892da0](https://github.c
 In particular, canonical sections contain vectors, export declarations carry an
 optional type ascription, and exports introduce aliases in their index spaces.
 
-The five WAT fixtures were parsed and validated with `wasm-tools 1.241.2`:
+The six WAT fixtures were parsed and validated with `wasm-tools 1.241.2`:
 
 ```sh
 wasm-tools parse packed_canon.wat -o packed_canon.wasm
@@ -20,6 +20,8 @@ wasm-tools parse exported_type_alias.wat -o exported_type_alias.wasm
 wasm-tools validate exported_type_alias.wasm
 wasm-tools parse packed_type_aliases.wat -o packed_type_aliases.wasm
 wasm-tools validate packed_type_aliases.wasm
+wasm-tools parse exported_func_aliases.wat -o exported_func_aliases.wasm
+wasm-tools validate exported_func_aliases.wasm
 ```
 
 `packed_canon.wat` includes two canon lowers and two lifts. Its mirror lower uses
@@ -39,3 +41,8 @@ Ordinary parser tests read the checked-in binaries and do not need wasm-tools.
 aliases in one export section, then imports a function using the second alias.
 Malformed-source tests separately reject self references, forward references,
 and the maximum u32 index in both type-aware decoding and streaming validation.
+
+`exported_func_aliases.wat` imports two distinct function signatures, then
+exports the second function twice through sequential aliases. Streaming
+validation must preserve the source signature for both aliases and reject
+function exports whose source index does not exist.

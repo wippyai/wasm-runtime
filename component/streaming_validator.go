@@ -729,9 +729,16 @@ func (v *StreamingValidator) processExportSection(data []byte) error {
 	}
 
 	for _, exp := range exports {
-		// Function exports (Sort=0x01) add to component func index space
-		if exp.Sort == 0x01 {
-			current.AddFunc(0)
+		if exp.Sort == SortFunc {
+			// An export aliases an existing function, including its type.
+			if uint64(exp.SortIndex) >= uint64(current.FuncCount()) {
+				return fmt.Errorf("export %q: func index %d out of range", exp.Name, exp.SortIndex)
+			}
+			ty, err := current.GetFunc(exp.SortIndex)
+			if err != nil {
+				return fmt.Errorf("export %q: %w", exp.Name, err)
+			}
+			current.AddFunc(ty)
 		}
 		if exp.Sort == SortType {
 			ty, err := current.GetType(exp.SortIndex)
