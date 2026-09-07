@@ -226,6 +226,11 @@ func TestOwnedMemoryPlanMatchesRepeatedRuntimeAllocations(t *testing.T) {
 				}
 			}
 			if transform {
+				for _, core := range inst.Modules() {
+					if !inst.IsModuleAsyncifyMemoryAdded(core) {
+						t.Fatal("missing provenance for transform-added memory")
+					}
+				}
 				original, err := wasm.ParseModuleMetadata(data)
 				if err != nil {
 					t.Fatal(err)

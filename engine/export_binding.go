@@ -403,8 +403,19 @@ func (i *WazeroInstance) getOrCreateAsyncifyForModuleLocked(mod api.Module, modI
 	if i.asyncifyConfig.DataAddr > 0 {
 		a.SetDataAddr(i.asyncifyConfig.DataAddr)
 	}
-	if i.linkerInst != nil && modIdx >= 0 {
-		a.trusted = i.linkerInst.IsInstanceTransformed(modIdx)
+	if i.asyncifyConfig.ownedStackBytes != 0 {
+		// Owned configuration pre-initializes every current transformed core.
+		// A later unreserved core cannot safely allocate here because export
+		// binding has no call context to give an untrusted guest allocator.
+		reservation, err := i.ownedAsyncifyReservationLocked(mod, i.asyncifyConfig.ownedStackBytes)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.SetStackSize(i.asyncifyConfig.ownedStackBytes)
+		a.SetDataAddr(reservation.dataAddr)
+	}
+	if i.linkerInst != nil {
+		a.trusted = i.linkerInst.IsModuleTransformed(mod)
 	} else {
 		a.trusted = i.transformed
 	}

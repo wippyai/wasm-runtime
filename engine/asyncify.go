@@ -76,6 +76,11 @@ const AsyncifyDefaultStackSize uint32 = 1024
 type AsyncifyConfig struct {
 	StackSize uint32
 	DataAddr  uint32
+
+	// ownedStackBytes is set only by WazeroInstance's automatic owned-stack
+	// path. A public nonzero DataAddr remains caller-managed; its legacy zero
+	// value does not establish any reservation.
+	ownedStackBytes uint32
 }
 
 func NewAsyncify() *Asyncify {
@@ -150,11 +155,15 @@ func (a *Asyncify) prepareInit(mod api.Module) (asyncifyHeader, error) {
 	if end > uint64(^uint32(0)) {
 		return asyncifyHeader{}, fmt.Errorf("asyncify: stack address overflow")
 	}
-	bytes, ok := a.memory.Read(a.dataAddr, 8)
+	// Reading the entire region proves both the header and every byte Asyncify
+	// may use for its saved stack are addressable. Checking only eight header
+	// bytes lets a valid header point at a stack that runs off linear memory.
+	regionBytes := uint32(end - uint64(a.dataAddr))
+	bytes, ok := a.memory.Read(a.dataAddr, regionBytes)
 	if !ok {
-		return asyncifyHeader{}, fmt.Errorf("asyncify: stack header outside memory")
+		return asyncifyHeader{}, fmt.Errorf("asyncify: stack region outside memory")
 	}
-	return asyncifyHeader{bytes: bytes, pointer: uint32(pointer), end: uint32(end)}, nil
+	return asyncifyHeader{bytes: bytes[:asyncifyHeaderBytes], pointer: uint32(pointer), end: uint32(end)}, nil
 }
 
 func (a *Asyncify) GetState(_ context.Context) int32 {

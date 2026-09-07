@@ -144,6 +144,10 @@ type InstanceConfig struct {
 	Args            []string
 	Mounts          []Mount
 	EnableAsyncify  bool
+	// AsyncifyStackBytes requests an instance-owned Asyncify data header and
+	// stack reservation for each transformed core. Zero leaves legacy
+	// AsyncifyConfig behavior unchanged, including its unreserved default.
+	AsyncifyStackBytes uint32
 }
 
 // Mount preopens a filesystem into the guest at Guest. FS is mounted when set;
@@ -1065,7 +1069,13 @@ func (m *WazeroModule) InstantiateWithConfig(ctx context.Context, cfg *InstanceC
 	// Mirror multi-module behavior: asyncify enable is best-effort.
 	// Callers may request asyncify on modules that have no async transform.
 	if cfg != nil && cfg.EnableAsyncify {
-		if err := wazInst.EnableAsyncify(AsyncifyConfig{}); err != nil {
+		if cfg.AsyncifyStackBytes > 0 {
+			if err := wazInst.enableOwnedAsyncify(startupCtx, cfg.AsyncifyStackBytes); err != nil {
+				finishStartup()
+				_ = wazInst.Close(context.WithoutCancel(ctx))
+				return nil, fmt.Errorf("initialize owned asyncify stack: %w", err)
+			}
+		} else if err := wazInst.EnableAsyncify(AsyncifyConfig{}); err != nil {
 			debugf("asyncify not available for module: %v", err)
 		}
 	}
@@ -1299,22 +1309,23 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 
 	// Create WazeroInstance wrapper
 	wazInst := &WazeroInstance{
-		lifetime:        lifetime,
-		admission:       admission,
-		module:          m,
-		instance:        module,
-		encoder:         m.encoder,
-		decoder:         m.decoderForConfig(cfg),
-		compiler:        m.compiler,
-		stackBuf:        make([]uint64, 16),
-		linkerInst:      inst,
-		resources:       resource.NewTable(),
-		transformed:     inst.IsInstanceTransformed(selectedIdx),
-		exportBindings:  make(map[string]*exportBinding),
-		allocatorCache:  make(map[api.Function]*wazeroAllocator),
-		memoryCache:     make(map[api.Memory]*WazeroMemory),
-		asyncifyCache:   make(map[api.Module]*asyncifyCoreState),
-		asyncifyEnabled: enableAsyncify,
+		lifetime:             lifetime,
+		admission:            admission,
+		module:               m,
+		instance:             module,
+		encoder:              m.encoder,
+		decoder:              m.decoderForConfig(cfg),
+		compiler:             m.compiler,
+		stackBuf:             make([]uint64, 16),
+		linkerInst:           inst,
+		resources:            resource.NewTable(),
+		transformed:          inst.IsInstanceTransformed(selectedIdx),
+		exportBindings:       make(map[string]*exportBinding),
+		allocatorCache:       make(map[api.Function]*wazeroAllocator),
+		memoryCache:          make(map[api.Memory]*WazeroMemory),
+		asyncifyCache:        make(map[api.Module]*asyncifyCoreState),
+		asyncifyReservations: make(map[api.Module]asyncifyStackReservation),
+		asyncifyEnabled:      enableAsyncify,
 	}
 
 	// Cache memory
@@ -1350,7 +1361,13 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 
 	// Enable asyncify if requested and module supports it
 	if enableAsyncify {
-		if err := wazInst.EnableAsyncify(AsyncifyConfig{}); err != nil {
+		if cfg != nil && cfg.AsyncifyStackBytes > 0 {
+			if err := wazInst.enableOwnedAsyncify(startupCtx, cfg.AsyncifyStackBytes); err != nil {
+				finishStartup()
+				_ = wazInst.Close(context.WithoutCancel(ctx))
+				return nil, fmt.Errorf("initialize owned asyncify stack: %w", err)
+			}
+		} else if err := wazInst.EnableAsyncify(AsyncifyConfig{}); err != nil {
 			debugf("asyncify not available for component: %v", err)
 		}
 	}
@@ -1384,35 +1401,37 @@ func (m *WazeroModule) decoderForConfig(cfg *InstanceConfig) *transcoder.Decoder
 // Close is an exception: concurrent callers share one teardown owner and may
 // cancel their wait without reclaiming resources still owned by that teardown.
 type WazeroInstance struct {
-	admission       *linker.MemoryAdmission
-	closeAttempt    chan struct{}
-	closeErr        error
-	lifetime        *executionLifetime
-	freeFn          api.Function
-	allocFn         api.Function
-	instance        api.Module
-	linkerInst      *linker.Instance
-	scheduler       *Scheduler
-	compiler        *transcoder.Compiler
-	resources       *resource.UnifiedTable
-	decoder         *transcoder.Decoder
-	memory          *WazeroMemory
-	alloc           *wazeroAllocator
-	module          *WazeroModule
-	asyncify        *Asyncify
-	encoder         *transcoder.Encoder
-	activeSession   *CallSession
-	asyncifyCache   map[api.Module]*asyncifyCoreState
-	memoryCache     map[api.Memory]*WazeroMemory
-	allocatorCache  map[api.Function]*wazeroAllocator
-	exportBindings  map[string]*exportBinding
-	stackBuf        []uint64
-	closeMu         sync.Mutex
-	bindingMu       sync.RWMutex
-	asyncifyConfig  AsyncifyConfig
-	closed          bool
-	transformed     bool
-	asyncifyEnabled bool
+	closeErr                error
+	freeFn                  api.Function
+	allocFn                 api.Function
+	instance                api.Module
+	memory                  *WazeroMemory
+	asyncify                *Asyncify
+	admission               *linker.MemoryAdmission
+	closeAttempt            chan struct{}
+	lifetime                *executionLifetime
+	linkerInst              *linker.Instance
+	scheduler               *Scheduler
+	compiler                *transcoder.Compiler
+	resources               *resource.UnifiedTable
+	decoder                 *transcoder.Decoder
+	asyncifyReservations    map[api.Module]asyncifyStackReservation
+	alloc                   *wazeroAllocator
+	module                  *WazeroModule
+	exportBindings          map[string]*exportBinding
+	encoder                 *transcoder.Encoder
+	activeSession           *CallSession
+	asyncifyCache           map[api.Module]*asyncifyCoreState
+	memoryCache             map[api.Memory]*WazeroMemory
+	allocatorCache          map[api.Function]*wazeroAllocator
+	stackBuf                []uint64
+	bindingMu               sync.RWMutex
+	asyncifyConfig          AsyncifyConfig
+	closeMu                 sync.Mutex
+	asyncifyOwnedStackBytes uint32
+	closed                  bool
+	transformed             bool
+	asyncifyEnabled         bool
 }
 
 // IsTransformed reports whether this instance was proven by trusted linker/engine
@@ -1493,13 +1512,23 @@ func (i *WazeroInstance) prepareCallContext(ctx context.Context) context.Context
 	}
 }
 
-// EnableAsyncify initializes asyncify support for this instance.
-// Call EnableAsyncify after instantiation but before calling async functions.
-// The module must have been compiled with asyncify (wasm-opt --asyncify).
+// EnableAsyncify initializes the legacy caller-reserved Asyncify layout.
+// Applications that use InstanceConfig.AsyncifyStackBytes get the automatic,
+// allocator-proven ownership path during instantiation instead.
 func (i *WazeroInstance) EnableAsyncify(config AsyncifyConfig) error {
+	if config.ownedStackBytes != 0 {
+		return fmt.Errorf("asyncify: owned stack configuration is internal")
+	}
+	return i.enableAsyncify(context.Background(), config)
+}
+
+func (i *WazeroInstance) enableAsyncify(ctx context.Context, config AsyncifyConfig) error {
+	if ctx == nil {
+		return fmt.Errorf("asyncify: nil execution context")
+	}
 	// Reconfiguration writes guest memory and inspects owned core modules. It
 	// must finish before shutdown may reclaim them, including during startup.
-	_, finish, err := i.enterExecution(context.Background())
+	_, finish, err := i.enterExecution(ctx)
 	if err != nil {
 		return err
 	}
@@ -1507,6 +1536,11 @@ func (i *WazeroInstance) EnableAsyncify(config AsyncifyConfig) error {
 
 	i.bindingMu.Lock()
 	defer i.bindingMu.Unlock()
+
+	ownedStackBytes := config.ownedStackBytes
+	if ownedStackBytes == 0 && len(i.asyncifyReservations) != 0 {
+		return fmt.Errorf("asyncify: instance has owned stack reservations; reconfigure through the same instance-owned stack policy")
+	}
 
 	if i.activeSession != nil && !i.activeSession.lifted {
 		activeName := ""
@@ -1526,6 +1560,9 @@ func (i *WazeroInstance) EnableAsyncify(config AsyncifyConfig) error {
 	if config.DataAddr > 0 {
 		a.SetDataAddr(config.DataAddr)
 	}
+	// For a component, trusted controls belong to the exact core selected
+	// below. A transformed entry core must not bless a sibling merely because
+	// that sibling exports Asyncify-shaped functions.
 	a.trusted = i.transformed
 
 	initMod := i.instance
@@ -1543,6 +1580,20 @@ func (i *WazeroInstance) EnableAsyncify(config AsyncifyConfig) error {
 		} else {
 			return fmt.Errorf("instance is closed or uninitialized")
 		}
+	}
+	if i.linkerInst != nil {
+		a.trusted = i.linkerInst.IsModuleTransformed(initMod)
+	}
+	if ownedStackBytes != 0 {
+		if err := i.prepareOwnedAsyncifyReservationsLocked(ctx, initMod, ownedStackBytes); err != nil {
+			return err
+		}
+		reservation, err := i.ownedAsyncifyReservationLocked(initMod, ownedStackBytes)
+		if err != nil {
+			return err
+		}
+		a.SetStackSize(ownedStackBytes)
+		a.SetDataAddr(reservation.dataAddr)
 	}
 
 	header, err := a.prepareInit(initMod)
@@ -1577,8 +1628,16 @@ func (i *WazeroInstance) EnableAsyncify(config AsyncifyConfig) error {
 		if config.DataAddr > 0 {
 			modA.SetDataAddr(config.DataAddr)
 		}
-		if i.linkerInst != nil && modIdx >= 0 {
-			modA.trusted = i.linkerInst.IsInstanceTransformed(modIdx)
+		if ownedStackBytes != 0 {
+			reservation, err := i.ownedAsyncifyReservationLocked(mod, ownedStackBytes)
+			if err != nil {
+				return nil, nil, err
+			}
+			modA.SetStackSize(ownedStackBytes)
+			modA.SetDataAddr(reservation.dataAddr)
+		}
+		if i.linkerInst != nil {
+			modA.trusted = i.linkerInst.IsModuleTransformed(mod)
 		} else {
 			modA.trusted = i.transformed
 		}
@@ -1592,6 +1651,17 @@ func (i *WazeroInstance) EnableAsyncify(config AsyncifyConfig) error {
 		modSched := NewScheduler(modA)
 		newCache[mod] = &asyncifyCoreState{asyncify: modA, scheduler: modSched}
 		return modA, modSched, nil
+	}
+
+	// An owned reservation is a per-core contract. Initialize every current
+	// Asyncify core while all ownership checks and headers are transactional,
+	// rather than deferring an unproven core until its first export call.
+	if ownedStackBytes != 0 {
+		for _, mod := range i.asyncifyStackModulesLocked(initMod) {
+			if _, _, err := resolveAsyncForMod(mod, -1); err != nil {
+				return fmt.Errorf("configure owned asyncify core %q: %w", asyncifyCoreName(mod), err)
+			}
+		}
 	}
 
 	// Rebind any existing cached export bindings consistently so they do not stay stale.
@@ -1636,6 +1706,9 @@ func (i *WazeroInstance) EnableAsyncify(config AsyncifyConfig) error {
 	}
 	// Publish state only after init and rebinding succeed
 	i.asyncifyConfig = config
+	if ownedStackBytes != 0 {
+		i.asyncifyOwnedStackBytes = ownedStackBytes
+	}
 	i.asyncifyEnabled = true
 	i.asyncify = a
 	i.scheduler = newSched
@@ -1803,17 +1876,27 @@ func (a *wazeroAllocator) setContext(ctx context.Context) {
 }
 
 func (a *wazeroAllocator) Alloc(size, align uint32) (uint32, error) {
+	if a == nil {
+		return 0, fmt.Errorf("no allocator available")
+	}
+	a.stackMutex.Lock()
+	ctx := a.currentCtx
+	a.stackMutex.Unlock()
+	return a.AllocContext(ctx, size, align)
+}
+
+// AllocContext performs allocation under the supplied execution context. It is
+// used for instance-owned reservations so an untrusted guest allocator sees the
+// caller's cancellation and linker/resource identity instead of Background.
+func (a *wazeroAllocator) AllocContext(ctx context.Context, size, align uint32) (uint32, error) {
 	if a == nil || a.allocFn == nil {
 		return 0, fmt.Errorf("no allocator available")
 	}
-
-	a.stackMutex.Lock()
-	defer a.stackMutex.Unlock()
-
-	ctx := a.currentCtx
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	a.stackMutex.Lock()
+	defer a.stackMutex.Unlock()
 
 	if a.isSimpleAlloc {
 		a.stackBuf[0] = uint64(size)

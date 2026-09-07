@@ -32,6 +32,7 @@ type InstancePre struct {
 	compFuncSources     map[uint32]compFuncSource
 	expectedFuncTypes   map[string]map[string]importSig
 	transformedModules  []bool
+	asyncifyAddedMemory []bool // exact transform provenance for memoryless source cores
 	bindings            []resolvedBinding
 	topoOrder           []int
 	compiled            []wazero.CompiledModule
@@ -81,15 +82,22 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 	}
 
 	pre := &InstancePre{
-		linker:             l,
-		component:          c,
-		transformedModules: make([]bool, len(c.Raw.CoreModules)),
+		linker:              l,
+		component:           c,
+		transformedModules:  make([]bool, len(c.Raw.CoreModules)),
+		asyncifyAddedMemory: make([]bool, len(c.Raw.CoreModules)),
 	}
 
 	// Compile all core modules (CoreModules is [][]byte)
 	for i, modBytes := range c.Raw.CoreModules {
 		// Rewrite empty module names in imports (wazero doesn't allow them)
 		modBytes = rewriteEmptyModuleNames(modBytes)
+		// Retain the source memory shape before transformation. This is used
+		// later to prove an Asyncify-created memory has no guest owner.
+		originalMetadata, err := wasm.ParseModuleMetadata(modBytes)
+		if err != nil {
+			return nil, instError("compile", i, "", "parse source module metadata", err)
+		}
 
 		// Apply asyncify transform if enabled and module isn't already asyncified
 		if l.options.AsyncifyTransform && !asyncify.IsAsyncified(modBytes) {
@@ -114,6 +122,12 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 		// Inspect the final transformed binary, not the original component:
 		// Asyncify may introduce a memory even when the input had none.
 		metadata, err := wasm.ParseModuleMetadata(modBytes)
+		if err == nil && pre.transformedModules[i] && len(originalMetadata.Memories) == 0 && originalMetadata.NumImportedMemories() == 0 && len(metadata.Memories) == 1 && metadata.NumImportedMemories() == 0 {
+			// The source module was memoryless, so it could not own active data.
+			// The sole final memory was introduced by our transformer and is
+			// reserved exclusively for Asyncify runtime state.
+			pre.asyncifyAddedMemory[i] = true
+		}
 		var compiled wazero.CompiledModule
 		if err == nil {
 			compiled, err = l.runtime.CompileModule(ctx, modBytes)

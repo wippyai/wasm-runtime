@@ -238,9 +238,10 @@ type Instance struct {
 
 // coreInstance wraps either a real wazero module or a virtual instance.
 type coreInstance struct {
-	module      api.Module
-	virtual     *VirtualInstance
-	transformed bool
+	module              api.Module
+	virtual             *VirtualInstance
+	transformed         bool
+	asyncifyAddedMemory bool
 }
 
 // moduleName returns a unique module name for this instance.
@@ -516,9 +517,11 @@ func (pre *InstancePre) NewInstanceWithCoreContext(ctx, coreCtx context.Context)
 			}
 			inst.modules = append(inst.modules, mod)
 			isTransformed := pre.isCoreModuleTransformed(int(parsedInst.ModuleIndex))
+			asyncifyAddedMemory := int(parsedInst.ModuleIndex) < len(pre.asyncifyAddedMemory) && pre.asyncifyAddedMemory[parsedInst.ModuleIndex]
 			inst.coreInstances[idx] = &coreInstance{
-				module:      mod,
-				transformed: isTransformed,
+				module:              mod,
+				transformed:         isTransformed,
+				asyncifyAddedMemory: asyncifyAddedMemory,
 			}
 
 			if err := inst.createGlobalBridges(ctx, idx, int(parsedInst.ModuleIndex), mod); err != nil {
@@ -2653,6 +2656,35 @@ func (inst *Instance) GetModule(instanceIndex int) api.Module {
 func (inst *Instance) IsInstanceTransformed(instanceIndex int) bool {
 	if ci := inst.coreInstances[instanceIndex]; ci != nil {
 		return ci.transformed
+	}
+	return false
+}
+
+// IsModuleTransformed reports exact embedded-transform provenance for mod.
+// It never infers trust from a selected sibling core.
+func (inst *Instance) IsModuleTransformed(mod api.Module) bool {
+	if inst == nil || mod == nil {
+		return false
+	}
+	for _, ci := range inst.coreInstances {
+		if ci != nil && ci.module == mod {
+			return ci.transformed
+		}
+	}
+	return false
+}
+
+// IsModuleAsyncifyMemoryAdded reports whether mod's only linear memory was
+// introduced by this linker's embedded Asyncify transform from a memoryless
+// source core. The marker is provenance, not an export-name heuristic.
+func (inst *Instance) IsModuleAsyncifyMemoryAdded(mod api.Module) bool {
+	if inst == nil || mod == nil {
+		return false
+	}
+	for _, ci := range inst.coreInstances {
+		if ci != nil && ci.module == mod {
+			return ci.asyncifyAddedMemory
+		}
 	}
 	return false
 }
