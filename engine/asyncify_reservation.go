@@ -26,10 +26,21 @@ type asyncifyReservationCandidate struct {
 
 // enableOwnedAsyncify configures Asyncify with storage allocated by a proven
 // same-memory guest allocator, or by a linker-proven Asyncify-created memory.
-// It is intentionally private: public AsyncifyConfig remains the legacy
-// compatibility path, whose default address is not an ownership proof.
+// An omitted size selects the bounded default; there is no fixed-address fallback.
 func (i *WazeroInstance) enableOwnedAsyncify(ctx context.Context, stackBytes uint32) error {
+	if stackBytes == 0 {
+		stackBytes = DefaultAsyncifyStackBytes
+	}
 	return i.enableAsyncify(ctx, AsyncifyConfig{ownedStackBytes: stackBytes})
+}
+
+// initializeAsyncify runs only during instance startup. Uninstrumented cores
+// remain synchronous; ownership failures in instrumented cores are fatal.
+func (i *WazeroInstance) initializeAsyncify(ctx context.Context, stackBytes uint32) error {
+	if len(i.asyncifyStackModulesLocked(i.instance)) == 0 {
+		return nil
+	}
+	return i.enableOwnedAsyncify(ctx, stackBytes)
 }
 
 // asyncifyStackModulesLocked returns every current core which declares the
@@ -84,6 +95,9 @@ func (i *WazeroInstance) ownedStackAllocatorLocked(mod api.Module) (*wazeroAlloc
 		return nil, false, fmt.Errorf("asyncify: owned stack requested for core %q, but it has no memory", asyncifyCoreName(mod))
 	}
 	mem := mod.Memory()
+	if i.linkerInst == nil && i.module != nil && i.module.asyncifyAddedMemory && mod == i.instance {
+		return nil, true, nil
+	}
 	if i.linkerInst != nil && i.linkerInst.IsModuleAsyncifyMemoryAdded(mod) {
 		// The linker proves this core began memoryless and the embedded
 		// transformer added its sole memory. No guest data can own an address

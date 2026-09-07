@@ -32,6 +32,8 @@ func reviewAsyncifyControls(t *testing.T, direct bool) (*Asyncify, api.Module) {
 		t.Fatal(err)
 	}
 	a := NewAsyncify()
+	// The fixture reserves [32768, 33800), outside its guest data.
+	a.SetDataAddr(32768)
 	a.trusted = direct
 	if err := a.Init(mod); err != nil {
 		t.Fatal(err)
@@ -67,7 +69,7 @@ func TestAsyncifyControlTrapPreservesCachedState(t *testing.T) {
 				}
 				before := a.GetState(ctx)
 				// Force the generated helper's stack-pointer ordering trap.
-				if !mod.Memory().WriteUint32Le(AsyncifyDataAddr, 4096) || !mod.Memory().WriteUint32Le(AsyncifyDataAddr+4, 2048) {
+				if !mod.Memory().WriteUint32Le(a.dataAddr, 4096) || !mod.Memory().WriteUint32Le(a.dataAddr+4, 2048) {
 					t.Fatal("could not corrupt stack header")
 				}
 				if err := call(ctx); err == nil {
@@ -129,6 +131,8 @@ func TestAsyncifyDirectControlsKeepLoopCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := NewAsyncify()
+	// The fixture reserves [32768, 33800), outside its guest data.
+	a.SetDataAddr(32768)
 	a.trusted = true
 	if err := a.Init(mod); err != nil {
 		t.Fatal(err)

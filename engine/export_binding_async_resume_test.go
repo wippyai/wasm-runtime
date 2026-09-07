@@ -212,8 +212,10 @@ func exportParseTransient(err error) bool {
 func instantiateTwoCoreYield(t *testing.T, mod *WazeroModule) *WazeroInstance {
 	t.Helper()
 	inst, err := mod.InstantiateWithConfig(context.Background(), &InstanceConfig{
-		EnableAsyncify:  true,
-		AsyncifyImports: []string{"env.yield"},
+		EnableAsyncify: true,
+		// These bounded fixture heaps have room for a 1 KiB owned stack.
+		AsyncifyStackBytes: 1024,
+		AsyncifyImports:    []string{"env.yield"},
 	})
 	if err != nil {
 		t.Fatalf("InstantiateWithConfig: %v", err)
@@ -230,12 +232,13 @@ func coreGlobalU32(t *testing.T, mod api.Module, name string) uint32 {
 	return uint32(g.Get())
 }
 
-func asyncifyStackPtr(t *testing.T, mem *WazeroMemory) uint32 {
+func asyncifyStackPtr(t *testing.T, binding *exportBinding) uint32 {
+	mem := binding.memory
 	t.Helper()
 	if mem == nil {
 		t.Fatal("missing core memory")
 	}
-	ptr, err := mem.ReadU32(AsyncifyDataAddr)
+	ptr, err := mem.ReadU32(binding.asyncify.dataAddr)
 	if err != nil {
 		t.Fatalf("read asyncify stack pointer: %v", err)
 	}
@@ -300,19 +303,19 @@ func TestExportBindingAsync_RealMultiCoreResume(t *testing.T) {
 		t.Fatal("expected distinct allocators")
 	}
 
-	initial1 := asyncifyStackPtr(t, b1.memory)
-	initial2 := asyncifyStackPtr(t, b2.memory)
-	if initial1 != AsyncifyDataAddr+8 {
-		t.Fatalf("core1 asyncify stack ptr = %d, want %d", initial1, AsyncifyDataAddr+8)
+	initial1 := asyncifyStackPtr(t, b1)
+	initial2 := asyncifyStackPtr(t, b2)
+	if initial1 != b1.asyncify.dataAddr+8 {
+		t.Fatalf("core1 asyncify stack ptr = %d, want %d", initial1, b1.asyncify.dataAddr+8)
 	}
-	if initial2 != AsyncifyDataAddr+8 {
-		t.Fatalf("core2 asyncify stack ptr = %d, want %d", initial2, AsyncifyDataAddr+8)
+	if initial2 != b2.asyncify.dataAddr+8 {
+		t.Fatalf("core2 asyncify stack ptr = %d, want %d", initial2, b2.asyncify.dataAddr+8)
 	}
-	if coreGlobalU32(t, b1.coreMod, "heap") != 70000 {
-		t.Fatalf("core1 heap = %d, want 70000", coreGlobalU32(t, b1.coreMod, "heap"))
+	if coreGlobalU32(t, b1.coreMod, "heap") != 71032 {
+		t.Fatalf("core1 heap = %d, want 71032", coreGlobalU32(t, b1.coreMod, "heap"))
 	}
-	if coreGlobalU32(t, b2.coreMod, "heap") != 140000 {
-		t.Fatalf("core2 heap = %d, want 140000", coreGlobalU32(t, b2.coreMod, "heap"))
+	if coreGlobalU32(t, b2.coreMod, "heap") != 141032 {
+		t.Fatalf("core2 heap = %d, want 141032", coreGlobalU32(t, b2.coreMod, "heap"))
 	}
 
 	cs1, err := inst.StartCall(ctx, "func1", "hello-core1")
@@ -322,10 +325,10 @@ func TestExportBindingAsync_RealMultiCoreResume(t *testing.T) {
 	if cs1.asyncify != b1.asyncify || cs1.scheduler != b1.scheduler {
 		t.Fatal("func1 session bound to the wrong core asyncify/scheduler")
 	}
-	if coreGlobalU32(t, b1.coreMod, "heap") <= 70000 {
+	if coreGlobalU32(t, b1.coreMod, "heap") <= 71032 {
 		t.Fatal("StartCall func1 did not allocate into core1 high-offset heap")
 	}
-	if coreGlobalU32(t, b2.coreMod, "heap") != 140000 {
+	if coreGlobalU32(t, b2.coreMod, "heap") != 141032 {
 		t.Fatalf("core2 heap moved during core1 StartCall: %d", coreGlobalU32(t, b2.coreMod, "heap"))
 	}
 
@@ -359,12 +362,12 @@ func TestExportBindingAsync_RealMultiCoreResume(t *testing.T) {
 	if coreGlobalU32(t, b2.coreMod, "entered") != 0 {
 		t.Fatalf("core2 entered during core1 suspend = %d, want 0", coreGlobalU32(t, b2.coreMod, "entered"))
 	}
-	parked1 := asyncifyStackPtr(t, b1.memory)
+	parked1 := asyncifyStackPtr(t, b1)
 	if parked1 <= initial1 {
 		t.Fatalf("core1 asyncify stack ptr = %d, want > %d after unwind", parked1, initial1)
 	}
-	if asyncifyStackPtr(t, b2.memory) != initial2 {
-		t.Fatalf("core2 asyncify stack ptr moved during core1 suspend: %d", asyncifyStackPtr(t, b2.memory))
+	if asyncifyStackPtr(t, b2) != initial2 {
+		t.Fatalf("core2 asyncify stack ptr moved during core1 suspend: %d", asyncifyStackPtr(t, b2))
 	}
 
 	mustRejectWhileParked(t, inst, "func2", "switching core while suspended is not supported")
@@ -422,7 +425,7 @@ func TestExportBindingAsync_RealMultiCoreResume(t *testing.T) {
 	if cs2.asyncify != b2.asyncify || cs2.scheduler != b2.scheduler {
 		t.Fatal("func2 session bound to the wrong core asyncify/scheduler")
 	}
-	if coreGlobalU32(t, b2.coreMod, "heap") <= 140000 {
+	if coreGlobalU32(t, b2.coreMod, "heap") <= 141032 {
 		t.Fatal("StartCall func2 did not allocate into core2 high-offset heap")
 	}
 
@@ -439,8 +442,8 @@ func TestExportBindingAsync_RealMultiCoreResume(t *testing.T) {
 	if coreGlobalU32(t, b2.coreMod, "completed") != 0 {
 		t.Fatalf("core2 completed during unwind = %d, want 0", coreGlobalU32(t, b2.coreMod, "completed"))
 	}
-	if asyncifyStackPtr(t, b2.memory) <= initial2 {
-		t.Fatalf("core2 asyncify stack ptr = %d, want > %d after unwind", asyncifyStackPtr(t, b2.memory), initial2)
+	if asyncifyStackPtr(t, b2) <= initial2 {
+		t.Fatalf("core2 asyncify stack ptr = %d, want > %d after unwind", asyncifyStackPtr(t, b2), initial2)
 	}
 
 	mustRejectWhileParked(t, inst, "func1", "switching core while suspended is not supported")

@@ -46,7 +46,7 @@ const indirectBridge3CoreWAT = `(component
   ;; Module C: imports B wrapper and has direct caller with before/after effect counters
   (core module $m_c
     (import "b_ns" "wrapped_call" (func $wrapped_call (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (global $before_count (export "before_count") (mut i32) (i32.const 0))
     (global $after_count (export "after_count") (mut i32) (i32.const 0))
     (global $token (export "token") (mut i32) (i32.const 0))

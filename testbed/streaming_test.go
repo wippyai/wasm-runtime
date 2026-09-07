@@ -165,8 +165,8 @@ func TestAsyncify_StreamingHTTP(t *testing.T) {
 
 			memory = mod.Memory()
 
-			if err := asyncify.Init(mod); err != nil {
-				t.Fatalf("init asyncify: %v", err)
+			if err := initDemoAsyncify(wasmBytes, asyncify, mod); err != nil {
+				t.Fatal(err)
 			}
 
 			countChunks := mod.ExportedFunction("count_stream_chunks")
@@ -263,7 +263,9 @@ func BenchmarkAsyncify_Streaming(b *testing.B) {
 					wazero.NewModuleConfig().WithName("bench"))
 
 				memory = mod.Memory()
-				asyncify.Init(mod)
+				if err := initDemoAsyncify(wasmBytes, asyncify, mod); err != nil {
+					b.Fatal(err)
+				}
 
 				countChunks := mod.ExportedFunction("count_stream_chunks")
 				scheduler.Run(testCtx, countChunks)
@@ -336,7 +338,9 @@ func BenchmarkAsyncify_SuspendResume(b *testing.B) {
 		}
 
 		memory = mod.Memory()
-		asyncify.Init(mod)
+		if err := initDemoAsyncify(wasmBytes, asyncify, mod); err != nil {
+			b.Fatal(err)
+		}
 
 		countChunks := mod.ExportedFunction("count_stream_chunks")
 
@@ -405,7 +409,9 @@ func TestAsyncify_StreamingProfile(t *testing.T) {
 			wazero.NewModuleConfig().WithName(fmt.Sprintf("profile_%d", iter)))
 
 		memory = mod.Memory()
-		asyncify.Init(mod)
+		if err := initDemoAsyncify(wasmBytes, asyncify, mod); err != nil {
+			t.Fatal(err)
+		}
 
 		countChunks := mod.ExportedFunction("count_stream_chunks")
 

@@ -28,7 +28,7 @@ const multiCoreWrapperWAT = `(component
   ;; Module 1: imports host yield and defines an exported wrapper function calling it directly
   (core module $m_wrapper
     (import "host_ns" "yield" (func $host_yield (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (func (export "wrapped_yield") (param $val i32) (result i32)
       (call $host_yield (local.get $val))
     )
@@ -38,7 +38,7 @@ const multiCoreWrapperWAT = `(component
   ;; Module 2: imports the wrapper function directly from Module 1, without call_indirect
   (core module $m_caller
     (import "wrapper_ns" "wrapped_yield" (func $wrapped_yield (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (global $before_count (export "before_count") (mut i32) (i32.const 0))
     (global $after_count (export "after_count") (mut i32) (i32.const 0))
     (global $token (export "token") (mut i32) (i32.const 0))
@@ -102,7 +102,7 @@ func buildChainWAT(chainLen int) string {
 	fmt.Fprintf(&sb, `
   (core module $m
     (import "chain_ns" "f" (func $chain_f (param i32) (result i32)))
-    (memory (export "memory") 1)
+    `+ownedAsyncifyTestMemory+`
     (global $count (export "count") (mut i32) (i32.const 0))
     (func (export "run") (param $val i32) (result i32)
       (global.set $count (i32.add (global.get $count) (i32.const 1)))
@@ -354,7 +354,7 @@ const twoLevelWrapperWAT = `(component
   ;; Module 3: Caller calling Module 2's wrap2
   (core module $m3
     (import "w2" "wrap2" (func $wrap2 (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (global $before (export "before") (mut i32) (i32.const 0))
     (global $after (export "after") (mut i32) (i32.const 0))
 
@@ -482,7 +482,7 @@ const arbitraryNamespacesWAT = `(component
 
   (core module $m
     (import "custom.org/services:api@1.2.0" "compute-data" (func $compute (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (func (export "run") (param $val i32) (result i32)
       (call $compute (local.get $val))
     )

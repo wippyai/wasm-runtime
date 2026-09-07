@@ -15,8 +15,8 @@ func TestAsyncify_NewAndDefaults(t *testing.T) {
 	if a.state != 0 {
 		t.Errorf("expected initial state 0, got %d", a.state)
 	}
-	if a.dataAddr != AsyncifyDataAddr {
-		t.Errorf("expected dataAddr %d, got %d", AsyncifyDataAddr, a.dataAddr)
+	if a.dataAddrSet || a.dataAddr != 0 {
+		t.Error("new controller must have no implicit storage reservation")
 	}
 	if a.stackSize != AsyncifyDefaultStackSize {
 		t.Errorf("expected stackSize %d, got %d", AsyncifyDefaultStackSize, a.stackSize)

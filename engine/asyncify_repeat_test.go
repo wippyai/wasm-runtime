@@ -197,6 +197,8 @@ func runRepeatSuspend(t *testing.T, watSrc string, asyncImports []string) {
 	t.Cleanup(func() { _ = mod.Close(ctx) })
 
 	a := NewAsyncify()
+	// The fixture reserves [32768, 33800), outside its guest data.
+	a.SetDataAddr(32768)
 	if err := a.Init(mod); err != nil {
 		t.Fatalf("asyncify init: %v", err)
 	}
@@ -480,6 +482,8 @@ func runRepeatSuspendRetptr(t *testing.T, mainWat string, mainAsync []string, sh
 func driveRecvSendLoop(ctx context.Context, t *testing.T, mod api.Module, calls *[]string, recvIdx *int, recvResults []uint64, sendArgs *[]uint64) {
 	t.Helper()
 	a := NewAsyncify()
+	// The fixture reserves [32768, 33800), outside its guest data.
+	a.SetDataAddr(32768)
 	if err := a.Init(mod); err != nil {
 		t.Fatalf("asyncify init: %v", err)
 	}

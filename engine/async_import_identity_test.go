@@ -24,7 +24,7 @@ const directCallerOlderGuestWAT = `(component
 
   (core module $m
     (import "test:async/host@0.1.0" "yield" (func $host_yield (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (global $before_count (export "before_count") (mut i32) (i32.const 0))
     (global $after_count (export "after_count") (mut i32) (i32.const 0))
     (global $token (export "token") (mut i32) (i32.const 0))
@@ -85,7 +85,7 @@ const multiversionGuestWAT = `(component
 
   (core module $m0
     (import "test:async/host@0.1.0" "yield" (func $host_yield0 (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (global $before_count (export "before_count") (mut i32) (i32.const 0))
     (global $after_count (export "after_count") (mut i32) (i32.const 0))
 
@@ -102,7 +102,7 @@ const multiversionGuestWAT = `(component
 
   (core module $m1
     (import "test:async/host@0.1.1" "yield" (func $host_yield1 (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (global $before_count (export "before_count") (mut i32) (i32.const 0))
     (global $after_count (export "after_count") (mut i32) (i32.const 0))
 
@@ -194,7 +194,7 @@ const methodNameAliasWAT = `(component
 
   (core module $m
     (import "test:async/io@0.1.0" "method-stream-flush" (func $host_flush (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (global $count (export "count") (mut i32) (i32.const 0))
     (func (export "run") (param $val i32) (result i32)
       (global.set $count (i32.add (global.get $count) (i32.const 1)))
@@ -586,7 +586,8 @@ func TestAsyncifyImportIdentity_RawCoreInstanceExportArgs(t *testing.T) {
 	// Instantiate WITHOUT manually specifying AsyncifyImports in config:
 	ctx := context.Background()
 	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{
-		EnableAsyncify: true,
+		EnableAsyncify:     true,
+		AsyncifyStackBytes: 1024, // fixture's bounded guest heap intentionally cannot hold the default reservation
 	})
 	if err != nil {
 		t.Fatalf("InstantiateWithConfig: %v", err)
@@ -720,7 +721,7 @@ const tableBeforeFunctionWAT = `(component
 
   (core module $env_mod
     (table (export "tbl") 1 2 funcref)
-    (memory (export "mem") 1)
+    (memory (export "mem") 1)` + ownedAsyncifyTestAllocator + `
   )
   (core instance $env_inst (instantiate $env_mod))
   (alias core export $env_inst "tbl" (core table $tbl))
@@ -734,6 +735,7 @@ const tableBeforeFunctionWAT = `(component
     (import "env" "tbl" (table 1 2 funcref))
     (import "env" "mem" (memory 1))
     (import "test:async/host@0.1.0" "yield" (func $host_yield (param i32) (result i32)))
+` + ownedAsyncifyTestAllocator + `
     (global $count (export "count") (mut i32) (i32.const 0))
     (func (export "run") (param $val i32) (result i32)
       (global.set $count (i32.add (global.get $count) (i32.const 1)))
@@ -787,7 +789,7 @@ const realisticAliasesChainWAT = `(component
 
   (core module $guest
     (import "env" "yield" (func $host_yield (param i32) (result i32)))
-    (memory (export "memory") 1)
+    ` + ownedAsyncifyTestMemory + `
     (global $count (export "count") (mut i32) (i32.const 0))
     (func (export "run") (param $val i32) (result i32)
       (global.set $count (i32.add (global.get $count) (i32.const 1)))

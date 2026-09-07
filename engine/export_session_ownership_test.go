@@ -6,7 +6,7 @@ func TestExportBindings_PreparedSessionOwnsInstance(t *testing.T) {
 	ctx := t.Context()
 	eng, mod := loadTwoCoreModule(t)
 	defer eng.Close(ctx)
-	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{EnableAsyncify: true})
+	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{EnableAsyncify: true, AsyncifyStackBytes: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}

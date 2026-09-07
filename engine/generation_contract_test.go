@@ -82,13 +82,17 @@ func TestGenerationRevocationPrecedesBorrowedLifetime(t *testing.T) {
 
 func TestReconfigurePreparesEveryCoreBeforeCommit(t *testing.T) {
 	ctx := context.Background()
-	eng, mod := loadTwoCoreYieldModule(t)
+	eng, mod := loadTwoCoreModule(t)
 	defer eng.Close(ctx)
-	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{EnableAsyncify: true, AsyncifyImports: []string{"env.yield"}})
+	inst, err := mod.Instantiate(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer inst.Close(ctx)
+	// Both fixture heaps start above 70000; reserve this region in each core.
+	if err := inst.EnableAsyncify(AsyncifyConfig{DataAddr: 32768, StackSize: 1024}); err != nil {
+		t.Fatal(err)
+	}
 	first, err := inst.getExportBinding("func1")
 	if err != nil {
 		t.Fatal(err)

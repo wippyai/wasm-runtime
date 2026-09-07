@@ -11,7 +11,7 @@ func TestSessionLifetimeResidentStepAndLift(t *testing.T) {
 	ctx := context.Background()
 	eng, mod := loadTwoCoreModule(t)
 	defer eng.Close(ctx)
-	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{EnableAsyncify: true})
+	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{EnableAsyncify: true, AsyncifyStackBytes: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}

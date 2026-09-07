@@ -34,6 +34,8 @@ func TestAsyncifyIndirectSuspensionDoesNotRepeatCallerEffects(t *testing.T) {
 		t.Fatal(err)
 	}
 	async := NewAsyncify()
+	// The fixture reserves [32768, 33800), outside its guest data.
+	async.SetDataAddr(32768)
 	if err := async.Init(module); err != nil {
 		t.Fatal(err)
 	}

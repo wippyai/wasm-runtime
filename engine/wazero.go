@@ -23,6 +23,7 @@ import (
 	"github.com/wippyai/wasm-runtime/memory/budget"
 	"github.com/wippyai/wasm-runtime/resource"
 	"github.com/wippyai/wasm-runtime/transcoder"
+	"github.com/wippyai/wasm-runtime/wasm"
 )
 
 type resourcesContextKey struct{}
@@ -145,8 +146,8 @@ type InstanceConfig struct {
 	Mounts          []Mount
 	EnableAsyncify  bool
 	// AsyncifyStackBytes requests an instance-owned Asyncify data header and
-	// stack reservation for each transformed core. Zero leaves legacy
-	// AsyncifyConfig behavior unchanged, including its unreserved default.
+	// stack reservation for each transformed core. Zero selects the bounded
+	// DefaultAsyncifyStackBytes reservation; allocation failures reject startup.
 	AsyncifyStackBytes uint32
 }
 
@@ -363,22 +364,23 @@ func (e *WazeroEngine) InitWASI(ctx context.Context) error {
 
 // WazeroModule is a compiled WASM module
 type WazeroModule struct {
-	engine        *WazeroEngine
-	runtime       wazero.Runtime
-	compiled      wazero.CompiledModule
-	canonRegistry *component.CanonRegistry
-	encoder       *transcoder.Encoder
-	decoder       *transcoder.Decoder
-	hostFuncs     map[string]HostFunc
-	compiler      *transcoder.Compiler
-	typeResolver  *component.TypeResolver
-	validated     *component.ValidatedComponent
-	cachedPre     *linker.InstancePre
-	linker        *linker.Linker
-	rawBytes      []byte
-	transformed   bool
-	hostFuncsMu   sync.RWMutex
-	cachedPreMu   sync.RWMutex
+	engine              *WazeroEngine
+	runtime             wazero.Runtime
+	compiled            wazero.CompiledModule
+	canonRegistry       *component.CanonRegistry
+	encoder             *transcoder.Encoder
+	decoder             *transcoder.Decoder
+	hostFuncs           map[string]HostFunc
+	compiler            *transcoder.Compiler
+	typeResolver        *component.TypeResolver
+	validated           *component.ValidatedComponent
+	cachedPre           *linker.InstancePre
+	linker              *linker.Linker
+	rawBytes            []byte
+	transformed         bool
+	asyncifyAddedMemory bool
+	hostFuncsMu         sync.RWMutex
+	cachedPreMu         sync.RWMutex
 
 	closeMu   sync.Mutex
 	compileMu sync.Mutex
@@ -847,6 +849,10 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 		m.closeMu.Unlock()
 
 		if rawBytes != nil && !asyncify.IsAsyncified(rawBytes) && len(asyncImports) > 0 {
+			originalMetadata, err := wasm.ParseModuleMetadata(rawBytes)
+			if err != nil {
+				return fmt.Errorf("parse asyncify source metadata: %w", err)
+			}
 			transformed, err := asyncify.Transform(rawBytes, asyncify.Config{
 				AsyncImports:  asyncImports,
 				ExportGlobals: true,
@@ -854,6 +860,11 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 			if err != nil {
 				return fmt.Errorf("asyncify transform: %w", err)
 			}
+			metadata, err := wasm.ParseModuleMetadata(transformed)
+			if err != nil {
+				return fmt.Errorf("parse asyncify result metadata: %w", err)
+			}
+			addedMemory := len(originalMetadata.Memories) == 0 && originalMetadata.NumImportedMemories() == 0 && len(metadata.Memories) == 1 && metadata.NumImportedMemories() == 0
 			compiled, err := m.runtime.CompileModule(ctx, transformed)
 			if err != nil {
 				return fmt.Errorf("recompile after asyncify: %w", err)
@@ -868,6 +879,7 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 			oldCompiled := m.compiled
 			m.compiled = compiled
 			m.transformed = true
+			m.asyncifyAddedMemory = addedMemory
 			m.rawBytes = transformed
 			m.closeMu.Unlock()
 
@@ -1066,17 +1078,13 @@ func (m *WazeroModule) InstantiateWithConfig(ctx context.Context, cfg *InstanceC
 		wazInst.allocatorCache[wazInst.allocFn] = wazInst.alloc
 	}
 
-	// Mirror multi-module behavior: asyncify enable is best-effort.
-	// Callers may request asyncify on modules that have no async transform.
+	// An uninstrumented core remains synchronous; an instrumented core must
+	// establish storage ownership before it can be published.
 	if cfg != nil && cfg.EnableAsyncify {
-		if cfg.AsyncifyStackBytes > 0 {
-			if err := wazInst.enableOwnedAsyncify(startupCtx, cfg.AsyncifyStackBytes); err != nil {
-				finishStartup()
-				_ = wazInst.Close(context.WithoutCancel(ctx))
-				return nil, fmt.Errorf("initialize owned asyncify stack: %w", err)
-			}
-		} else if err := wazInst.EnableAsyncify(AsyncifyConfig{}); err != nil {
-			debugf("asyncify not available for module: %v", err)
+		if err := wazInst.initializeAsyncify(startupCtx, cfg.AsyncifyStackBytes); err != nil {
+			finishStartup()
+			_ = wazInst.Close(context.WithoutCancel(ctx))
+			return nil, fmt.Errorf("initialize owned asyncify stack: %w", err)
 		}
 	}
 
@@ -1359,16 +1367,11 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 		wazInst.allocatorCache[wazInst.allocFn] = wazInst.alloc
 	}
 
-	// Enable asyncify if requested and module supports it
 	if enableAsyncify {
-		if cfg != nil && cfg.AsyncifyStackBytes > 0 {
-			if err := wazInst.enableOwnedAsyncify(startupCtx, cfg.AsyncifyStackBytes); err != nil {
-				finishStartup()
-				_ = wazInst.Close(context.WithoutCancel(ctx))
-				return nil, fmt.Errorf("initialize owned asyncify stack: %w", err)
-			}
-		} else if err := wazInst.EnableAsyncify(AsyncifyConfig{}); err != nil {
-			debugf("asyncify not available for component: %v", err)
+		if err := wazInst.initializeAsyncify(startupCtx, cfg.AsyncifyStackBytes); err != nil {
+			finishStartup()
+			_ = wazInst.Close(context.WithoutCancel(ctx))
+			return nil, fmt.Errorf("initialize owned asyncify stack: %w", err)
 		}
 	}
 
@@ -1512,12 +1515,15 @@ func (i *WazeroInstance) prepareCallContext(ctx context.Context) context.Context
 	}
 }
 
-// EnableAsyncify initializes the legacy caller-reserved Asyncify layout.
-// Applications that use InstanceConfig.AsyncifyStackBytes get the automatic,
-// allocator-proven ownership path during instantiation instead.
+// EnableAsyncify configures owned suspension storage when DataAddr is zero.
+// A positive DataAddr is an advanced contract: the caller must reserve the full
+// header and stack in each affected core memory before calling this method.
 func (i *WazeroInstance) EnableAsyncify(config AsyncifyConfig) error {
 	if config.ownedStackBytes != 0 {
 		return fmt.Errorf("asyncify: owned stack configuration is internal")
+	}
+	if config.DataAddr == 0 {
+		return i.enableOwnedAsyncify(context.Background(), config.StackSize)
 	}
 	return i.enableAsyncify(context.Background(), config)
 }

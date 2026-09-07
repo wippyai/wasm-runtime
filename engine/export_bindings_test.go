@@ -285,7 +285,7 @@ func TestExportBindings_TypedAPIs(t *testing.T) {
 
 	// 3. StartCall / Step / LiftResult
 	t.Run("StartCall and LiftResult", func(t *testing.T) {
-		asyncInst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{EnableAsyncify: true})
+		asyncInst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{EnableAsyncify: true, AsyncifyStackBytes: 1024})
 		if err != nil {
 			t.Fatalf("InstantiateWithConfig: %v", err)
 		}
@@ -358,7 +358,7 @@ func TestExportBindings_AsyncifySuspensionRejection(t *testing.T) {
 	eng, mod := loadTwoCoreModule(t)
 	defer eng.Close(ctx)
 
-	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{EnableAsyncify: true})
+	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{EnableAsyncify: true, AsyncifyStackBytes: 1024})
 	if err != nil {
 		t.Fatalf("Instantiate: %v", err)
 	}

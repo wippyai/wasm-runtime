@@ -78,7 +78,7 @@ func TestInstanceCloseJoinsPublicAsyncifyExecution(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err = inst.EnableAsyncify(AsyncifyConfig{}); err != nil {
+			if err = inst.EnableAsyncify(AsyncifyConfig{DataAddr: 32768, StackSize: 1024}); err != nil {
 				t.Fatal(err)
 			}
 			a, s := inst.Asyncify(), inst.Scheduler()

@@ -17,6 +17,17 @@ import (
 	"github.com/wippyai/wasm-runtime/wat"
 )
 
+// Standalone Asyncify controllers have no instance allocator. Reserve a
+// fixture-owned region explicitly, away from low guest addresses used by the
+// control tests themselves.
+const standaloneAsyncifyFixtureDataAddr uint32 = 32768
+
+func newExplicitFixtureAsyncify() *Asyncify {
+	a := NewAsyncify()
+	a.SetDataAddr(standaloneAsyncifyFixtureDataAddr)
+	return a
+}
+
 // TestAsyncify_DirectGlobals_RepeatedStatefulLoop tests repeated stateful asyncify
 // suspension and resume loops using the direct mutable-global control path.
 func TestAsyncify_DirectGlobals_RepeatedStatefulLoop(t *testing.T) {
@@ -78,7 +89,7 @@ func TestAsyncify_DirectGlobals_RepeatedStatefulLoop(t *testing.T) {
 	}
 	defer mod.Close(ctx)
 
-	a := NewAsyncify()
+	a := newExplicitFixtureAsyncify()
 	a.trusted = true // Trusted provenance from embedded transformer in this load
 	if err := a.Init(mod); err != nil {
 		t.Fatalf("asyncify init: %v", err)
@@ -167,7 +178,7 @@ func TestAsyncify_Fallback_PreAsyncified(t *testing.T) {
 	}
 	defer mod.Close(ctx)
 
-	a := NewAsyncify()
+	a := newExplicitFixtureAsyncify()
 	// Untrusted by default
 	if err := a.Init(mod); err != nil {
 		t.Fatalf("init: %v", err)
@@ -227,7 +238,7 @@ func TestAsyncify_Fallback_SpoofedGlobalNames(t *testing.T) {
 	}
 	defer mod.Close(ctx)
 
-	a := NewAsyncify()
+	a := newExplicitFixtureAsyncify()
 	// trusted is FALSE
 	if err := a.Init(mod); err != nil {
 		t.Fatalf("init: %v", err)
@@ -273,7 +284,7 @@ func TestAsyncify_Fallback_GuestTrap(t *testing.T) {
 	}
 	defer mod.Close(ctx)
 
-	a := NewAsyncify()
+	a := newExplicitFixtureAsyncify()
 	if err := a.Init(mod); err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -330,7 +341,7 @@ func TestAsyncify_DirectGlobals_StateTraps(t *testing.T) {
 	}
 	defer mod.Close(ctx)
 
-	a := NewAsyncify()
+	a := newExplicitFixtureAsyncify()
 	a.trusted = true
 	if err := a.Init(mod); err != nil {
 		t.Fatalf("init: %v", err)
@@ -420,17 +431,16 @@ func TestAsyncify_DirectGlobals_StackBoundsTraps(t *testing.T) {
 	}
 	defer mod.Close(ctx)
 
-	a := NewAsyncify()
+	a := newExplicitFixtureAsyncify()
 	a.trusted = true
 	if err := a.Init(mod); err != nil {
 		t.Fatalf("init: %v", err)
 	}
 
-	// Corrupt stack so stack_ptr > stack_end
-	// dataAddr is 16. stack_ptr is at offset 0 (16), stack_end is at offset 4 (20).
+	// Corrupt stack so stack_ptr > stack_end in the explicit fixture region.
 	mem := mod.Memory()
-	mem.WriteUint32Le(16, 500) // stack_ptr = 500
-	mem.WriteUint32Le(20, 100) // stack_end = 100 (500 > 100!)
+	mem.WriteUint32Le(standaloneAsyncifyFixtureDataAddr, 500)   // stack_ptr = 500
+	mem.WriteUint32Le(standaloneAsyncifyFixtureDataAddr+4, 100) // stack_end = 100 (500 > 100!)
 
 	err = a.StartUnwind(ctx)
 	if err == nil || !strings.Contains(err.Error(), "unreachable") {
@@ -486,7 +496,7 @@ func TestAsyncify_Provenance_ComponentEngine(t *testing.T) {
 		(import "env" "call" (func $call))
 		(func (export "run") (call $call))
 		(memory (export "memory") 1)
-		(func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+` + ownedAsyncifyTestAllocator + `
 	)`
 
 	raw, err := wat.Compile(watSrc)
@@ -553,7 +563,7 @@ func TestAsyncify_ConcurrencyAndRace(t *testing.T) {
 		(func (export "run") (result i32)
 			(call $step))
 		(memory (export "memory") 1)
-		(func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+` + ownedAsyncifyTestAllocator + `
 	)`
 
 	raw, err := wat.Compile(watSrc)
@@ -666,7 +676,7 @@ func benchmarkSuspension(b *testing.B, directGlobals bool) {
 	}
 	defer mod.Close(ctx)
 
-	a := NewAsyncify()
+	a := newExplicitFixtureAsyncify()
 	a.trusted = directGlobals
 	if err := a.Init(mod); err != nil {
 		b.Fatalf("init: %v", err)

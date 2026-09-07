@@ -68,25 +68,30 @@ type Asyncify struct {
 	dataAddr       uint32
 	stackSize      uint32
 	trusted        bool
+	dataAddrSet    bool
 }
 
+// AsyncifyDataAddr is retained for callers which explicitly reserve this region.
+// It is never used as an automatic storage location.
 const AsyncifyDataAddr uint32 = 16
 const AsyncifyDefaultStackSize uint32 = 1024
+
+// DefaultAsyncifyStackBytes bounds each automatically owned suspension stack.
+const DefaultAsyncifyStackBytes uint32 = 64 << 10
 
 type AsyncifyConfig struct {
 	StackSize uint32
 	DataAddr  uint32
 
 	// ownedStackBytes is set only by WazeroInstance's automatic owned-stack
-	// path. A public nonzero DataAddr remains caller-managed; its legacy zero
-	// value does not establish any reservation.
+	// path. A public nonzero DataAddr remains caller-managed; zero selects
+	// an automatically owned reservation.
 	ownedStackBytes uint32
 }
 
 func NewAsyncify() *Asyncify {
 	return &Asyncify{
 		state:     0,
-		dataAddr:  AsyncifyDataAddr,
 		stackSize: AsyncifyDefaultStackSize,
 	}
 }
@@ -100,6 +105,7 @@ func (a *Asyncify) SetStackSize(size uint32) {
 
 func (a *Asyncify) SetDataAddr(addr uint32) {
 	a.dataAddr = addr
+	a.dataAddrSet = true
 }
 
 // Init initializes caller-owned controls. Instance reconfiguration prepares all
@@ -122,6 +128,12 @@ func (a *Asyncify) Init(mod api.Module) error {
 // guest memory. The returned slice is borrowed until commit; no guest execution
 // or memory growth may occur between preparation and commit.
 func (a *Asyncify) prepareInit(mod api.Module) (asyncifyHeader, error) {
+	if !a.dataAddrSet {
+		return asyncifyHeader{}, fmt.Errorf("asyncify: caller must reserve storage and call SetDataAddr before Init")
+	}
+	if mod == nil {
+		return asyncifyHeader{}, fmt.Errorf("asyncify: module is nil")
+	}
 	a.memory = mod.Memory()
 	if a.memory == nil {
 		return asyncifyHeader{}, fmt.Errorf("asyncify: module has no memory")
