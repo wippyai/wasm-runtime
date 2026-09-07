@@ -369,6 +369,15 @@ func capabilityErrno(err error) experimentalsys.Errno {
 	if err == nil {
 		return 0
 	}
+	// Preserve an explicit WASI errno before following its syscall.Unwrap.
+	// In particular, Errno.ENOTDIR aliases ERROR_PATH_NOT_FOUND on Windows and
+	// Errno.EACCES aliases a standard permission sentinel, so generic errors.Is
+	// checks below would otherwise turn those deliberate results into ENOENT and
+	// EPERM. errors.As also traverses wrapped and joined errors.
+	var errno experimentalsys.Errno
+	if errors.As(err, &errno) {
+		return errno
+	}
 	// Check standard sentinel chains before falling back to Wazero's direct
 	// unwrapping, which intentionally only recognizes a single PathError.
 	switch {
@@ -384,10 +393,6 @@ func capabilityErrno(err error) experimentalsys.Errno {
 		return experimentalsys.EBADF
 	case errors.Is(err, errors.ErrUnsupported):
 		return experimentalsys.ENOSYS
-	}
-	var errno experimentalsys.Errno
-	if errors.As(err, &errno) {
-		return errno
 	}
 	var syscallErrno syscall.Errno
 	if errors.As(err, &syscallErrno) {

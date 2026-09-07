@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -445,6 +446,8 @@ func TestCapabilityErrnoNormalizesNestedAndJoinedErrors(t *testing.T) {
 		{name: "invalid", err: errors.Join(errors.New("context"), fs.ErrInvalid), want: experimentalsys.EINVAL},
 		{name: "closed", err: errors.Join(errors.New("context"), fs.ErrClosed), want: experimentalsys.EBADF},
 		{name: "unsupported", err: errors.Join(errors.New("context"), errors.ErrUnsupported), want: experimentalsys.ENOSYS},
+		{name: "wrapped-explicit-access", err: fmt.Errorf("open capability: %w", experimentalsys.EACCES), want: experimentalsys.EACCES},
+		{name: "joined-explicit-not-directory", err: errors.Join(errors.New("context"), experimentalsys.ENOTDIR), want: experimentalsys.ENOTDIR},
 		{name: "wazero-errno", err: errors.Join(errors.New("context"), experimentalsys.ELOOP), want: experimentalsys.ELOOP},
 		{name: "syscall-loop", err: errors.Join(errors.New("context"), syscall.ELOOP), want: experimentalsys.ELOOP},
 		{name: "syscall-not-directory", err: &fs.PathError{Op: "open", Path: "directory", Err: syscall.ENOTDIR}, want: syscallNotDirectory},
