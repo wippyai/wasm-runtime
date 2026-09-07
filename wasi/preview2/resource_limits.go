@@ -403,6 +403,14 @@ func (b *HostBufferBudget) reserve(bytes uint64) (*budget.Reservation, error) {
 	return reservation, nil
 }
 
+// Reserve admits a resident host buffer before allocation. The resource owner
+// must retain the returned reservation until all users of the backing storage
+// have stopped, including background I/O after a handle is dropped. A nil budget
+// preserves the unbounded configuration and returns a nil reservation.
+func (b *HostBufferBudget) Reserve(bytes uint64) (*budget.Reservation, error) {
+	return b.reserve(bytes)
+}
+
 // NewResourceTableWithBudgets creates a bounded resource table with an optional
 // explicit host-buffer domain. hostBuffers is independent of socket count and
 // guest linear-memory configuration.

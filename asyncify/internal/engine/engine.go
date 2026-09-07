@@ -129,11 +129,29 @@ func DefaultRegistry() *handler.Registry {
 //  5. Adds asyncify export functions
 //  6. Encodes and returns the result
 func (e *Engine) Transform(wasmData []byte) ([]byte, error) {
+	// The emitter and host controller currently share a wasm32, memory-0
+	// address contract. Reject unsupported modes before changing the module.
+	if e.wasm64 {
+		return nil, fmt.Errorf("asyncify: wasm64 is not supported")
+	}
+	if e.useSecondaryMemory || e.memoryIndex != 0 {
+		return nil, fmt.Errorf("asyncify: secondary or nonzero memory selection is not supported")
+	}
 	m, err := wasm.ParseModule(wasmData)
 	if err != nil {
 		return nil, fmt.Errorf("parse module: %w", err)
 	}
 
+	for _, mem := range m.Memories {
+		if mem.Limits.Memory64 {
+			return nil, fmt.Errorf("asyncify: memory64 is not supported")
+		}
+	}
+	for _, imp := range m.Imports {
+		if imp.Desc.Kind == wasm.KindMemory && imp.Desc.Memory != nil && imp.Desc.Memory.Limits.Memory64 {
+			return nil, fmt.Errorf("asyncify: imported memory64 is not supported")
+		}
+	}
 	if err := validateInputIdentities(m); err != nil {
 		return nil, fmt.Errorf("input module identities: %w", err)
 	}
@@ -143,8 +161,8 @@ func (e *Engine) Transform(wasmData []byte) ([]byte, error) {
 		return nil, fmt.Errorf("module is already asyncified (has asyncify exports); re-asyncifying is not supported")
 	}
 
-	// Check for conflicting asyncify imports and remove them
-	if err := e.removeAsyncifyConflicts(m); err != nil {
+	// Reserved protocol identities cannot be silently deleted or retargeted.
+	if err := e.validateAsyncifyConflicts(m); err != nil {
 		return nil, err
 	}
 
@@ -572,119 +590,27 @@ func (e *Engine) isPreAsyncified(m *wasm.Module) bool {
 
 // removeAsyncifyConflicts checks for and removes existing asyncify imports.
 // This prevents conflicts when adding our own asyncify exports.
-func (e *Engine) removeAsyncifyConflicts(m *wasm.Module) error {
-	asyncifyFuncs := map[string]bool{
-		"asyncify_start_unwind": true,
-		"asyncify_stop_unwind":  true,
-		"asyncify_start_rewind": true,
-		"asyncify_stop_rewind":  true,
-		"asyncify_get_state":    true,
+// validateAsyncifyConflicts preserves every source function identity. Import
+// removal needs a complete replacement protocol across calls, exports, start,
+// elements and reference expressions; guessing from names cannot provide one.
+func (e *Engine) validateAsyncifyConflicts(m *wasm.Module) error {
+	reserved := func(name string) bool {
+		switch name {
+		case "asyncify_start_unwind", "asyncify_stop_unwind", "asyncify_start_rewind", "asyncify_stop_rewind", "asyncify_get_state":
+			return true
+		}
+		return false
 	}
-
-	// Check for imports from "asyncify" module or with asyncify function names
-	// Track which function indices are being removed
-	var toRemove []int
-	var funcIndicesToRemove []uint32
-	funcIdx := uint32(0)
-	for i, imp := range m.Imports {
-		if imp.Desc.Kind == wasm.KindFunc {
-			if imp.Module == "asyncify" || asyncifyFuncs[imp.Name] {
-				toRemove = append(toRemove, i)
-				funcIndicesToRemove = append(funcIndicesToRemove, funcIdx)
-			}
-			funcIdx++
+	for _, imp := range m.Imports {
+		if imp.Desc.Kind == wasm.KindFunc && (imp.Module == "asyncify" || reserved(imp.Name)) {
+			return fmt.Errorf("asyncify: conflicting protocol import %q.%q", imp.Module, imp.Name)
 		}
 	}
-
-	// Remove conflicting imports if any (in reverse order to preserve indices)
-	if len(toRemove) > 0 {
-		for i := len(toRemove) - 1; i >= 0; i-- {
-			idx := toRemove[i]
-			m.Imports = append(m.Imports[:idx], m.Imports[idx+1:]...)
-		}
-
-		// Build reindex map: old function index -> new function index
-		reindexFunc := func(oldIdx uint32) uint32 {
-			offset := uint32(0)
-			for _, removedIdx := range funcIndicesToRemove {
-				if oldIdx > removedIdx {
-					offset++
-				} else if oldIdx == removedIdx {
-					return ^uint32(0) // should not happen for valid references
-				}
-			}
-			return oldIdx - offset
-		}
-
-		// Update function references in exports
-		for i := range m.Exports {
-			if m.Exports[i].Kind == wasm.KindFunc {
-				m.Exports[i].Idx = reindexFunc(m.Exports[i].Idx)
-			}
-		}
-
-		// Update start function if present
-		if m.Start != nil {
-			newStart := reindexFunc(*m.Start)
-			m.Start = &newStart
-		}
-
-		// Update table element segments
-		for i := range m.Elements {
-			for j := range m.Elements[i].FuncIdxs {
-				m.Elements[i].FuncIdxs[j] = reindexFunc(m.Elements[i].FuncIdxs[j])
-			}
-		}
-
-		// Update call instructions in all function bodies
-		numImported := uint32(m.NumImportedFuncs())
-		for i := range m.Code {
-			funcIdx := numImported + uint32(i)
-			instrs, err := wasm.DecodeInstructions(m.Code[i].Code)
-			if err != nil {
-				return fmt.Errorf("decode func %d: %w", funcIdx, err)
-			}
-			modified := false
-			for j := range instrs {
-				switch instrs[j].Opcode {
-				case wasm.OpCall:
-					if imm, ok := instrs[j].Imm.(wasm.CallImm); ok {
-						newIdx := reindexFunc(imm.FuncIdx)
-						if newIdx != imm.FuncIdx {
-							instrs[j].Imm = wasm.CallImm{FuncIdx: newIdx}
-							modified = true
-						}
-					}
-				case wasm.OpRefFunc:
-					if imm, ok := instrs[j].Imm.(wasm.RefFuncImm); ok {
-						newIdx := reindexFunc(imm.FuncIdx)
-						if newIdx != imm.FuncIdx {
-							instrs[j].Imm = wasm.RefFuncImm{FuncIdx: newIdx}
-							modified = true
-						}
-					}
-				}
-			}
-			if modified {
-				m.Code[i].Code = wasm.EncodeInstructions(instrs)
-			}
+	for _, exp := range m.Exports {
+		if reserved(exp.Name) {
+			return fmt.Errorf("asyncify: conflicting protocol export %q", exp.Name)
 		}
 	}
-
-	// Check for existing exports with asyncify names (always check, even if no imports removed)
-	var exportRemove []int
-	for i, exp := range m.Exports {
-		if asyncifyFuncs[exp.Name] {
-			exportRemove = append(exportRemove, i)
-		}
-	}
-
-	// Remove conflicting exports (in reverse order)
-	for i := len(exportRemove) - 1; i >= 0; i-- {
-		idx := exportRemove[i]
-		m.Exports = append(m.Exports[:idx], m.Exports[idx+1:]...)
-	}
-
 	return nil
 }
 

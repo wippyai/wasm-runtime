@@ -802,7 +802,7 @@ func TestBinaryen_PropagateAddList(t *testing.T) {
 	}
 }
 
-// TestBinaryen_SecondaryMemory verifies asyncify can use a separate memory.
+// Secondary-memory code generation is not implemented; reject rather than corrupt memory.
 func TestBinaryen_SecondaryMemory(t *testing.T) {
 	m := &wasm.Module{
 		Types: []wasm.FuncType{
@@ -827,34 +827,8 @@ func TestBinaryen_SecondaryMemory(t *testing.T) {
 		SecondaryMemoryPages: 2,
 	})
 	result, err := eng.Transform(m.Encode())
-	if err != nil {
-		t.Fatalf("Transform: %v", err)
-	}
-
-	transformed, _ := wasm.ParseModule(result)
-
-	// Should have 2 memories now
-	if len(transformed.Memories) != 2 {
-		t.Errorf("expected 2 memories, got %d", len(transformed.Memories))
-	}
-
-	// Check secondary memory has correct size
-	if len(transformed.Memories) >= 2 {
-		if transformed.Memories[1].Limits.Min != 2 {
-			t.Errorf("secondary memory should have 2 pages, got %d", transformed.Memories[1].Limits.Min)
-		}
-	}
-
-	// Should have export for secondary memory
-	hasMemExport := false
-	for _, exp := range transformed.Exports {
-		if exp.Name == "asyncify_memory" && exp.Kind == wasm.KindMemory {
-			hasMemExport = true
-			break
-		}
-	}
-	if !hasMemExport {
-		t.Error("missing asyncify_memory export")
+	if err == nil || result != nil {
+		t.Fatalf("unsupported memory mode must fail without output: %v", err)
 	}
 }
 
@@ -1260,7 +1234,7 @@ func TestBinaryen_OnlyList(t *testing.T) {
 	}
 }
 
-// TestBinaryen_Wasm64 verifies that Wasm64 option uses i64 pointers in exports.
+// Wasm64 must fail until both frame operations and control pointers support it.
 func TestBinaryen_Wasm64(t *testing.T) {
 	watSrc := `(module
 		(import "env" "async" (func $async (result i32)))
@@ -1278,46 +1252,8 @@ func TestBinaryen_Wasm64(t *testing.T) {
 		Wasm64:  true,
 	})
 	transformed, err := eng.Transform(wasmData)
-	if err != nil {
-		t.Fatalf("transform failed: %v", err)
-	}
-
-	m, err := wasm.ParseModule(transformed)
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-
-	// Find asyncify_start_unwind export and check its parameter type
-	var startUnwindIdx uint32
-	found := false
-	for _, exp := range m.Exports {
-		if exp.Name == "asyncify_start_unwind" {
-			startUnwindIdx = exp.Idx
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("asyncify_start_unwind export not found")
-	}
-
-	// Get the function's type
-	numImported := uint32(m.NumImportedFuncs())
-	funcBody := m.Code[startUnwindIdx-numImported]
-	funcTypeIdx := m.Funcs[startUnwindIdx-numImported]
-	funcType := m.Types[funcTypeIdx]
-
-	// With Wasm64, the parameter should be i64
-	if len(funcType.Params) != 1 {
-		t.Fatalf("expected 1 param, got %d", len(funcType.Params))
-	}
-	if funcType.Params[0] != wasm.ValI64 {
-		t.Errorf("Wasm64: expected i64 param, got %v", funcType.Params[0])
-	}
-
-	// Verify the function body is non-empty
-	if len(funcBody.Code) == 0 {
-		t.Error("asyncify_start_unwind has empty body")
+	if err == nil || transformed != nil {
+		t.Fatalf("unsupported memory mode must fail without output: %v", err)
 	}
 }
 

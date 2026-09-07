@@ -151,6 +151,12 @@ func HasAsyncifyProtocolExports(m *wasm.Module) bool {
 type ImportMatcher = engine.ImportMatcher
 
 // Config configures the asyncify transformation.
+//
+// The supported address contract is wasm32 using memory zero. Wasm64,
+// UseSecondaryMemory and a nonzero MemoryIndex are rejected: their complete
+// code-generation and controller contracts are not implemented. Memory64 inputs
+// are rejected even when Wasm64 is not set. Reserved protocol-name collisions
+// are errors; transformation never silently deletes source imports or exports.
 type Config struct {
 	OnlyList             FunctionMatcher
 	Matcher              ImportMatcher

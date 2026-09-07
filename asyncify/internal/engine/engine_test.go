@@ -1174,7 +1174,7 @@ func TestEngine_AllowsExceptionHandlingInNonAsyncPath(t *testing.T) {
 	_ = err
 }
 
-func TestEngine_RemoveAsyncifyImports_ReindexesCalls(t *testing.T) {
+func TestEngine_RejectAsyncifyImports(t *testing.T) {
 	// Test that when asyncify imports are removed, function indices are updated.
 	// Bug scenario:
 	// - Function 0: asyncify_start_unwind (import)
@@ -1208,68 +1208,8 @@ func TestEngine_RemoveAsyncifyImports_ReindexesCalls(t *testing.T) {
 	})
 
 	result, err := eng.Transform(m.Encode())
-	if err != nil {
-		t.Fatalf("Transform failed: %v", err)
-	}
-
-	out, err := wasm.ParseModule(result)
-	if err != nil {
-		t.Fatalf("parse result: %v", err)
-	}
-
-	// After removing asyncify import:
-	// - Function 0 should now be env.other
-	// - The call in code should be updated to call 0, not still call 1
-
-	// Verify asyncify import was removed
-	for _, imp := range out.Imports {
-		if imp.Module == "asyncify" {
-			t.Error("asyncify import should have been removed")
-		}
-	}
-
-	// Count function imports - should be 1 (env.other only)
-	funcImportCount := 0
-	for _, imp := range out.Imports {
-		if imp.Desc.Kind == wasm.KindFunc {
-			funcImportCount++
-		}
-	}
-	if funcImportCount != 1 {
-		t.Errorf("expected 1 function import after removal, got %d", funcImportCount)
-	}
-
-	// Validate the module is well-formed
-	if err := out.Validate(); err != nil {
-		t.Errorf("module validation failed after asyncify import removal: %v", err)
-	}
-
-	// Verify async call targets the correct function (env.other = index 0 after removal)
-	// Decode first code body (the transformed local function)
-	if len(out.Code) > 0 {
-		instrs, err := wasm.DecodeInstructions(out.Code[0].Code)
-		if err != nil {
-			t.Fatalf("decode code: %v", err)
-		}
-
-		// Find all direct call instructions in the transformed code
-		// The async call to env.other should now reference index 0 (not 1)
-		foundCallToAsyncImport := false
-		for _, instr := range instrs {
-			if instr.Opcode == wasm.OpCall {
-				if imm, ok := instr.Imm.(wasm.CallImm); ok {
-					// env.other was index 1, should now be index 0
-					if imm.FuncIdx == 0 {
-						foundCallToAsyncImport = true
-					}
-				}
-			}
-		}
-
-		// We expect to find a call to the async import (now at index 0)
-		if !foundCallToAsyncImport {
-			t.Error("no call to async import (index 0) found; indices may not have been updated")
-		}
+	if err == nil || result != nil {
+		t.Fatalf("conflicting imports must fail without output: %v", err)
 	}
 }
 
@@ -1683,119 +1623,16 @@ func TestEngine_ValidateAsyncFuncs_AtomicPrefix(t *testing.T) {
 	}
 }
 
-func TestEngine_RemoveAsyncifyConflicts(t *testing.T) {
-	eng := New(Config{})
-
-	t.Run("removes_asyncify_module_imports", func(t *testing.T) {
-		m := &wasm.Module{
-			Types: []wasm.FuncType{{}},
-			Imports: []wasm.Import{
-				{Module: "asyncify", Name: "start_unwind", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
-				{Module: "env", Name: "other", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
-			},
-			Funcs: []uint32{0},
-			Exports: []wasm.Export{
-				{Name: "test", Kind: 0, Idx: 2},
-			},
-			Code: []wasm.FuncBody{{
-				Code: wasm.EncodeInstructions([]wasm.Instruction{
-					{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 1}}, // call env.other
-					{Opcode: wasm.OpEnd},
-				}),
-			}},
+func TestEngine_RejectAsyncifyConflicts(t *testing.T) {
+	for _, name := range []string{"asyncify_start_unwind", "asyncify_stop_unwind", "asyncify_start_rewind", "asyncify_stop_rewind", "asyncify_get_state"} {
+		m := &wasm.Module{Imports: []wasm.Import{{Module: "env", Name: name, Desc: wasm.ImportDesc{Kind: wasm.KindFunc}}}}
+		if err := New(Config{}).validateAsyncifyConflicts(m); err == nil {
+			t.Fatalf("accepted reserved import %s", name)
 		}
-
-		err := eng.removeAsyncifyConflicts(m)
-		if err != nil {
-			t.Fatal(err)
-		}
-
 		if len(m.Imports) != 1 {
-			t.Errorf("expected 1 import after removal, got %d", len(m.Imports))
+			t.Fatal("rejection mutated imports")
 		}
-		if m.Imports[0].Module != "env" {
-			t.Error("wrong import remained")
-		}
-	})
-
-	t.Run("removes_asyncify_named_imports", func(t *testing.T) {
-		m := &wasm.Module{
-			Types: []wasm.FuncType{{}},
-			Imports: []wasm.Import{
-				{Module: "env", Name: "asyncify_start_unwind", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
-				{Module: "env", Name: "asyncify_stop_unwind", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
-				{Module: "env", Name: "normal_func", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
-			},
-			Funcs: []uint32{0},
-			Code: []wasm.FuncBody{{
-				Code: wasm.EncodeInstructions([]wasm.Instruction{
-					{Opcode: wasm.OpEnd},
-				}),
-			}},
-		}
-
-		err := eng.removeAsyncifyConflicts(m)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if len(m.Imports) != 1 {
-			t.Errorf("expected 1 import, got %d", len(m.Imports))
-		}
-	})
-
-	t.Run("updates_start_function", func(t *testing.T) {
-		startIdx := uint32(2)
-		m := &wasm.Module{
-			Types: []wasm.FuncType{{}},
-			Imports: []wasm.Import{
-				{Module: "asyncify", Name: "func", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
-				{Module: "env", Name: "other", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
-			},
-			Funcs: []uint32{0},
-			Start: &startIdx,
-			Code: []wasm.FuncBody{{
-				Code: wasm.EncodeInstructions([]wasm.Instruction{{Opcode: wasm.OpEnd}}),
-			}},
-		}
-
-		err := eng.removeAsyncifyConflicts(m)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if *m.Start != 1 {
-			t.Errorf("start function should be reindexed to 1, got %d", *m.Start)
-		}
-	})
-
-	t.Run("updates_element_segments", func(t *testing.T) {
-		m := &wasm.Module{
-			Types: []wasm.FuncType{{}},
-			Imports: []wasm.Import{
-				{Module: "asyncify", Name: "func", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
-				{Module: "env", Name: "other", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
-			},
-			Funcs:  []uint32{0},
-			Tables: []wasm.TableType{{ElemType: 0x70, Limits: wasm.Limits{Min: 1}}},
-			Elements: []wasm.Element{
-				{FuncIdxs: []uint32{1, 2}}, // env.other and local func
-			},
-			Code: []wasm.FuncBody{{
-				Code: wasm.EncodeInstructions([]wasm.Instruction{{Opcode: wasm.OpEnd}}),
-			}},
-		}
-
-		err := eng.removeAsyncifyConflicts(m)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// After removing asyncify import at 0, indices should shift down
-		if m.Elements[0].FuncIdxs[0] != 0 || m.Elements[0].FuncIdxs[1] != 1 {
-			t.Errorf("element indices not reindexed: %v", m.Elements[0].FuncIdxs)
-		}
-	})
+	}
 }
 
 func TestEngine_Transform_WithImportedMemory(t *testing.T) {
@@ -2022,42 +1859,8 @@ func TestEngine_Transform_SecondaryMemoryWithImportedMemory(t *testing.T) {
 	})
 	wasmData := m.Encode()
 	result, err := eng.Transform(wasmData)
-	if err != nil {
-		t.Fatalf("Transform failed: %v", err)
-	}
-
-	// Parse and verify secondary memory was added
-	parsed, err := wasm.ParseModule(result)
-	if err != nil {
-		t.Fatalf("parse result: %v", err)
-	}
-
-	// Should have 1 imported memory + 1 secondary memory
-	importedMems := 0
-	for _, imp := range parsed.Imports {
-		if imp.Desc.Kind == 2 {
-			importedMems++
-		}
-	}
-	if importedMems != 1 {
-		t.Errorf("expected 1 imported memory, got %d", importedMems)
-	}
-	if len(parsed.Memories) != 1 {
-		t.Errorf("expected 1 local memory (secondary), got %d", len(parsed.Memories))
-	}
-
-	// Verify asyncify_memory export
-	hasAsyncifyMemory := false
-	for _, exp := range parsed.Exports {
-		if exp.Name == "asyncify_memory" {
-			hasAsyncifyMemory = true
-			if exp.Idx != 1 {
-				t.Errorf("asyncify_memory should be memory index 1 (after imported), got %d", exp.Idx)
-			}
-		}
-	}
-	if !hasAsyncifyMemory {
-		t.Error("missing asyncify_memory export")
+	if err == nil {
+		t.Fatalf("secondary memory must fail, got %d bytes", len(result))
 	}
 }
 
@@ -2116,16 +1919,8 @@ func TestEngine_RemoveAsyncifyConflicts_StartFunction(t *testing.T) {
 
 	eng := New(Config{Matcher: newExactMatcher([]string{"env.other"})})
 	result, err := eng.Transform(m.Encode())
-	if err != nil {
-		t.Fatalf("Transform: %v", err)
-	}
-
-	parsed, _ := wasm.ParseModule(result)
-	if parsed.Start == nil {
-		t.Fatal("start function should be preserved")
-	}
-	if *parsed.Start != 1 {
-		t.Errorf("start function should be reindexed to 1, got %d", *parsed.Start)
+	if err == nil || result != nil {
+		t.Fatalf("conflict must fail without output: %v", err)
 	}
 }
 
@@ -2154,16 +1949,8 @@ func TestEngine_RemoveAsyncifyConflicts_Elements(t *testing.T) {
 
 	eng := New(Config{Matcher: newExactMatcher([]string{"env.target"})})
 	result, err := eng.Transform(m.Encode())
-	if err != nil {
-		t.Fatalf("Transform: %v", err)
-	}
-
-	parsed, _ := wasm.ParseModule(result)
-	if len(parsed.Elements) == 0 || len(parsed.Elements[0].FuncIdxs) == 0 {
-		t.Fatal("element segment should be preserved")
-	}
-	if parsed.Elements[0].FuncIdxs[0] != 1 {
-		t.Errorf("element func idx should be reindexed to 1, got %d", parsed.Elements[0].FuncIdxs[0])
+	if err == nil || result != nil {
+		t.Fatalf("conflict must fail without output: %v", err)
 	}
 }
 
@@ -2190,25 +1977,8 @@ func TestEngine_RemoveAsyncifyConflicts_RefFunc(t *testing.T) {
 
 	eng := New(Config{Matcher: newExactMatcher([]string{"env.target"})})
 	result, err := eng.Transform(m.Encode())
-	if err != nil {
-		t.Fatalf("Transform: %v", err)
-	}
-
-	parsed, _ := wasm.ParseModule(result)
-	instrs, _ := wasm.DecodeInstructions(parsed.Code[0].Code)
-	found := false
-	for _, instr := range instrs {
-		if instr.Opcode == wasm.OpRefFunc {
-			if imm, ok := instr.Imm.(wasm.RefFuncImm); ok {
-				found = true
-				if imm.FuncIdx != 1 {
-					t.Errorf("ref.func idx should be 1, got %d", imm.FuncIdx)
-				}
-			}
-		}
-	}
-	if !found {
-		t.Error("ref.func instruction not found in transformed code")
+	if err == nil || result != nil {
+		t.Fatalf("conflict must fail without output: %v", err)
 	}
 }
 
@@ -2230,20 +2000,8 @@ func TestEngine_RemoveAsyncifyConflicts_ExistingExports(t *testing.T) {
 
 	eng := New(Config{})
 	result, err := eng.Transform(m.Encode())
-	if err != nil {
-		t.Fatalf("Transform: %v", err)
-	}
-
-	parsed, _ := wasm.ParseModule(result)
-	// Verify my_func is still there
-	found := false
-	for _, exp := range parsed.Exports {
-		if exp.Name == "my_func" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("my_func export should be preserved")
+	if err == nil || result != nil {
+		t.Fatalf("conflict must fail without output: %v", err)
 	}
 }
 
