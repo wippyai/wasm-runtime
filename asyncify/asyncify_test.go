@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/wippyai/wasm-runtime/asyncify/internal/testutil"
 	"github.com/wippyai/wasm-runtime/wasm"
 	"github.com/wippyai/wasm-runtime/wat"
 )
@@ -203,9 +204,7 @@ func TestTransform_TransitiveAsync(t *testing.T) {
 	numUserFuncs := 2
 	for i := 0; i < numUserFuncs; i++ {
 		body := out.Code[i]
-		if len(body.Locals) < 10 {
-			t.Errorf("func %d: expected at least 10 scratch locals, got %d", i, len(body.Locals))
-		}
+		testutil.RequireContinuationFrame(t, out, body)
 	}
 }
 
@@ -413,9 +412,7 @@ func TestTransform_WITMatcher(t *testing.T) {
 		t.Fatalf("parse result: %v", err)
 	}
 
-	if len(out.Code[0].Locals) < 10 {
-		t.Errorf("expected at least 10 scratch locals, got %d", len(out.Code[0].Locals))
-	}
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
 }
 
 // Integration tests using WAT fixtures
@@ -479,10 +476,11 @@ func TestTransform_FromWATFixture(t *testing.T) {
 		t.Errorf("expected at least 2 asyncify globals, got %d", len(out.Globals))
 	}
 
-	// Verify function was transformed (has scratch locals)
-	if len(out.Code) > 0 && len(out.Code[0].Locals) < 10 {
-		t.Errorf("expected at least 10 scratch locals, got %d", len(out.Code[0].Locals))
+	// Verify continuation code, independent of scratch-local layout.
+	if len(out.Code) == 0 {
+		t.Fatal("missing transformed function")
 	}
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
 }
 
 func TestTransform_OutputStructure(t *testing.T) {
@@ -528,10 +526,8 @@ func TestTransform_OutputStructure(t *testing.T) {
 
 	body := out.Code[0]
 
-	// Must have scratch locals
-	if len(body.Locals) < 10 {
-		t.Errorf("expected at least 10 scratch locals, got %d", len(body.Locals))
-	}
+	// Must access continuation state and frame memory
+	testutil.RequireContinuationFrame(t, out, body)
 
 	// Decode instructions and check for asyncify patterns
 	instrs, err := wasm.DecodeInstructions(body.Code)
@@ -663,10 +659,8 @@ func TestTransform_AsyncImportsConfig(t *testing.T) {
 		t.Fatalf("parse result: %v", err)
 	}
 
-	// Should have transformed (has scratch locals)
-	if len(out.Code[0].Locals) < 10 {
-		t.Errorf("expected transformation with AsyncImports, got %d locals", len(out.Code[0].Locals))
-	}
+	// Must contain a continuation frame
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
 }
 
 func TestTransform_AsyncImportsWithFallback(t *testing.T) {
@@ -679,13 +673,16 @@ func TestTransform_AsyncImportsWithFallback(t *testing.T) {
 			{Module: "env", Name: "sleep", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
 			{Module: "wasi", Name: "wait", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
 		},
-		Funcs: []uint32{0},
+		Funcs: []uint32{0, 0},
 		Exports: []wasm.Export{
 			{Name: "test", Kind: 0, Idx: 2},
 		},
 		Code: []wasm.FuncBody{
 			{Code: wasm.EncodeInstructions([]wasm.Instruction{
 				{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}},
+				{Opcode: wasm.OpEnd},
+			})},
+			{Code: wasm.EncodeInstructions([]wasm.Instruction{
 				{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 1}},
 				{Opcode: wasm.OpEnd},
 			})},
@@ -707,9 +704,8 @@ func TestTransform_AsyncImportsWithFallback(t *testing.T) {
 	}
 
 	// Both should be detected as async
-	if len(out.Code[0].Locals) < 10 {
-		t.Error("expected both imports to trigger transformation")
-	}
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
+	testutil.RequireContinuationFrame(t, out, out.Code[1])
 }
 
 func TestTransform_AsyncImportsNameOnly(t *testing.T) {
@@ -744,9 +740,7 @@ func TestTransform_AsyncImportsNameOnly(t *testing.T) {
 		t.Fatalf("parse result: %v", err)
 	}
 
-	if len(out.Code[0].Locals) < 10 {
-		t.Error("expected name-only pattern to match")
-	}
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
 }
 
 func TestTransform_NonI32Types(t *testing.T) {

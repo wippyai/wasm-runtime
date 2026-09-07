@@ -310,7 +310,12 @@ func TestCallSession_PostReturn_NoCleanupOnDecodeError(t *testing.T) {
 	}
 
 	// Verify post-return was NOT called
-	getCalls := inst.GetExportedFunction("get_post_return_called")
+	if _, rawErr := inst.GetExportedFunction("get_post_return_called").Call(ctx); rawErr == nil {
+		t.Fatal("public raw execution accepted after failed lift")
+	}
+	// Inspect the fixture's counter through the private backend hook: public
+	// execution correctly refuses reuse after failed canonical finalization.
+	getCalls := inst.getExportedFunction("get_post_return_called")
 	res, errCalls := getCalls.Call(ctx)
 	if errCalls != nil || len(res) != 1 || res[0] != 0 {
 		t.Fatalf("expected post-return not called (0), got %v", res)
@@ -320,15 +325,17 @@ func TestCallSession_PostReturn_NoCleanupOnDecodeError(t *testing.T) {
 // TestCallSession_PostReturn_IndirectResultErrors verifies validation of raw results
 // for indirect calls.
 func TestCallSession_PostReturn_IndirectResultErrors(t *testing.T) {
-	_, inst, cleanup := setupPostReturnInstance(t)
-	defer cleanup()
-
 	ctx := context.Background()
 
 	t.Run("empty rawResults for indirect return", func(t *testing.T) {
+		_, inst, cleanup := setupPostReturnInstance(t)
+		defer cleanup()
 		session, err := inst.StartCall(ctx, "echo_str")
 		if err != nil {
 			t.Fatalf("StartCall: %v", err)
+		}
+		if _, stepErr := session.Step(ctx, nil); stepErr != nil {
+			t.Fatal(stepErr)
 		}
 		_, err = session.LiftResult(ctx, []uint64{})
 		if err == nil || err.Error() != "indirect result requires one return pointer" {
@@ -343,9 +350,14 @@ func TestCallSession_PostReturn_IndirectResultErrors(t *testing.T) {
 	})
 
 	t.Run("too many rawResults for indirect return", func(t *testing.T) {
+		_, inst, cleanup := setupPostReturnInstance(t)
+		defer cleanup()
 		session, err := inst.StartCall(ctx, "echo_str")
 		if err != nil {
 			t.Fatalf("StartCall: %v", err)
+		}
+		if _, stepErr := session.Step(ctx, nil); stepErr != nil {
+			t.Fatal(stepErr)
 		}
 		_, err = session.LiftResult(ctx, []uint64{100, 200})
 		if err == nil || err.Error() != "indirect result requires one return pointer" {
@@ -354,9 +366,14 @@ func TestCallSession_PostReturn_IndirectResultErrors(t *testing.T) {
 	})
 
 	t.Run("empty rawResults for direct return", func(t *testing.T) {
+		_, inst, cleanup := setupPostReturnInstance(t)
+		defer cleanup()
 		session, err := inst.StartCall(ctx, "add", uint32(1), uint32(2))
 		if err != nil {
 			t.Fatalf("StartCall: %v", err)
+		}
+		if _, stepErr := session.Step(ctx, nil); stepErr != nil {
+			t.Fatal(stepErr)
 		}
 		_, err = session.LiftResult(ctx, []uint64{})
 		if err == nil {
@@ -395,7 +412,12 @@ func TestCallSession_PostReturn_TrapAndRepeatedLiftPreservesFailure(t *testing.T
 		t.Fatalf("expected wrapped post-return error, got %v", err1)
 	}
 
-	getCalls := inst.GetExportedFunction("get_post_return_called")
+	if _, rawErr := inst.GetExportedFunction("get_post_return_called").Call(ctx); rawErr == nil {
+		t.Fatal("public raw execution accepted after failed lift")
+	}
+	// Inspect the fixture's counter through the private backend hook: public
+	// execution correctly refuses reuse after failed canonical finalization.
+	getCalls := inst.getExportedFunction("get_post_return_called")
 	res, err := getCalls.Call(ctx)
 	if err != nil || len(res) != 1 || res[0] != 1 {
 		t.Fatalf("expected post-return called once, got res=%v, err=%v", res, err)

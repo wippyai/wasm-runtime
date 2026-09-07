@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/tetratelabs/wazero/api"
+	"github.com/wippyai/wasm-runtime/wat"
 )
 
 func TestAsyncify_NewAndDefaults(t *testing.T) {
@@ -51,11 +52,38 @@ func TestIsAsyncified(t *testing.T) {
 		t.Error("expected non-asyncified module to return false")
 	}
 
-	// Fake asyncified WASM (contains export name)
-	asyncified := append(append([]byte{}, nonAsync...), []byte("asyncify_start_unwind")...)
+	// Fake asyncified WASM (contains export name bytes in invalid section/trailing data).
+	// Detection must NOT be fooled by raw string bytes.
+	fakeAsync := append(append([]byte{}, nonAsync...), []byte("asyncify_start_unwind")...)
+	if IsAsyncified(fakeAsync) {
+		t.Error("expected fake asyncified module with raw bytes to return false")
+	}
 
-	if !IsAsyncified(asyncified) {
-		t.Error("expected asyncified module to return true")
+	// Valid module with passive data segment containing helper names must NOT be detected as asyncified.
+	withData, err := wat.Compile(`(module
+		(memory 1)
+		(data (i32.const 0) "asyncify_start_unwind asyncify_stop_unwind asyncify_start_rewind asyncify_stop_rewind asyncify_get_state")
+	)`)
+	if err != nil {
+		t.Fatalf("wat.Compile with data: %v", err)
+	}
+	if IsAsyncified(withData) {
+		t.Error("expected module with helper text in data to return false")
+	}
+
+	// Valid asyncified module (exports all 5 required helpers with proper signatures)
+	validAsync, err := wat.Compile(`(module
+		(func (export "asyncify_start_unwind") (param i32))
+		(func (export "asyncify_stop_unwind"))
+		(func (export "asyncify_start_rewind") (param i32))
+		(func (export "asyncify_stop_rewind"))
+		(func (export "asyncify_get_state") (result i32) i32.const 0)
+	)`)
+	if err != nil {
+		t.Fatalf("wat.Compile valid asyncified: %v", err)
+	}
+	if !IsAsyncified(validAsync) {
+		t.Error("expected valid asyncified module to return true")
 	}
 }
 

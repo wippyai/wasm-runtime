@@ -1,18 +1,18 @@
 package layout
 
 import (
+	"sync"
+
 	"github.com/wippyai/wasm-runtime/transcoder/internal/abi"
 	"go.bytecodealliance.org/wit"
 )
 
 type Calculator struct {
-	cache map[*wit.TypeDef]Info
+	cache sync.Map // *wit.TypeDef -> Info
 }
 
 func NewCalculator() *Calculator {
-	return &Calculator{
-		cache: make(map[*wit.TypeDef]Info),
-	}
+	return &Calculator{}
 }
 
 func (c *Calculator) Calculate(t wit.Type) Info {
@@ -28,6 +28,9 @@ func (c *Calculator) Calculate(t wit.Type) Info {
 	case wit.String:
 		return Info{Size: 8, Align: 4} // [ptr: u32, len: u32]
 	case *wit.TypeDef:
+		if typ == nil {
+			return Info{Size: 0, Align: 1}
+		}
 		return c.calculateTypeDef(typ)
 	default:
 		return Info{Size: 0, Align: 1}
@@ -35,8 +38,8 @@ func (c *Calculator) Calculate(t wit.Type) Info {
 }
 
 func (c *Calculator) calculateTypeDef(t *wit.TypeDef) Info {
-	if cached, ok := c.cache[t]; ok {
-		return cached
+	if cached, ok := c.cache.Load(t); ok {
+		return cached.(Info)
 	}
 
 	var info Info
@@ -64,7 +67,7 @@ func (c *Calculator) calculateTypeDef(t *wit.TypeDef) Info {
 		info = Info{Size: 0, Align: 1}
 	}
 
-	c.cache[t] = info
+	c.cache.Store(t, info)
 	return info
 }
 
@@ -228,11 +231,10 @@ func (c *Calculator) calculateFlags(f *wit.Flags) Info {
 		return Info{Size: 2, Align: 2}
 	} else if numFlags <= 32 {
 		return Info{Size: 4, Align: 4}
-	} else if numFlags <= 64 {
-		return Info{Size: 8, Align: 8}
 	}
 
-	// >64 flags: multiple u32s per Canonical ABI spec
-	numU32s := (numFlags + 31) / 32
-	return Info{Size: uint32(numU32s * 4), Align: 4}
+	// Invalid flag declarations are rejected by the schema/compiler admission
+	// boundary. Return an inert layout here so internal callers cannot revive
+	// the removed multi-word extension before that validation runs.
+	return Info{Size: 0, Align: 1}
 }

@@ -134,6 +134,10 @@ func (e *Engine) Transform(wasmData []byte) ([]byte, error) {
 		return nil, fmt.Errorf("parse module: %w", err)
 	}
 
+	if err := validateInputIdentities(m); err != nil {
+		return nil, fmt.Errorf("input module identities: %w", err)
+	}
+
 	// Check if module is already asyncified (has asyncify exports with function bodies)
 	if e.isPreAsyncified(m) {
 		return nil, fmt.Errorf("module is already asyncified (has asyncify exports); re-asyncifying is not supported")
@@ -686,86 +690,85 @@ func (e *Engine) removeAsyncifyConflicts(m *wasm.Module) error {
 
 // findAsyncFuncs identifies functions that need transformation.
 func (e *Engine) findAsyncFuncs(m *wasm.Module) (map[uint32]bool, error) {
-	// Build export name map: funcIdx -> name
-	exportNames := make(map[uint32]string)
+	// A function can have multiple export aliases. Lists match any alias,
+	// independently of which export appears last in the module.
+	exportNames := make(map[uint32][]string)
 	for _, exp := range m.Exports {
 		if exp.Kind == wasm.KindFunc {
-			exportNames[exp.Idx] = exp.Name
+			exportNames[exp.Idx] = append(exportNames[exp.Idx], exp.Name)
 		}
 	}
-
-	cg, err := BuildCallGraph(m)
-	if err != nil {
-		return nil, fmt.Errorf("build call graph: %w", err)
+	matches := func(matcher FunctionMatcher, names []string) bool {
+		for _, name := range names {
+			if matcher.MatchFunction(name) {
+				return true
+			}
+		}
+		return false
 	}
 
+	analysis, err := AnalyzeIndirectCalls(m, e.ignoreIndirect)
+	if err != nil {
+		return nil, fmt.Errorf("analyze indirect calls: %w", err)
+	}
+	cg := analysis.ResolvedCallGraph
+
 	// Find async imports (skip if ignoreImports is set)
-	asyncImports := make(map[uint32]bool)
+	suspendingRoots := make(map[uint32]bool)
 	if e.matcher != nil && !e.ignoreImports {
 		importIdx := uint32(0)
 		for _, imp := range m.Imports {
 			if imp.Desc.Kind == wasm.KindFunc {
 				if e.matcher.Match(imp.Module, imp.Name) {
-					asyncImports[importIdx] = true
+					suspendingRoots[importIdx] = true
 				}
 				importIdx++
 			}
 		}
 	}
 
-	// Get transitive callers of async imports
-	var result map[uint32]bool
-	if len(asyncImports) > 0 {
-		result = cg.TransitiveCallers(asyncImports)
-	} else {
-		result = make(map[uint32]bool)
-	}
-
-	// Include functions with call_indirect (unless ignoreIndirect is set)
+	// Conservative roots: call_ref and indirect calls to non-closed tables
 	if !e.ignoreIndirect {
-		numImported := uint32(m.NumImportedFuncs())
-		for i, body := range m.Code {
-			funcIdx := numImported + uint32(i)
-			instrs, err := wasm.DecodeInstructions(body.Code)
-			if err != nil {
-				return nil, fmt.Errorf("decode func %d: %w", funcIdx, err)
-			}
-			for _, instr := range instrs {
-				if instr.IsIndirectCall() || instr.Opcode == wasm.OpCallRef {
-					result[funcIdx] = true
-					break
-				}
-			}
+		for funcIdx := range analysis.ConservativeRoots {
+			suspendingRoots[funcIdx] = true
 		}
 	}
 
 	// Apply addList - force these functions to be transformed
+	addedFuncs := make(map[uint32]bool)
 	if e.addList != nil {
-		addedFuncs := make(map[uint32]bool)
-		for funcIdx, name := range exportNames {
-			if e.addList.MatchFunction(name) {
-				result[funcIdx] = true
+		for funcIdx, names := range exportNames {
+			if matches(e.addList, names) {
 				addedFuncs[funcIdx] = true
 			}
 		}
 
-		// PropagateAddList - also instrument callers of addList functions
-		if e.propagateAddList && len(addedFuncs) > 0 {
-			callers := cg.TransitiveCallers(addedFuncs)
-			for funcIdx := range callers {
-				result[funcIdx] = true
+		if e.propagateAddList {
+			for funcIdx := range addedFuncs {
+				suspendingRoots[funcIdx] = true
 			}
 		}
 	}
 
-	// Apply onlyList - restrict to only these functions and their callees
+	// Compute transitive callers from all suspending roots across direct and resolved indirect calls
+	result := cg.TransitiveCallers(suspendingRoots)
+
+	// If propagateAddList was false, addList functions are still forced
+	if e.addList != nil && !e.propagateAddList {
+		for funcIdx := range addedFuncs {
+			result[funcIdx] = true
+		}
+	}
+
+	// Apply onlyList - restrict to only these functions and their callees,
+	// without silently losing forced async roots from addList.
 	if e.onlyList != nil {
 		filtered := make(map[uint32]bool)
 		onlyFuncs := make(map[uint32]bool)
 
 		// Find functions matching onlyList
-		for funcIdx, name := range exportNames {
-			if e.onlyList.MatchFunction(name) {
+		for funcIdx, names := range exportNames {
+			if matches(e.onlyList, names) {
 				onlyFuncs[funcIdx] = true
 			}
 		}
@@ -773,7 +776,7 @@ func (e *Engine) findAsyncFuncs(m *wasm.Module) (map[uint32]bool, error) {
 		// Include matched functions and their transitive callees
 		callees := cg.TransitiveCallees(onlyFuncs)
 		for funcIdx := range result {
-			if onlyFuncs[funcIdx] || callees[funcIdx] {
+			if onlyFuncs[funcIdx] || callees[funcIdx] || addedFuncs[funcIdx] {
 				filtered[funcIdx] = true
 			}
 		}
@@ -782,8 +785,8 @@ func (e *Engine) findAsyncFuncs(m *wasm.Module) (map[uint32]bool, error) {
 
 	// Apply removeList - exclude these functions (highest priority)
 	if e.removeList != nil {
-		for funcIdx, name := range exportNames {
-			if e.removeList.MatchFunction(name) {
+		for funcIdx, names := range exportNames {
+			if matches(e.removeList, names) {
 				delete(result, funcIdx)
 			}
 		}

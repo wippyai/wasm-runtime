@@ -2,9 +2,11 @@ package preview2
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
+	"github.com/wippyai/wasm-runtime/memory/budget"
 	"github.com/wippyai/wasm-runtime/resource"
 )
 
@@ -195,10 +197,11 @@ func (b *SocketBudget) AcquireCancellable(stop <-chan struct{}) (*SocketLease, e
 // resourceBudget counts live handles, including sockets which have not yet
 // connected. Reservation precedes publication and release follows removal.
 type resourceBudget struct {
-	socketBudget *SocketBudget
-	mu           sync.Mutex
-	handles      int
-	maxHandles   int
+	socketBudget     *SocketBudget
+	hostBufferBudget *HostBufferBudget
+	mu               sync.Mutex
+	handles          int
+	maxHandles       int
 }
 
 func isSocketType(kind ResourceType) bool {
@@ -235,15 +238,7 @@ func (b *resourceBudget) releaseHandle() {
 
 // NewResourceTableWithBudget creates an isolated, bounded table with an explicit SocketBudget.
 func NewResourceTableWithBudget(maxHandles int, socketBudget *SocketBudget) *ResourceTable {
-	if maxHandles <= 0 || socketBudget == nil {
-		panic("positive handle limit and socket budget required")
-	}
-	t := NewResourceTable()
-	t.budget = &resourceBudget{
-		maxHandles:   maxHandles,
-		socketBudget: socketBudget,
-	}
-	return t
+	return NewResourceTableWithBudgets(maxHandles, socketBudget, nil)
 }
 
 // NewResourceTableWithLimits creates an isolated, bounded table. Both limits
@@ -372,4 +367,54 @@ func (l *SocketLease) releaseTable() {
 			return
 		}
 	}
+}
+
+// ErrHostBufferLimit reports that an opt-in host-buffer budget cannot reserve
+// a fixed backing buffer. It is deliberately separate from guest linear memory
+// and from SocketBudget's concurrent-socket count.
+var ErrHostBufferLimit = errors.New("WASI host buffer budget exceeded")
+
+// HostBufferBudget bounds explicitly accounted resident host buffers. Its unit
+// is backing capacity in bytes, not guest linear memory, buffered occupancy, or
+// process RSS.
+type HostBufferBudget struct{ bytes *budget.Budget }
+
+// NewHostBufferBudget creates a host-buffer budget. Zero admits no buffers.
+func NewHostBufferBudget(limit uint64) *HostBufferBudget {
+	return &HostBufferBudget{bytes: budget.New(limit)}
+}
+
+// Usage reports currently reserved and peak host-buffer capacity.
+func (b *HostBufferBudget) Usage() budget.Usage {
+	if b == nil {
+		return budget.Usage{}
+	}
+	return b.bytes.Usage()
+}
+
+func (b *HostBufferBudget) reserve(bytes uint64) (*budget.Reservation, error) {
+	if b == nil {
+		return nil, nil
+	}
+	reservation, err := b.bytes.Reserve(bytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrHostBufferLimit, err)
+	}
+	return reservation, nil
+}
+
+// NewResourceTableWithBudgets creates a bounded resource table with an optional
+// explicit host-buffer domain. hostBuffers is independent of socket count and
+// guest linear-memory configuration.
+func NewResourceTableWithBudgets(maxHandles int, socketBudget *SocketBudget, hostBuffers *HostBufferBudget) *ResourceTable {
+	if maxHandles <= 0 || socketBudget == nil {
+		panic("positive handle limit and socket budget required")
+	}
+	t := NewResourceTable()
+	t.budget = &resourceBudget{
+		maxHandles:       maxHandles,
+		socketBudget:     socketBudget,
+		hostBufferBudget: hostBuffers,
+	}
+	return t
 }

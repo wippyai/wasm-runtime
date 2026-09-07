@@ -114,12 +114,9 @@ func (e *Encoder) lowerToStack(ct *CompiledType, ptr unsafe.Pointer, stack []uin
 		return e.lowerVariantToStack(ct, ptr, stack, offset, mem, alloc, allocList)
 
 	case KindEnum:
-		rv := reflect.NewAt(ct.GoType, ptr).Elem()
-		var disc uint64
-		if rv.CanUint() {
-			disc = rv.Uint()
-		} else {
-			disc = uint64(rv.Int())
+		disc, err := compiledUnsigned(ct, ptr)
+		if err != nil {
+			return 0, err
 		}
 		if disc >= uint64(len(ct.Cases)) {
 			return 0, errors.InvalidDiscriminant(errors.PhaseEncode, nil, uint32(disc), uint32(len(ct.Cases)-1))
@@ -128,13 +125,14 @@ func (e *Encoder) lowerToStack(ct *CompiledType, ptr unsafe.Pointer, stack []uin
 		return 1, nil
 
 	case KindFlags:
-		// Flags are stored as integers without bounds check
-		rv := reflect.NewAt(ct.GoType, ptr).Elem()
-		if rv.CanUint() {
-			stack[offset] = rv.Uint()
-		} else {
-			stack[offset] = uint64(rv.Int())
+		if err := validateFlagsCount(len(ct.Cases), errors.PhaseEncode, nil); err != nil {
+			return 0, err
 		}
+		value, err := compiledUnsigned(ct, ptr)
+		if err != nil {
+			return 0, err
+		}
+		stack[offset] = value & flagsMask(len(ct.Cases))
 		return 1, nil
 
 	case KindOwn, KindBorrow:
@@ -148,15 +146,12 @@ func (e *Encoder) lowerToStack(ct *CompiledType, ptr unsafe.Pointer, stack []uin
 }
 
 func (e *Encoder) lowerStringToStack(s string, stack []uint64, offset int, mem Memory, alloc Allocator, allocList *AllocationList) (int, error) {
+	dataLen, err := checkedStringLength(len(s), nil)
+	if err != nil {
+		return 0, err
+	}
 	if !utf8.ValidString(s) {
 		return 0, errors.InvalidUTF8(errors.PhaseEncode, nil, []byte(s))
-	}
-
-	dataLen := uint32(len(s))
-	if dataLen > MaxStringSize {
-		return 0, errors.New(errors.PhaseEncode, errors.KindOverflow).
-			Detail("string size %d exceeds maximum %d", dataLen, MaxStringSize).
-			Build()
 	}
 
 	if dataLen == 0 {
@@ -203,7 +198,10 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 		Cap  int
 	}
 	slice := (*sliceHeader)(ptr)
-	length := uint32(slice.Len)
+	length, err := checkedListLength(slice.Len, nil)
+	if err != nil {
+		return 0, err
+	}
 
 	if length == 0 {
 		stack[offset] = 0
@@ -233,9 +231,10 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 		allocList.Add(dataAddr, dataSize, elemAlign)
 	}
 
-	// Fast path for primitives - direct memory write
-	switch ct.ElemType.GoType.Kind() {
-	case reflect.Int32, reflect.Uint32:
+	// Dispatch by Canonical ABI semantic kind. A Go int32 representation can
+	// mean s32 or char, and a Go uint32 can mean u32, enum, or flags.
+	switch ct.ElemType.Kind {
+	case KindU32, KindS32:
 		src := unsafe.Slice((*uint32)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			if err := mem.WriteU32(dataAddr+i*4, src[i]); err != nil {
@@ -246,7 +245,7 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 		stack[offset+1] = uint64(length)
 		return 2, nil
 
-	case reflect.Int64, reflect.Uint64:
+	case KindU64, KindS64:
 		src := unsafe.Slice((*uint64)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			if err := mem.WriteU64(dataAddr+i*8, src[i]); err != nil {
@@ -257,7 +256,7 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 		stack[offset+1] = uint64(length)
 		return 2, nil
 
-	case reflect.Float32:
+	case KindF32:
 		src := unsafe.Slice((*float32)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			if err := mem.WriteU32(dataAddr+i*4, abi.CanonicalizeF32(math.Float32bits(src[i]))); err != nil {
@@ -268,7 +267,7 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 		stack[offset+1] = uint64(length)
 		return 2, nil
 
-	case reflect.Float64:
+	case KindF64:
 		src := unsafe.Slice((*float64)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			if err := mem.WriteU64(dataAddr+i*8, abi.CanonicalizeF64(math.Float64bits(src[i]))); err != nil {
@@ -279,7 +278,7 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 		stack[offset+1] = uint64(length)
 		return 2, nil
 
-	case reflect.Uint8:
+	case KindU8:
 		src := unsafe.Slice((*byte)(slice.Data), length)
 		if err := mem.Write(dataAddr, src); err != nil {
 			return 0, err
@@ -288,12 +287,18 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 		stack[offset+1] = uint64(length)
 		return 2, nil
 
-	case reflect.String:
+	case KindString:
 		// Fast path for string lists
 		src := unsafe.Slice((*string)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			s := src[i]
-			strLen := uint32(len(s))
+			strLen, err := checkedStringLength(len(s), nil)
+			if err != nil {
+				return 0, err
+			}
+			if !utf8.ValidString(s) {
+				return 0, errors.InvalidUTF8(errors.PhaseEncode, nil, []byte(s))
+			}
 
 			// Write string metadata (ptr + len)
 			metaAddr := dataAddr + i*8
@@ -332,7 +337,7 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 		stack[offset+1] = uint64(length)
 		return 2, nil
 
-	case reflect.Struct:
+	case KindRecord:
 		// Fast path for record lists
 		if ct.ElemType.Kind != KindRecord {
 			break
@@ -374,7 +379,13 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 					}
 				case KindString:
 					s := *(*string)(fieldPtr)
-					strLen := uint32(len(s))
+					strLen, err := checkedStringLength(len(s), nil)
+					if err != nil {
+						return 0, err
+					}
+					if !utf8.ValidString(s) {
+						return 0, errors.InvalidUTF8(errors.PhaseEncode, nil, []byte(s))
+					}
 					if strLen > 0 {
 						strAddr, err := alloc.Alloc(strLen, 1)
 						if err != nil {
@@ -393,10 +404,18 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 				case KindList:
 					if field.Type.ElemType != nil && field.Type.ElemType.Kind == KindString {
 						fieldSlice := (*sliceHeader)(fieldPtr)
-						listLen := uint32(fieldSlice.Len)
+						listLen, err := checkedListLength(fieldSlice.Len, nil)
+						if err != nil {
+							return 0, err
+						}
 
 						if listLen > 0 {
-							metaSize := listLen * 8
+							metaSize, ok := abi.SafeMulU32(listLen, 8)
+							if !ok || metaSize > MaxAlloc {
+								return 0, errors.New(errors.PhaseEncode, errors.KindOverflow).
+									Detail("list<string> metadata size overflow: %d * 8", listLen).
+									Build()
+							}
 							metaAddr, err := alloc.Alloc(metaSize, 4)
 							if err != nil {
 								return 0, err
@@ -418,7 +437,13 @@ func (e *Encoder) lowerListToStack(ct *CompiledType, ptr unsafe.Pointer, stack [
 
 							for j := uint32(0); j < listLen; j++ {
 								s := strings[j]
-								sLen := uint32(len(s))
+								sLen, err := checkedStringLength(len(s), nil)
+								if err != nil {
+									return 0, err
+								}
+								if !utf8.ValidString(s) {
+									return 0, errors.InvalidUTF8(errors.PhaseEncode, nil, []byte(s))
+								}
 								off := j * 8
 
 								if sLen > 0 {
@@ -714,20 +739,17 @@ func (d *Decoder) liftFromStack(ct *CompiledType, stack []uint64, offset int, pt
 		if disc >= uint64(len(ct.Cases)) {
 			return 0, errors.InvalidDiscriminant(errors.PhaseDecode, nil, uint32(disc), uint32(len(ct.Cases)-1))
 		}
-		rv := reflect.NewAt(ct.GoType, ptr).Elem()
-		if rv.CanUint() {
-			rv.SetUint(disc)
-		} else {
-			rv.SetInt(int64(disc))
+		if err := storeCompiledUnsigned(ct, ptr, disc); err != nil {
+			return 0, err
 		}
 		return 1, nil
 
 	case KindFlags:
-		rv := reflect.NewAt(ct.GoType, ptr).Elem()
-		if rv.CanUint() {
-			rv.SetUint(stack[offset])
-		} else {
-			rv.SetInt(int64(stack[offset]))
+		if err := validateFlagsCount(len(ct.Cases), errors.PhaseDecode, nil); err != nil {
+			return 0, err
+		}
+		if err := storeCompiledUnsigned(ct, ptr, stack[offset]&flagsMask(len(ct.Cases))); err != nil {
+			return 0, err
 		}
 		return 1, nil
 
@@ -792,17 +814,17 @@ func assignLiftedList(ct *CompiledType, ptr unsafe.Pointer, length int) error {
 	// Canonical byte and numeric lists have pointer-free backing. Allocate their
 	// actual Go representation directly, avoiding reflection on common I/O paths.
 	if ct.ElemType != nil && ct.ElemType.GoType != nil {
-		switch ct.ElemType.GoType.Kind() {
-		case reflect.Uint8, reflect.Int8:
+		switch ct.ElemType.Kind {
+		case KindU8, KindS8:
 			assignScalarList[uint8](ptr, length)
 			return nil
-		case reflect.Uint16, reflect.Int16:
+		case KindU16, KindS16:
 			assignScalarList[uint16](ptr, length)
 			return nil
-		case reflect.Uint32, reflect.Int32, reflect.Float32:
+		case KindU32, KindS32, KindF32:
 			assignScalarList[uint32](ptr, length)
 			return nil
-		case reflect.Uint64, reflect.Int64, reflect.Float64:
+		case KindU64, KindS64, KindF64:
 			assignScalarList[uint64](ptr, length)
 			return nil
 		}
@@ -891,8 +913,8 @@ func (d *Decoder) liftListFromStack(ct *CompiledType, stack []uint64, offset int
 
 	slice := (*sliceHeader)(ptr)
 
-	switch elemType.GoType.Kind() {
-	case reflect.Int32, reflect.Uint32:
+	switch elemType.Kind {
+	case KindU32, KindS32:
 		dst := unsafe.Slice((*uint32)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			val, err := mem.ReadU32(dataAddr + i*4)
@@ -903,7 +925,7 @@ func (d *Decoder) liftListFromStack(ct *CompiledType, stack []uint64, offset int
 		}
 		return 2, nil
 
-	case reflect.Int64, reflect.Uint64:
+	case KindU64, KindS64:
 		dst := unsafe.Slice((*uint64)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			val, err := mem.ReadU64(dataAddr + i*8)
@@ -914,7 +936,7 @@ func (d *Decoder) liftListFromStack(ct *CompiledType, stack []uint64, offset int
 		}
 		return 2, nil
 
-	case reflect.Float32:
+	case KindF32:
 		dst := unsafe.Slice((*float32)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			val, err := mem.ReadU32(dataAddr + i*4)
@@ -925,7 +947,7 @@ func (d *Decoder) liftListFromStack(ct *CompiledType, stack []uint64, offset int
 		}
 		return 2, nil
 
-	case reflect.Float64:
+	case KindF64:
 		dst := unsafe.Slice((*float64)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			val, err := mem.ReadU64(dataAddr + i*8)
@@ -936,12 +958,12 @@ func (d *Decoder) liftListFromStack(ct *CompiledType, stack []uint64, offset int
 		}
 		return 2, nil
 
-	case reflect.Uint8:
+	case KindU8:
 		dst := unsafe.Slice((*byte)(slice.Data), length)
 		copy(dst, listBytes)
 		return 2, nil
 
-	case reflect.String:
+	case KindString:
 		dst := unsafe.Slice((*string)(slice.Data), length)
 		for i := uint32(0); i < length; i++ {
 			off := i * 8
@@ -966,7 +988,7 @@ func (d *Decoder) liftListFromStack(ct *CompiledType, stack []uint64, offset int
 		}
 		return 2, nil
 
-	case reflect.Struct:
+	case KindRecord:
 		if elemType.Kind != KindRecord {
 			break
 		}

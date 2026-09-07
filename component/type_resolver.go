@@ -248,6 +248,9 @@ func (r *TypeResolver) resolveTuple(t TupleType, frame *resolveFrame) (wit.Type,
 }
 
 func (r *TypeResolver) resolveFlags(f FlagsType) (wit.Type, error) {
+	if len(f.Names) == 0 || len(f.Names) > 32 {
+		return nil, fmt.Errorf("flags count must be 1 through 32, got %d", len(f.Names))
+	}
 	flags := make([]wit.Flag, len(f.Names))
 	for i, name := range f.Names {
 		flags[i] = wit.Flag{Name: name}

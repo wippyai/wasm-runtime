@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"unsafe"
 
-	"github.com/tetratelabs/wazero/api"
 	"go.bytecodealliance.org/wit"
 
 	"github.com/wippyai/wasm-runtime/transcoder"
@@ -16,8 +15,22 @@ import (
 // Call path implementations for WazeroInstance.
 // Contains fast paths, compiled paths, and general transcoder-based calling.
 
-// tryCallStringInto handles (string) -> string with zero allocations
-func (i *WazeroInstance) tryCallStringInto(ctx context.Context, fn api.Function, paramTypes []wit.Type, resultTypes []wit.Type, result any, params []any) (bool, error) {
+func bindingMemoryInterface(b *exportBinding) transcoder.Memory {
+	if b != nil && b.memory != nil && b.memory.mem != nil {
+		return b.memory
+	}
+	return nil
+}
+
+func bindingAllocatorInterface(b *exportBinding) transcoder.Allocator {
+	if b != nil && b.alloc != nil && b.alloc.allocFn != nil {
+		return b.alloc
+	}
+	return nil
+}
+
+// tryCallStringInto handles (string) -> string, copying returned guest bytes.
+func (i *WazeroInstance) tryCallStringInto(ctx context.Context, b *exportBinding, paramTypes []wit.Type, resultTypes []wit.Type, result any, params []any) (bool, error) {
 	// Check signature: (string) -> string
 	if len(paramTypes) != 1 || len(resultTypes) != 1 {
 		return false, nil
@@ -42,11 +55,20 @@ func (i *WazeroInstance) tryCallStringInto(ctx context.Context, fn api.Function,
 		return false, nil
 	}
 
-	if i.allocFn == nil || i.memory == nil {
-		return false, fmt.Errorf("no allocator or memory available")
+	alloc := b.alloc
+	memObj := b.memory
+	if alloc == nil || alloc.allocFn == nil || memObj == nil || memObj.mem == nil {
+		return true, fmt.Errorf("canonical memory or allocator not available for export %q", b.name)
 	}
 
-	mem := i.memory.mem
+	mem := memObj.mem
+
+	// Track allocations for cleanup
+	allocList := transcoder.NewAllocationList()
+	defer allocList.Release()
+	if !b.isCanonical() {
+		defer allocList.Free(alloc)
+	}
 
 	// Allocate and write input string
 	var inputPtr uint32
@@ -56,11 +78,15 @@ func (i *WazeroInstance) tryCallStringInto(ctx context.Context, fn api.Function,
 		i.stackBuf[1] = 0
 		i.stackBuf[2] = 1 // align
 		i.stackBuf[3] = uint64(inputLen)
-		if err := i.allocFn.CallWithStack(ctx, i.stackBuf[:4]); err != nil {
+		if err := alloc.allocFn.CallWithStack(ctx, i.stackBuf[:4]); err != nil {
 			return true, err
 		}
 		inputPtr = uint32(i.stackBuf[0])
+		allocList.Add(inputPtr, inputLen, 1)
 		if !mem.WriteString(inputPtr, input) {
+			if b.isCanonical() {
+				allocList.Free(alloc)
+			}
 			return true, fmt.Errorf("write input string to memory at 0x%x: out of bounds", inputPtr)
 		}
 	}
@@ -68,7 +94,7 @@ func (i *WazeroInstance) tryCallStringInto(ctx context.Context, fn api.Function,
 	// Call: (ptr, len) -> retptr
 	i.stackBuf[0] = uint64(inputPtr)
 	i.stackBuf[1] = uint64(inputLen)
-	if err := fn.CallWithStack(ctx, i.stackBuf[:2]); err != nil {
+	if err := b.fn.CallWithStack(ctx, i.stackBuf[:2]); err != nil {
 		return true, err
 	}
 
@@ -90,14 +116,22 @@ func (i *WazeroInstance) tryCallStringInto(ctx context.Context, fn api.Function,
 		if !ok {
 			return true, fmt.Errorf("read result data at 0x%x (len %d): out of bounds", resultDataPtr, resultDataLen)
 		}
-		*resultPtr = unsafe.String(unsafe.SliceData(resultData), len(resultData))
+		// Go strings must outlive subsequent guest calls, even without post-return.
+		*resultPtr = string(resultData)
+	}
+
+	if b.postReturn != nil {
+		callCtx := i.prepareCallContext(ctx)
+		if _, err := b.postReturn.Call(callCtx, uint64(retptr)); err != nil {
+			return true, fmt.Errorf("post-return: %w", err)
+		}
 	}
 
 	return true, nil
 }
 
 // tryCallPrimitiveInto handles primitive signatures with zero allocations
-func (i *WazeroInstance) tryCallPrimitiveInto(ctx context.Context, fn api.Function, paramTypes []wit.Type, resultTypes []wit.Type, result any, params []any) (bool, error) {
+func (i *WazeroInstance) tryCallPrimitiveInto(ctx context.Context, b *exportBinding, paramTypes []wit.Type, resultTypes []wit.Type, result any, params []any) (bool, error) {
 	// Only handle single u32 result for now
 	if len(resultTypes) != 1 {
 		return false, nil
@@ -123,17 +157,23 @@ func (i *WazeroInstance) tryCallPrimitiveInto(ctx context.Context, fn api.Functi
 			}
 
 			a, ok1 := params[0].(uint32)
-			b, ok2 := params[1].(uint32)
+			bParam, ok2 := params[1].(uint32)
 			if !ok1 || !ok2 {
 				return false, nil
 			}
 
 			i.stackBuf[0] = uint64(a)
-			i.stackBuf[1] = uint64(b)
-			if err := fn.CallWithStack(ctx, i.stackBuf[:2]); err != nil {
+			i.stackBuf[1] = uint64(bParam)
+			if err := b.fn.CallWithStack(ctx, i.stackBuf[:2]); err != nil {
 				return true, err
 			}
 			*resultPtr = uint32(i.stackBuf[0])
+			if b.postReturn != nil {
+				callCtx := i.prepareCallContext(ctx)
+				if _, err := b.postReturn.Call(callCtx, i.stackBuf[0]); err != nil {
+					return true, fmt.Errorf("post-return: %w", err)
+				}
+			}
 			return true, nil
 		}
 
@@ -152,19 +192,31 @@ func (i *WazeroInstance) tryCallPrimitiveInto(ctx context.Context, fn api.Functi
 			}
 
 			i.stackBuf[0] = uint64(a)
-			if err := fn.CallWithStack(ctx, i.stackBuf[:1]); err != nil {
+			if err := b.fn.CallWithStack(ctx, i.stackBuf[:1]); err != nil {
 				return true, err
 			}
 			*resultPtr = uint32(i.stackBuf[0])
+			if b.postReturn != nil {
+				callCtx := i.prepareCallContext(ctx)
+				if _, err := b.postReturn.Call(callCtx, i.stackBuf[0]); err != nil {
+					return true, fmt.Errorf("post-return: %w", err)
+				}
+			}
 			return true, nil
 		}
 
 		// Handle () -> u32
 		if len(paramTypes) == 0 {
-			if err := fn.CallWithStack(ctx, i.stackBuf[:1]); err != nil {
+			if err := b.fn.CallWithStack(ctx, i.stackBuf[:1]); err != nil {
 				return true, err
 			}
 			*resultPtr = uint32(i.stackBuf[0])
+			if b.postReturn != nil {
+				callCtx := i.prepareCallContext(ctx)
+				if _, err := b.postReturn.Call(callCtx, i.stackBuf[0]); err != nil {
+					return true, fmt.Errorf("post-return: %w", err)
+				}
+			}
 			return true, nil
 		}
 	}
@@ -174,7 +226,7 @@ func (i *WazeroInstance) tryCallPrimitiveInto(ctx context.Context, fn api.Functi
 
 // tryCallCompiled handles typed calls using compiled transcoder (allocates result, returns it)
 // Supports records (structs) and lists (typed slices)
-func (i *WazeroInstance) tryCallCompiled(ctx context.Context, fn api.Function, paramTypes []wit.Type, resultTypes []wit.Type, params []any) (any, bool, error) {
+func (i *WazeroInstance) tryCallCompiled(ctx context.Context, b *exportBinding, paramTypes []wit.Type, resultTypes []wit.Type, params []any) (any, bool, error) {
 	// Check signature: single param -> single result
 	if len(paramTypes) != 1 || len(resultTypes) != 1 || len(params) != 1 {
 		return nil, false, nil
@@ -211,21 +263,44 @@ func (i *WazeroInstance) tryCallCompiled(ctx context.Context, fn api.Function, p
 		return nil, false, nil
 	}
 
+	alloc := b.alloc
+	mem := b.memory
+	if (alloc == nil || alloc.allocFn == nil) && paramsRequireAlloc(paramTypes) {
+		return nil, true, fmt.Errorf("canonical allocator not available for export %q", b.name)
+	}
+	if (mem == nil || mem.mem == nil) && paramsRequireMemory(paramTypes) {
+		return nil, true, fmt.Errorf("canonical memory not available for export %q", b.name)
+	}
+	if (mem == nil || mem.mem == nil) && resultsRequireMemory(resultTypes) {
+		return nil, true, fmt.Errorf("canonical memory not available for export %q", b.name)
+	}
+
+	memInterface := bindingMemoryInterface(b)
+	allocInterface := bindingAllocatorInterface(b)
+	if alloc != nil {
+		alloc.setContext(ctx)
+	}
+
+	allocList := transcoder.NewAllocationList()
+	defer allocList.Release()
+	if !b.isCanonical() && allocInterface != nil {
+		defer allocList.Free(allocInterface)
+	}
+
 	// Lower param to stack - get pointer to param data
-	// Go interface layout: [type ptr, data ptr]. For non-pointer types larger than
-	// a word, data ptr points to the actual data. This is faster than reflect.
 	paramInterface := (*[2]unsafe.Pointer)(unsafe.Pointer(&params[0]))
 	paramPtr := paramInterface[1]
 
-	i.alloc.setContext(ctx)
-
-	stackSize, err := i.encoder.LowerToStack(paramCompiled, paramPtr, i.stackBuf, i.memory, i.alloc)
+	stackSize, err := i.encoder.LowerToStackTracked(paramCompiled, paramPtr, i.stackBuf, memInterface, allocInterface, allocList)
 	if err != nil {
+		if b.isCanonical() && allocInterface != nil {
+			allocList.Free(allocInterface)
+		}
 		return nil, true, err
 	}
 
 	// Call WASM function
-	if err := fn.CallWithStack(ctx, i.stackBuf[:stackSize]); err != nil {
+	if err := b.fn.CallWithStack(ctx, i.stackBuf[:stackSize]); err != nil {
 		return nil, true, err
 	}
 
@@ -234,9 +309,17 @@ func (i *WazeroInstance) tryCallCompiled(ctx context.Context, fn api.Function, p
 	resultPtrVal.Elem().Set(resultGo)
 	resultPtr := resultPtrVal.UnsafePointer()
 
-	_, err = i.decoder.LiftFromStack(resultCompiled, i.stackBuf, resultPtr, i.memory)
+	_, err = i.decoder.LiftFromStack(resultCompiled, i.stackBuf, resultPtr, memInterface)
 	if err != nil {
 		return nil, true, err
+	}
+
+	if b.postReturn != nil {
+		callCtx := i.prepareCallContext(ctx)
+		rawResults := []uint64{i.stackBuf[0]}
+		if _, err := b.postReturn.Call(callCtx, rawResults...); err != nil {
+			return nil, true, fmt.Errorf("post-return: %w", err)
+		}
 	}
 
 	return resultPtrVal.Elem().Interface(), true, nil
@@ -244,7 +327,7 @@ func (i *WazeroInstance) tryCallCompiled(ctx context.Context, fn api.Function, p
 
 // tryCallCompiledInto handles typed calls using compiled transcoder (zero-alloc fast path)
 // Supports records (structs) and lists (typed slices)
-func (i *WazeroInstance) tryCallCompiledInto(ctx context.Context, fn api.Function, paramTypes []wit.Type, resultTypes []wit.Type, result any, params []any) (bool, error) {
+func (i *WazeroInstance) tryCallCompiledInto(ctx context.Context, b *exportBinding, paramTypes []wit.Type, resultTypes []wit.Type, result any, params []any) (bool, error) {
 	// Check signature: single param -> single result
 	if len(paramTypes) != 1 || len(resultTypes) != 1 || len(params) != 1 {
 		return false, nil
@@ -275,22 +358,44 @@ func (i *WazeroInstance) tryCallCompiledInto(ctx context.Context, fn api.Functio
 		return false, nil
 	}
 
+	alloc := b.alloc
+	mem := b.memory
+	if (alloc == nil || alloc.allocFn == nil) && paramsRequireAlloc(paramTypes) {
+		return true, fmt.Errorf("canonical allocator not available for export %q", b.name)
+	}
+	if (mem == nil || mem.mem == nil) && paramsRequireMemory(paramTypes) {
+		return true, fmt.Errorf("canonical memory not available for export %q", b.name)
+	}
+	if (mem == nil || mem.mem == nil) && resultsRequireMemory(resultTypes) {
+		return true, fmt.Errorf("canonical memory not available for export %q", b.name)
+	}
+
+	memInterface := bindingMemoryInterface(b)
+	allocInterface := bindingAllocatorInterface(b)
+	if alloc != nil {
+		alloc.setContext(ctx)
+	}
+
+	allocList := transcoder.NewAllocationList()
+	defer allocList.Release()
+	if !b.isCanonical() && allocInterface != nil {
+		defer allocList.Free(allocInterface)
+	}
+
 	// Lower param to stack - get pointer to param data
-	// Go interface layout: [type ptr, data ptr]. For non-pointer types larger than
-	// a word, data ptr points to the actual data. This is faster than reflect.
 	paramInterface := (*[2]unsafe.Pointer)(unsafe.Pointer(&params[0]))
 	paramPtr := paramInterface[1]
 
-	// Set allocator context
-	i.alloc.setContext(ctx)
-
-	stackSize, err := i.encoder.LowerToStack(paramCompiled, paramPtr, i.stackBuf, i.memory, i.alloc)
+	stackSize, err := i.encoder.LowerToStackTracked(paramCompiled, paramPtr, i.stackBuf, memInterface, allocInterface, allocList)
 	if err != nil {
+		if b.isCanonical() && allocInterface != nil {
+			allocList.Free(allocInterface)
+		}
 		return true, err
 	}
 
 	// Call WASM function
-	if err := fn.CallWithStack(ctx, i.stackBuf[:stackSize]); err != nil {
+	if err := b.fn.CallWithStack(ctx, i.stackBuf[:stackSize]); err != nil {
 		return true, err
 	}
 
@@ -305,7 +410,10 @@ func (i *WazeroInstance) tryCallCompiledInto(ctx context.Context, fn api.Functio
 		retptr := uint32(i.stackBuf[0])
 		resultSize := resultSize(resultTypes[0])
 
-		resultData, err := i.memory.Read(retptr, resultSize)
+		if mem == nil || mem.mem == nil {
+			return true, fmt.Errorf("read retptr result: memory not available")
+		}
+		resultData, err := mem.Read(retptr, resultSize)
 		if err != nil {
 			return true, fmt.Errorf("read retptr result: %w", err)
 		}
@@ -319,48 +427,102 @@ func (i *WazeroInstance) tryCallCompiledInto(ctx context.Context, fn api.Functio
 			offset := j * 4
 			i.stackBuf[j] = uint64(binary.LittleEndian.Uint32(resultData[offset:]))
 		}
-		_, err = i.decoder.LiftFromStack(resultCompiled, i.stackBuf[:flatCount], resultPtr, i.memory)
-		return true, err
+		_, err = i.decoder.LiftFromStack(resultCompiled, i.stackBuf[:flatCount], resultPtr, memInterface)
+		if err != nil {
+			return true, err
+		}
+
+		if b.postReturn != nil {
+			callCtx := i.prepareCallContext(ctx)
+			if _, err := b.postReturn.Call(callCtx, uint64(retptr)); err != nil {
+				return true, fmt.Errorf("post-return: %w", err)
+			}
+		}
+		return true, nil
 	}
 
 	// Result is returned directly on stack
-	_, err = i.decoder.LiftFromStack(resultCompiled, i.stackBuf, resultPtr, i.memory)
-	return true, err
+	rawRet := i.stackBuf[0]
+	_, err = i.decoder.LiftFromStack(resultCompiled, i.stackBuf, resultPtr, memInterface)
+	if err != nil {
+		return true, err
+	}
+
+	if b.postReturn != nil {
+		callCtx := i.prepareCallContext(ctx)
+		if _, err := b.postReturn.Call(callCtx, rawRet); err != nil {
+			return true, fmt.Errorf("post-return: %w", err)
+		}
+	}
+
+	return true, nil
 }
 
 // callGeneralInto is the general path using transcoder with DecodeInto
-func (i *WazeroInstance) callGeneralInto(ctx context.Context, fn api.Function, paramTypes []wit.Type, resultTypes []wit.Type, result any, params []any) error {
-	i.alloc.setContext(ctx)
+func (i *WazeroInstance) callGeneralInto(ctx context.Context, b *exportBinding, paramTypes []wit.Type, resultTypes []wit.Type, result any, params []any) error {
+	alloc := b.alloc
+	mem := b.memory
+	if (alloc == nil || alloc.allocFn == nil) && paramsRequireAlloc(paramTypes) {
+		return fmt.Errorf("canonical allocator not available for export %q", b.name)
+	}
+	if (mem == nil || mem.mem == nil) && paramsRequireMemory(paramTypes) {
+		return fmt.Errorf("canonical memory not available for export %q", b.name)
+	}
+	if (mem == nil || mem.mem == nil) && resultsRequireMemory(resultTypes) {
+		return fmt.Errorf("canonical memory not available for export %q", b.name)
+	}
+
+	memInterface := bindingMemoryInterface(b)
+	allocInterface := bindingAllocatorInterface(b)
+	if alloc != nil {
+		alloc.setContext(ctx)
+	}
 
 	allocList := transcoder.NewAllocationList()
-	defer allocList.FreeAndRelease(i.alloc)
+	defer allocList.Release()
+	if !b.isCanonical() && allocInterface != nil {
+		defer allocList.Free(allocInterface)
+	}
 
 	// Encode parameters - encoder internally uses compiled fast path when possible
-	flatParams, err := i.encoder.EncodeParams(paramTypes, params, i.memory, i.alloc, allocList)
+	flatParams, err := i.encoder.EncodeParams(paramTypes, params, memInterface, allocInterface, allocList)
 	if err != nil {
+		if b.isCanonical() && allocInterface != nil {
+			allocList.Free(allocInterface)
+		}
 		return fmt.Errorf("encode params: %w", err)
 	}
 
 	// Call WASM function
 	copy(i.stackBuf, flatParams)
-	if err := fn.CallWithStack(ctx, i.stackBuf[:len(flatParams)]); err != nil {
+	if err := b.fn.CallWithStack(ctx, i.stackBuf[:len(flatParams)]); err != nil {
 		return fmt.Errorf("wasm call failed: %w", err)
 	}
 
 	// Handle void return
 	if result == nil || len(resultTypes) == 0 {
+		if b.postReturn != nil {
+			callCtx := i.prepareCallContext(ctx)
+			if _, err := b.postReturn.Call(callCtx); err != nil {
+				return fmt.Errorf("post-return: %w", err)
+			}
+		}
 		return nil
 	}
 
 	// Check if result uses retptr (indirect return)
 	usesRetptr := usesRetptr(resultTypes)
+	var retptr uint32
 
 	// If retptr, read actual result from memory into stackBuf
 	if usesRetptr {
-		retptr := uint32(i.stackBuf[0])
+		retptr = uint32(i.stackBuf[0])
 		resultSize := resultSize(resultTypes[0])
 
-		resultData, err := i.memory.Read(retptr, resultSize)
+		if mem == nil || mem.mem == nil {
+			return fmt.Errorf("read retptr result: memory not available")
+		}
+		resultData, err := mem.Read(retptr, resultSize)
 		if err != nil {
 			return fmt.Errorf("read retptr result: %w", err)
 		}
@@ -386,21 +548,55 @@ func (i *WazeroInstance) callGeneralInto(ctx context.Context, fn api.Function, p
 				if err == nil {
 					// Use compiled fast path for records, lists, etc.
 					resultPtr := unsafe.Pointer(rv.Pointer())
-					_, err = i.decoder.LiftFromStack(compiled, i.stackBuf, resultPtr, i.memory)
-					return err
+					_, err = i.decoder.LiftFromStack(compiled, i.stackBuf, resultPtr, memInterface)
+					if err != nil {
+						return err
+					}
+					if b.postReturn != nil {
+						callCtx := i.prepareCallContext(ctx)
+						var raw []uint64
+						if usesRetptr {
+							raw = []uint64{uint64(retptr)}
+						} else {
+							raw = []uint64{i.stackBuf[0]}
+						}
+						if _, err := b.postReturn.Call(callCtx, raw...); err != nil {
+							return fmt.Errorf("post-return: %w", err)
+						}
+					}
+					return nil
 				}
 			}
 		}
 	}
 
 	// Fall back to DecodeInto for other types - results are in stackBuf
-	return i.decoder.DecodeInto(resultTypes, i.stackBuf, i.memory, result)
+	if err := i.decoder.DecodeInto(resultTypes, i.stackBuf, memInterface, result); err != nil {
+		return err
+	}
+
+	if b.postReturn != nil {
+		callCtx := i.prepareCallContext(ctx)
+		var raw []uint64
+		if usesRetptr {
+			raw = []uint64{uint64(retptr)}
+		} else {
+			count := flatResultCount(resultTypes)
+			raw = make([]uint64, count)
+			copy(raw, i.stackBuf[:count])
+		}
+		if _, err := b.postReturn.Call(callCtx, raw...); err != nil {
+			return fmt.Errorf("post-return: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // tryFastCall attempts direct call for primitive signatures
-func (i *WazeroInstance) tryFastCall(ctx context.Context, fn api.Function, paramTypes []wit.Type, resultTypes []wit.Type, params []any) (any, bool, error) {
+func (i *WazeroInstance) tryFastCall(ctx context.Context, b *exportBinding, paramTypes []wit.Type, resultTypes []wit.Type, params []any) (any, bool, error) {
 	// Try string fast path first
-	if result, ok, err := i.tryFastStringCall(ctx, fn, paramTypes, resultTypes, params); ok {
+	if result, ok, err := i.tryFastStringCall(ctx, b, paramTypes, resultTypes, params); ok {
 		return result, ok, err
 	}
 
@@ -428,7 +624,7 @@ func (i *WazeroInstance) tryFastCall(ctx context.Context, fn api.Function, param
 
 	// Handle (T, T) -> R for 32-bit types
 	if len(paramTypes) == 2 && len(params) == 2 {
-		var a, b uint64
+		var a, bVal uint64
 		switch p := paramTypes[0].(type) {
 		case wit.U32:
 			if v, ok := params[0].(uint32); ok {
@@ -449,13 +645,13 @@ func (i *WazeroInstance) tryFastCall(ctx context.Context, fn api.Function, param
 		switch p := paramTypes[1].(type) {
 		case wit.U32:
 			if v, ok := params[1].(uint32); ok {
-				b = uint64(v)
+				bVal = uint64(v)
 			} else {
 				return nil, false, nil
 			}
 		case wit.S32:
 			if v, ok := params[1].(int32); ok {
-				b = uint64(uint32(v))
+				bVal = uint64(uint32(v))
 			} else {
 				return nil, false, nil
 			}
@@ -465,11 +661,18 @@ func (i *WazeroInstance) tryFastCall(ctx context.Context, fn api.Function, param
 		}
 
 		i.stackBuf[0] = a
-		i.stackBuf[1] = b
-		if err := fn.CallWithStack(ctx, i.stackBuf[:2]); err != nil {
+		i.stackBuf[1] = bVal
+		if err := b.fn.CallWithStack(ctx, i.stackBuf[:2]); err != nil {
 			return nil, true, fmt.Errorf("wasm call failed: %w", err)
 		}
-		return convertResult(i.stackBuf[0]), true, nil
+		rawRet := i.stackBuf[0]
+		if b.postReturn != nil {
+			callCtx := i.prepareCallContext(ctx)
+			if _, err := b.postReturn.Call(callCtx, rawRet); err != nil {
+				return nil, true, fmt.Errorf("post-return: %w", err)
+			}
+		}
+		return convertResult(rawRet), true, nil
 	}
 
 	// Handle (T) -> R for 32/64-bit types
@@ -506,30 +709,39 @@ func (i *WazeroInstance) tryFastCall(ctx context.Context, fn api.Function, param
 		}
 
 		i.stackBuf[0] = a
-		if err := fn.CallWithStack(ctx, i.stackBuf[:1]); err != nil {
+		if err := b.fn.CallWithStack(ctx, i.stackBuf[:1]); err != nil {
 			return nil, true, fmt.Errorf("wasm call failed: %w", err)
 		}
-		return convertResult(i.stackBuf[0]), true, nil
+		rawRet := i.stackBuf[0]
+		if b.postReturn != nil {
+			callCtx := i.prepareCallContext(ctx)
+			if _, err := b.postReturn.Call(callCtx, rawRet); err != nil {
+				return nil, true, fmt.Errorf("post-return: %w", err)
+			}
+		}
+		return convertResult(rawRet), true, nil
 	}
 
 	// Handle () -> R
 	if len(paramTypes) == 0 {
-		if err := fn.CallWithStack(ctx, i.stackBuf[:1]); err != nil {
+		if err := b.fn.CallWithStack(ctx, i.stackBuf[:1]); err != nil {
 			return nil, true, fmt.Errorf("wasm call failed: %w", err)
 		}
-		return convertResult(i.stackBuf[0]), true, nil
+		rawRet := i.stackBuf[0]
+		if b.postReturn != nil {
+			callCtx := i.prepareCallContext(ctx)
+			if _, err := b.postReturn.Call(callCtx, rawRet); err != nil {
+				return nil, true, fmt.Errorf("post-return: %w", err)
+			}
+		}
+		return convertResult(rawRet), true, nil
 	}
 
 	return nil, false, nil
 }
 
 // tryFastStringCall handles string parameter/result signatures
-func (i *WazeroInstance) tryFastStringCall(ctx context.Context, fn api.Function, paramTypes []wit.Type, resultTypes []wit.Type, params []any) (any, bool, error) {
-	// Need allocator and memory for strings
-	if i.allocFn == nil || i.memory == nil {
-		return nil, false, nil
-	}
-
+func (i *WazeroInstance) tryFastStringCall(ctx context.Context, b *exportBinding, paramTypes []wit.Type, resultTypes []wit.Type, params []any) (any, bool, error) {
 	// Handle (string) -> string (e.g., echo, process)
 	// Canonical ABI: function takes (ptr, len) and returns retptr to (resultPtr, resultLen)
 	if len(paramTypes) == 1 && len(resultTypes) == 1 {
@@ -548,11 +760,20 @@ func (i *WazeroInstance) tryFastStringCall(ctx context.Context, fn api.Function,
 			return nil, false, nil
 		}
 
+		alloc := b.alloc
+		memObj := b.memory
+		if alloc == nil || alloc.allocFn == nil || memObj == nil || memObj.mem == nil {
+			return nil, true, fmt.Errorf("canonical memory or allocator not available for export %q", b.name)
+		}
+
 		// Track allocations for cleanup
 		allocList := transcoder.NewAllocationList()
-		defer allocList.FreeAndRelease(i.alloc)
+		defer allocList.Release()
+		if !b.isCanonical() {
+			defer allocList.Free(alloc)
+		}
 
-		mem := i.memory.mem
+		mem := memObj.mem
 
 		// Allocate and write input string
 		var inputPtr uint32
@@ -562,18 +783,23 @@ func (i *WazeroInstance) tryFastStringCall(ctx context.Context, fn api.Function,
 			i.stackBuf[1] = 0
 			i.stackBuf[2] = 1 // align
 			i.stackBuf[3] = uint64(inputLen)
-			if err := i.allocFn.CallWithStack(ctx, i.stackBuf[:4]); err != nil {
+			if err := alloc.allocFn.CallWithStack(ctx, i.stackBuf[:4]); err != nil {
 				return nil, true, err
 			}
 			inputPtr = uint32(i.stackBuf[0])
 			allocList.Add(inputPtr, inputLen, 1)
-			mem.WriteString(inputPtr, s) // avoids []byte(s) allocation
+			if !mem.WriteString(inputPtr, s) {
+				if b.isCanonical() {
+					allocList.Free(alloc)
+				}
+				return nil, true, fmt.Errorf("write input string to memory at 0x%x: out of bounds", inputPtr)
+			}
 		}
 
 		// Call: (ptr, len) -> retptr
 		i.stackBuf[0] = uint64(inputPtr)
 		i.stackBuf[1] = uint64(inputLen)
-		if err := fn.CallWithStack(ctx, i.stackBuf[:2]); err != nil {
+		if err := b.fn.CallWithStack(ctx, i.stackBuf[:2]); err != nil {
 			return nil, true, fmt.Errorf("wasm call failed: %w", err)
 		}
 
@@ -590,30 +816,65 @@ func (i *WazeroInstance) tryFastStringCall(ctx context.Context, fn api.Function,
 			return nil, true, fmt.Errorf("read result length at 0x%x: out of bounds", retptr+4)
 		}
 		if resultLen == 0 {
+			if b.postReturn != nil {
+				callCtx := i.prepareCallContext(ctx)
+				if _, err := b.postReturn.Call(callCtx, uint64(retptr)); err != nil {
+					return nil, true, fmt.Errorf("post-return: %w", err)
+				}
+			}
 			return "", true, nil
 		}
 		resultData, ok := mem.Read(resultPtr, resultLen)
 		if !ok {
 			return nil, true, fmt.Errorf("read result data at 0x%x (len %d): out of bounds", resultPtr, resultLen)
 		}
-		// Use unsafe to avoid string copy - resultData is a view into wasm memory
-		return unsafe.String(unsafe.SliceData(resultData), len(resultData)), true, nil
+
+		// The guest may reuse this memory on its next call.
+		res := string(resultData)
+		if b.postReturn != nil {
+			callCtx := i.prepareCallContext(ctx)
+			if _, err := b.postReturn.Call(callCtx, uint64(retptr)); err != nil {
+				return nil, true, fmt.Errorf("post-return: %w", err)
+			}
+		}
+		return res, true, nil
 	}
 
 	return nil, false, nil
 }
 
 // callGeneral is the general-purpose call path using transcoder
-func (i *WazeroInstance) callGeneral(ctx context.Context, fn api.Function, paramTypes []wit.Type, resultTypes []wit.Type, params []any) (any, error) {
-	// Update allocator context
-	i.alloc.setContext(ctx)
+func (i *WazeroInstance) callGeneral(ctx context.Context, b *exportBinding, paramTypes []wit.Type, resultTypes []wit.Type, params []any) (any, error) {
+	alloc := b.alloc
+	mem := b.memory
+	if (alloc == nil || alloc.allocFn == nil) && paramsRequireAlloc(paramTypes) {
+		return nil, fmt.Errorf("canonical allocator not available for export %q", b.name)
+	}
+	if (mem == nil || mem.mem == nil) && paramsRequireMemory(paramTypes) {
+		return nil, fmt.Errorf("canonical memory not available for export %q", b.name)
+	}
+	if (mem == nil || mem.mem == nil) && resultsRequireMemory(resultTypes) {
+		return nil, fmt.Errorf("canonical memory not available for export %q", b.name)
+	}
+
+	memInterface := bindingMemoryInterface(b)
+	allocInterface := bindingAllocatorInterface(b)
+	if alloc != nil {
+		alloc.setContext(ctx)
+	}
 
 	allocList := transcoder.NewAllocationList()
-	defer allocList.FreeAndRelease(i.alloc)
+	defer allocList.Release()
+	if !b.isCanonical() && allocInterface != nil {
+		defer allocList.Free(allocInterface)
+	}
 
 	// Encode parameters - encoder internally uses compiled fast path when possible
-	flatParams, err := i.encoder.EncodeParams(paramTypes, params, i.memory, i.alloc, allocList)
+	flatParams, err := i.encoder.EncodeParams(paramTypes, params, memInterface, allocInterface, allocList)
 	if err != nil {
+		if b.isCanonical() && allocInterface != nil {
+			allocList.Free(allocInterface)
+		}
 		return nil, fmt.Errorf("encode params: %w", err)
 	}
 
@@ -638,27 +899,32 @@ func (i *WazeroInstance) callGeneral(ctx context.Context, fn api.Function, param
 		stackSize = 1
 	}
 
-	if err := fn.CallWithStack(ctx, i.stackBuf[:stackSize]); err != nil {
+	if err := b.fn.CallWithStack(ctx, i.stackBuf[:stackSize]); err != nil {
 		return nil, fmt.Errorf("wasm call failed: %w", err)
 	}
 
 	var goResults []any
+	var rawResults []uint64
 	if usesIndirectReturn {
 		// Callee allocated return buffer and returned pointer to it in stackBuf[0]
 		retptr := uint32(i.stackBuf[0])
+		rawResults = []uint64{uint64(retptr)}
+		if mem == nil || mem.mem == nil {
+			return nil, fmt.Errorf("decode results: memory not available")
+		}
 		if len(resultTypes) == 1 {
 			if _, isString := resultTypes[0].(wit.String); isString {
 				// Fast path for string results
-				ptr, err := i.memory.ReadU32(retptr)
+				ptr, err := mem.ReadU32(retptr)
 				if err != nil {
 					return nil, fmt.Errorf("read string pointer at 0x%x: %w", retptr, err)
 				}
-				length, err := i.memory.ReadU32(retptr + 4)
+				length, err := mem.ReadU32(retptr + 4)
 				if err != nil {
 					return nil, fmt.Errorf("read string length at 0x%x: %w", retptr+4, err)
 				}
 				if length > 0 {
-					data, err := i.memory.Read(ptr, length)
+					data, err := mem.Read(ptr, length)
 					if err != nil {
 						return nil, fmt.Errorf("read string data at 0x%x (len %d): %w", ptr, length, err)
 					}
@@ -668,7 +934,7 @@ func (i *WazeroInstance) callGeneral(ctx context.Context, fn api.Function, param
 				}
 			} else {
 				// Load value directly from memory at retptr address
-				val, err := i.decoder.LoadValue(resultTypes[0], retptr, i.memory)
+				val, err := i.decoder.LoadValue(resultTypes[0], retptr, memInterface)
 				if err != nil {
 					return nil, fmt.Errorf("load indirect result: %w", err)
 				}
@@ -679,7 +945,7 @@ func (i *WazeroInstance) callGeneral(ctx context.Context, fn api.Function, param
 			goResults = make([]any, len(resultTypes))
 			offset := uint32(0)
 			for idx, rt := range resultTypes {
-				val, err := i.decoder.LoadValue(rt, retptr+offset, i.memory)
+				val, err := i.decoder.LoadValue(rt, retptr+offset, memInterface)
 				if err != nil {
 					return nil, fmt.Errorf("load indirect result[%d]: %w", idx, err)
 				}
@@ -687,12 +953,23 @@ func (i *WazeroInstance) callGeneral(ctx context.Context, fn api.Function, param
 				offset += resultSize(rt)
 			}
 		}
-	} else {
+	} else if len(resultTypes) > 0 {
 		// Decode results from flat return values in stackBuf
+		count := flatResultCount(resultTypes)
+		rawResults = make([]uint64, count)
+		copy(rawResults, i.stackBuf[:count])
 		var err error
-		goResults, err = i.decoder.DecodeResults(resultTypes, i.stackBuf, i.memory)
+		goResults, err = i.decoder.DecodeResults(resultTypes, i.stackBuf, memInterface)
 		if err != nil {
 			return nil, fmt.Errorf("decode results: %w", err)
+		}
+	}
+
+	// Post-return cleanup
+	if b.postReturn != nil {
+		callCtx := i.prepareCallContext(ctx)
+		if _, err := b.postReturn.Call(callCtx, rawResults...); err != nil {
+			return nil, fmt.Errorf("post-return: %w", err)
 		}
 	}
 

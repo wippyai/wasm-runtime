@@ -72,6 +72,17 @@ func (p *Parser) parseDualIdxPair(idxMap map[string]uint32) (uint32, uint32, err
 }
 
 func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
+	return p.parseInstructionSequence(localMap, false)
+}
+
+// parseFoldedInstr is entered only after consuming an expression's opening
+// parenthesis. Only its first instruction owns subsequent operand expressions;
+// instructions in a structured body are a new, flat instruction sequence.
+func (p *Parser) parseFoldedInstr(localMap map[string]uint32) ([]ast.Instr, error) {
+	return p.parseInstructionSequence(localMap, true)
+}
+
+func (p *Parser) parseInstructionSequence(localMap map[string]uint32, firstFolded bool) ([]ast.Instr, error) {
 	var instrs []ast.Instr
 
 	for {
@@ -82,7 +93,7 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 
 		if t.Type == token.LParen {
 			p.next()
-			nested, err := p.parseInstrs(localMap)
+			nested, err := p.parseFoldedInstr(localMap)
 			if err != nil {
 				return nil, err
 			}
@@ -100,9 +111,11 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 		p.next()
 		name := t.Value
 		line := t.Line
+		folded := firstFolded
+		firstFolded = false
 
 		if info, ok := opcode.Lookup(name); ok {
-			result, err := p.parseSimpleInstr(name, info, localMap)
+			result, err := p.parseSimpleInstr(name, info, localMap, folded)
 			if err != nil {
 				return nil, err
 			}
@@ -111,7 +124,7 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 		}
 
 		if memOp, ok := opcode.LookupMemory(name); ok {
-			result, err := p.parseMemoryInstr(memOp, localMap)
+			result, err := p.parseMemoryInstr(memOp, localMap, folded)
 			if err != nil {
 				return nil, err
 			}
@@ -120,7 +133,7 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 		}
 
 		if prefOp, ok := opcode.LookupPrefixed(name); ok {
-			result, err := p.parsePrefixedInstr(name, prefOp, localMap)
+			result, err := p.parsePrefixedInstr(name, prefOp, localMap, folded)
 			if err != nil {
 				return nil, err
 			}
@@ -157,13 +170,13 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 			}
 
 			// Check for folded condition: (if (condition) ...)
-			if t := p.peek(); t != nil && t.Type == token.LParen {
+			if t := p.peek(); folded && t != nil && t.Type == token.LParen {
 				saved := p.pos
 				p.next()
 				if nt := p.peek(); nt != nil && nt.Type == token.Ident && (nt.Value == "then" || nt.Value == "result" || nt.Value == "param") {
 					p.pos = saved
 				} else {
-					cond, err := p.parseInstrs(localMap)
+					cond, err := p.parseFoldedInstr(localMap)
 					if err != nil {
 						return nil, err
 					}
@@ -257,13 +270,13 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 				return nil, err
 			}
 
-			for {
+			for folded {
 				if t := p.peek(); t == nil || t.Type == token.RParen {
 					break
 				}
 				if t := p.peek(); t != nil && t.Type == token.LParen {
 					p.next()
-					ops, err := p.parseInstrs(localMap)
+					ops, err := p.parseFoldedInstr(localMap)
 					if err != nil {
 						return nil, err
 					}
@@ -309,12 +322,12 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 			if len(labels) == 0 {
 				return nil, fmt.Errorf("br_table requires at least one label")
 			}
-			for {
+			for folded {
 				if t := p.peek(); t == nil || t.Type != token.LParen {
 					break
 				}
 				p.next()
-				ops, err := p.parseInstrs(localMap)
+				ops, err := p.parseFoldedInstr(localMap)
 				if err != nil {
 					return nil, err
 				}
@@ -334,7 +347,7 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 					return nil, err
 				}
 			}
-			ops, err := p.parseOperands(localMap, 1)
+			ops, err := p.parseOperands(localMap, 1, folded)
 			if err != nil {
 				return nil, err
 			}
@@ -350,7 +363,7 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 					return nil, err
 				}
 			}
-			ops, err := p.parseOperands(localMap, 2)
+			ops, err := p.parseOperands(localMap, 2, folded)
 			if err != nil {
 				return nil, err
 			}
@@ -407,7 +420,7 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 					break
 				}
 			}
-			ops, err := p.parseOperands(localMap, 3)
+			ops, err := p.parseOperands(localMap, 3, folded)
 			if err != nil {
 				return nil, err
 			}
@@ -426,7 +439,7 @@ func (p *Parser) parseInstrs(localMap map[string]uint32) ([]ast.Instr, error) {
 	return instrs, nil
 }
 
-func (p *Parser) parseSimpleInstr(name string, info opcode.Info, localMap map[string]uint32) ([]ast.Instr, error) {
+func (p *Parser) parseSimpleInstr(name string, info opcode.Info, localMap map[string]uint32, folded bool) ([]ast.Instr, error) {
 	var result []ast.Instr
 
 	var imm interface{}
@@ -545,18 +558,18 @@ func (p *Parser) parseSimpleInstr(name string, info opcode.Info, localMap map[st
 	}
 
 	if info.Operands > 0 {
-		ops, err := p.parseOperands(localMap, info.Operands)
+		ops, err := p.parseOperands(localMap, info.Operands, folded)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, ops...)
-	} else if info.Operands == -1 {
+	} else if folded && info.Operands == -1 {
 		for {
 			if t := p.peek(); t == nil || t.Type != token.LParen {
 				break
 			}
 			p.next()
-			ops, err := p.parseInstrs(localMap)
+			ops, err := p.parseFoldedInstr(localMap)
 			if err != nil {
 				return nil, err
 			}
@@ -571,7 +584,7 @@ func (p *Parser) parseSimpleInstr(name string, info opcode.Info, localMap map[st
 	return result, nil
 }
 
-func (p *Parser) parseMemoryInstr(memOp opcode.MemoryOp, localMap map[string]uint32) ([]ast.Instr, error) {
+func (p *Parser) parseMemoryInstr(memOp opcode.MemoryOp, localMap map[string]uint32, folded bool) ([]ast.Instr, error) {
 	var result []ast.Instr
 
 	ma := ast.Memarg{Align: memOp.NaturalAlign, Offset: 0}
@@ -639,7 +652,7 @@ func (p *Parser) parseMemoryInstr(memOp opcode.MemoryOp, localMap map[string]uin
 		}
 	}
 
-	ops, err := p.parseOperands(localMap, memOp.Operands)
+	ops, err := p.parseOperands(localMap, memOp.Operands, folded)
 	if err != nil {
 		return nil, err
 	}
@@ -649,12 +662,15 @@ func (p *Parser) parseMemoryInstr(memOp opcode.MemoryOp, localMap map[string]uin
 	return result, nil
 }
 
-func (p *Parser) parseOperands(localMap map[string]uint32, count int) ([]ast.Instr, error) {
+func (p *Parser) parseOperands(localMap map[string]uint32, count int, folded bool) ([]ast.Instr, error) {
+	if !folded {
+		return nil, nil
+	}
 	var result []ast.Instr
 	for i := 0; i < count; i++ {
 		if t := p.peek(); t != nil && t.Type == token.LParen {
 			p.next()
-			ops, err := p.parseInstrs(localMap)
+			ops, err := p.parseFoldedInstr(localMap)
 			if err != nil {
 				return nil, err
 			}
@@ -733,7 +749,7 @@ func (p *Parser) parseIfBody(localMap map[string]uint32) ([]ast.Instr, error) {
 
 		if t.Type == token.LParen {
 			p.next()
-			nested, err := p.parseInstrs(localMap)
+			nested, err := p.parseFoldedInstr(localMap)
 			if err != nil {
 				return nil, err
 			}
@@ -824,15 +840,15 @@ func (p *Parser) parseFlatInstr(name string, localMap map[string]uint32) ([]ast.
 	}
 
 	if info, ok := opcode.Lookup(name); ok {
-		return p.parseSimpleInstr(name, info, localMap)
+		return p.parseSimpleInstr(name, info, localMap, false)
 	}
 
 	if memOp, ok := opcode.LookupMemory(name); ok {
-		return p.parseMemoryInstr(memOp, localMap)
+		return p.parseMemoryInstr(memOp, localMap, false)
 	}
 
 	if prefOp, ok := opcode.LookupPrefixed(name); ok {
-		return p.parsePrefixedInstr(name, prefOp, localMap)
+		return p.parsePrefixedInstr(name, prefOp, localMap, false)
 	}
 
 	return nil, fmt.Errorf("unknown instruction: %s", name)
@@ -870,7 +886,7 @@ func (p *Parser) parseFlatBlock(name string, localMap map[string]uint32) ([]ast.
 	return instrs, nil
 }
 
-func (p *Parser) parsePrefixedInstr(name string, prefOp opcode.PrefixedOp, localMap map[string]uint32) ([]ast.Instr, error) {
+func (p *Parser) parsePrefixedInstr(name string, prefOp opcode.PrefixedOp, localMap map[string]uint32, folded bool) ([]ast.Instr, error) {
 	var instrs []ast.Instr
 	var imm interface{} = prefOp.Subop
 
@@ -880,7 +896,7 @@ func (p *Parser) parsePrefixedInstr(name string, prefOp opcode.PrefixedOp, local
 		if err != nil {
 			return nil, err
 		}
-		ops, err := p.parseOperands(localMap, 3)
+		ops, err := p.parseOperands(localMap, 3, folded)
 		if err != nil {
 			return nil, err
 		}
@@ -899,7 +915,7 @@ func (p *Parser) parsePrefixedInstr(name string, prefOp opcode.PrefixedOp, local
 		if err != nil {
 			return nil, err
 		}
-		ops, err := p.parseOperands(localMap, 3)
+		ops, err := p.parseOperands(localMap, 3, folded)
 		if err != nil {
 			return nil, err
 		}
@@ -926,7 +942,7 @@ func (p *Parser) parsePrefixedInstr(name string, prefOp opcode.PrefixedOp, local
 				return nil, err
 			}
 		}
-		ops, err := p.parseOperands(localMap, 3)
+		ops, err := p.parseOperands(localMap, 3, folded)
 		if err != nil {
 			return nil, err
 		}
@@ -946,7 +962,7 @@ func (p *Parser) parsePrefixedInstr(name string, prefOp opcode.PrefixedOp, local
 		if name == "table.fill" {
 			opCount = 3
 		}
-		ops, err := p.parseOperands(localMap, opCount)
+		ops, err := p.parseOperands(localMap, opCount, folded)
 		if err != nil {
 			return nil, err
 		}
@@ -984,7 +1000,7 @@ func (p *Parser) parsePrefixedInstr(name string, prefOp opcode.PrefixedOp, local
 				p.pos = saved
 			}
 		}
-		ops, err := p.parseOperands(localMap, 3)
+		ops, err := p.parseOperands(localMap, 3, folded)
 		if err != nil {
 			return nil, err
 		}
@@ -996,7 +1012,7 @@ func (p *Parser) parsePrefixedInstr(name string, prefOp opcode.PrefixedOp, local
 		if err != nil {
 			return nil, err
 		}
-		ops, err := p.parseOperands(localMap, 3)
+		ops, err := p.parseOperands(localMap, 3, folded)
 		if err != nil {
 			return nil, err
 		}
@@ -1004,7 +1020,7 @@ func (p *Parser) parsePrefixedInstr(name string, prefOp opcode.PrefixedOp, local
 		imm = []uint32{prefOp.Subop, destMem, srcMem}
 
 	default:
-		ops, err := p.parseOperands(localMap, prefOp.Operands)
+		ops, err := p.parseOperands(localMap, prefOp.Operands, folded)
 		if err != nil {
 			return nil, err
 		}

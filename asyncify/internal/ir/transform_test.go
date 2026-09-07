@@ -14,17 +14,16 @@ func TestAnalyze_NoAsyncCalls(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
-	config := &TransformConfig{
+	config := &testLinearizeConfig{
 		AsyncFuncs: map[uint32]bool{0: true},
 	}
-	result := Analyze(tree, config)
+	result := prepareFixture(t, instrs, config)
 
-	if result.NeedsTransform {
+	if result.NeedsTransform() {
 		t.Error("expected no transform needed")
 	}
-	if len(result.CallSites) != 0 {
-		t.Errorf("expected 0 call sites, got %d", len(result.CallSites))
+	if result.SuspensionCount() != 0 {
+		t.Errorf("expected 0 call sites, got %d", result.SuspensionCount())
 	}
 }
 
@@ -34,17 +33,16 @@ func TestAnalyze_WithAsyncCall(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
-	config := &TransformConfig{
+	config := &testLinearizeConfig{
 		AsyncFuncs: map[uint32]bool{0: true},
 	}
-	result := Analyze(tree, config)
+	result := prepareFixture(t, instrs, config)
 
-	if !result.NeedsTransform {
+	if !result.NeedsTransform() {
 		t.Error("expected transform needed")
 	}
-	if len(result.CallSites) != 1 {
-		t.Errorf("expected 1 call site, got %d", len(result.CallSites))
+	if result.SuspensionCount() != 1 {
+		t.Errorf("expected 1 call site, got %d", result.SuspensionCount())
 	}
 }
 
@@ -58,16 +56,15 @@ func TestAnalyze_AsyncInBranch(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
-	config := &TransformConfig{
+	config := &testLinearizeConfig{
 		AsyncFuncs: map[uint32]bool{0: true},
 	}
-	result := Analyze(tree, config)
+	result := prepareFixture(t, instrs, config)
 
-	if !result.NeedsTransform {
+	if !result.NeedsTransform() {
 		t.Error("expected transform needed")
 	}
-	if !result.HasAsyncInBranch {
+	if !result.HasAsyncInBranch() {
 		t.Error("expected HasAsyncInBranch to be true")
 	}
 }
@@ -79,13 +76,12 @@ func TestAnalyze_CallIndirect(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
-	config := &TransformConfig{
+	config := &testLinearizeConfig{
 		AsyncFuncs: map[uint32]bool{},
 	}
-	result := Analyze(tree, config)
+	result := prepareFixture(t, instrs, config)
 
-	if !result.NeedsTransform {
+	if !result.NeedsTransform() {
 		t.Error("expected transform needed for call_indirect")
 	}
 }
@@ -103,16 +99,15 @@ func TestAnalyze_NestedAsync(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
-	config := &TransformConfig{
+	config := &testLinearizeConfig{
 		AsyncFuncs: map[uint32]bool{0: true},
 	}
-	result := Analyze(tree, config)
+	result := prepareFixture(t, instrs, config)
 
-	if !result.NeedsTransform {
+	if !result.NeedsTransform() {
 		t.Error("expected transform needed")
 	}
-	if !result.HasAsyncInBranch {
+	if !result.HasAsyncInBranch() {
 		t.Error("expected HasAsyncInBranch for nested async")
 	}
 }
@@ -125,16 +120,15 @@ func TestAnalyze_MultipleAsyncCalls(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
-	config := &TransformConfig{
+	config := &testLinearizeConfig{
 		AsyncFuncs: map[uint32]bool{0: true},
 	}
-	result := Analyze(tree, config)
+	result := prepareFixture(t, instrs, config)
 
-	if !result.NeedsTransform {
+	if !result.NeedsTransform() {
 		t.Error("expected transform needed")
 	}
-	if len(result.CallSites) != 2 {
-		t.Errorf("expected 2 call sites, got %d", len(result.CallSites))
+	if result.SuspensionCount() != 2 {
+		t.Errorf("expected 2 call sites, got %d", result.SuspensionCount())
 	}
 }

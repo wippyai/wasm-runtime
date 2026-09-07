@@ -2,12 +2,15 @@ package linker
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/wippyai/wasm-runtime/asyncify"
 	"github.com/wippyai/wasm-runtime/component"
 	"github.com/wippyai/wasm-runtime/linker/internal/graph"
+	"github.com/wippyai/wasm-runtime/wasm"
 	"go.uber.org/zap"
 )
 
@@ -17,22 +20,26 @@ import (
 // It is thread-safe: NewInstance can be called concurrently from multiple goroutines.
 // Each call creates an independent Instance with its own module instances.
 type InstancePre struct {
+	closeErr            error
+	depGraph            *graph.Graph
+	canonLifts          map[uint32]*canonLiftInfo
 	hostModuleBindings  map[string][]resolvedBinding
 	component           *component.ValidatedComponent
 	expectedGlobalTypes map[string]map[string]GlobalImport
 	linker              *Linker
 	graph               *component.InstanceGraph
-	depGraph            *graph.Graph
-	expectedFuncTypes   map[string]map[string]importSig
-	compFuncSources     map[uint32]compFuncSource
-	canonLifts          map[uint32]*canonLiftInfo
 	typeResolver        *component.TypeResolver
+	compFuncSources     map[uint32]compFuncSource
+	expectedFuncTypes   map[string]map[string]importSig
 	transformedModules  []bool
 	bindings            []resolvedBinding
 	topoOrder           []int
 	compiled            []wazero.CompiledModule
+	ownedMemoryTypes    [][]wasm.MemoryType
 	numExports          int
 	numInstances        int
+	closeOnce           sync.Once
+	closed              atomic.Bool
 }
 
 // isCoreModuleTransformed reports whether the core module at index i was transformed
@@ -48,10 +55,11 @@ func (pre *InstancePre) isCoreModuleTransformed(i int) bool {
 type canonLiftInfo struct {
 	CoreFuncIndex   uint32 // core function being lifted
 	TypeIndex       uint32 // component type index
-	MemoryIndex     uint32 // memory index (0 = default)
+	MemoryIndex     uint32 // memory index when HasMemory is true
 	ReallocIndex    int32  // realloc core func index (-1 = not specified)
 	PostReturnIndex int32  // post-return core func index (-1 = not specified)
 	Encoding        byte   // string encoding
+	HasMemory       bool   // distinguishes omitted memory from memory index zero
 }
 
 // resolvedBinding describes a resolved import binding
@@ -103,7 +111,13 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 			pre.transformedModules[i] = true
 		}
 
-		compiled, err := l.runtime.CompileModule(ctx, modBytes)
+		// Inspect the final transformed binary, not the original component:
+		// Asyncify may introduce a memory even when the input had none.
+		metadata, err := wasm.ParseModuleMetadata(modBytes)
+		var compiled wazero.CompiledModule
+		if err == nil {
+			compiled, err = l.runtime.CompileModule(ctx, modBytes)
+		}
 		if err != nil {
 			// Clean up already-compiled modules before returning error
 			for j, cm := range pre.compiled {
@@ -116,6 +130,7 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 			return nil, instError("compile", i, "", "module compilation failed", err)
 		}
 		pre.compiled = append(pre.compiled, compiled)
+		pre.ownedMemoryTypes = append(pre.ownedMemoryTypes, metadata.Memories)
 	}
 
 	// Build instance graph if we have core instances
@@ -392,11 +407,13 @@ func (pre *InstancePre) buildCanonLifts() map[uint32]*canonLiftInfo {
 						PostReturnIndex: -1,
 						Encoding:        canon.Parsed.GetStringEncoding(),
 					}
-					// Check for post-return option
+					// Preserve options on this exact lift; multiple lifts may share a core function and type.
 					for _, opt := range canon.Parsed.Options {
-						if opt.Kind == component.CanonOptPostReturn {
+						switch opt.Kind {
+						case component.CanonOptMemory:
+							info.HasMemory = true
+						case component.CanonOptPostReturn:
 							info.PostReturnIndex = int32(opt.Index)
-							break
 						}
 					}
 					lifts[funcIdx] = info
@@ -499,16 +516,18 @@ func (pre *InstancePre) Component() *component.ValidatedComponent {
 	return pre.component
 }
 
-// Close releases compiled module resources
+// Close releases this template's compiled handles exactly once. The descriptor
+// slice remains immutable for existing instances and concurrent readers.
 func (pre *InstancePre) Close(ctx context.Context) error {
-	var firstErr error
-	for _, cm := range pre.compiled {
-		if err := cm.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
+	pre.closeOnce.Do(func() {
+		pre.closed.Store(true)
+		for _, cm := range pre.compiled {
+			if err := cm.Close(ctx); err != nil && pre.closeErr == nil {
+				pre.closeErr = err
+			}
 		}
-	}
-	pre.compiled = nil
-	return firstErr
+	})
+	return pre.closeErr
 }
 
 // IsRequiredFromHost checks if a function must be provided by the host.

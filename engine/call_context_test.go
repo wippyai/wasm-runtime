@@ -13,6 +13,8 @@ import (
 
 type parentCtxKey struct{}
 
+var engineContextBenchmarkSink context.Context
+
 func newEngineCallInstance() *WazeroInstance {
 	asyncify := NewAsyncify()
 	return &WazeroInstance{
@@ -116,12 +118,15 @@ func TestCallSessionStep_RetainedContextIsImmutable(t *testing.T) {
 	originalResources := inst.resources
 	originalAsyncify := inst.asyncify
 	originalScheduler := inst.scheduler
+	originalLinker := &linker.Instance{}
+	inst.linkerInst = originalLinker
 
 	retained := captureStepContext(context.Background(), t, inst)
 
 	inst.resources = resource.NewTable()
 	inst.asyncify = NewAsyncify()
 	inst.scheduler = NewScheduler(inst.asyncify)
+	inst.linkerInst = &linker.Instance{}
 	next := captureStepContext(context.Background(), t, inst)
 
 	if retained == next {
@@ -129,6 +134,12 @@ func TestCallSessionStep_RetainedContextIsImmutable(t *testing.T) {
 	}
 	if ResourcesFromContext(retained) != originalResources || GetAsyncify(retained) != originalAsyncify || GetScheduler(retained) != originalScheduler {
 		t.Fatal("retained step context changed after a later step")
+	}
+	if got := linker.InstanceFromContext(retained); got != originalLinker {
+		t.Fatalf("retained linker instance = %p, want %p", got, originalLinker)
+	}
+	if got := linker.InstanceFromContext(next); got != inst.linkerInst {
+		t.Fatalf("next linker instance = %p, want %p", got, inst.linkerInst)
 	}
 	assertEngineIdentity(next, t, inst)
 }
@@ -228,6 +239,39 @@ func TestCallSessionStep_LinkerInstanceWhenPresent(t *testing.T) {
 	assertEngineIdentity(wrapped, t, withLinker)
 }
 
+func TestEngineCallContext_LinkerInstanceSurvivesStandardWrappers(t *testing.T) {
+	parentInstance := &linker.Instance{}
+	ownedInstance := &linker.Instance{}
+	parent := linker.WithInstance(context.Background(), parentInstance)
+	inst := newEngineCallInstance()
+	inst.linkerInst = ownedInstance
+
+	base := withEngineCallContext(parent, inst)
+	wrapped := context.WithValue(base, parentCtxKey{}, "wrapped")
+	wrapped, cancel := context.WithCancel(wrapped)
+	defer cancel()
+	if got := linker.InstanceFromContext(wrapped); got != ownedInstance {
+		t.Fatalf("wrapped linker instance = %p, want owned %p", got, ownedInstance)
+	}
+	if got := wrapped.Value(parentCtxKey{}); got != "wrapped" {
+		t.Fatalf("wrapped value = %v, want wrapped", got)
+	}
+}
+
+func TestEngineCallContext_NilLinkerDelegatesAndExplicitNilShadows(t *testing.T) {
+	parentInstance := &linker.Instance{}
+	parent := linker.WithInstance(context.Background(), parentInstance)
+	ctx := withEngineCallContext(parent, newEngineCallInstance())
+	wrapped, cancel := context.WithCancel(context.WithValue(ctx, parentCtxKey{}, "wrapped"))
+	defer cancel()
+	if got := linker.InstanceFromContext(wrapped); got != parentInstance {
+		t.Fatalf("delegated linker instance = %p, want parent %p", got, parentInstance)
+	}
+	if got := linker.InstanceFromContext(linker.WithInstance(wrapped, nil)); got != nil {
+		t.Fatalf("explicit nil linker instance = %p, want nil", got)
+	}
+}
+
 func TestPrepareCallContext_SyncPathUnchanged(t *testing.T) {
 	inst := newEngineCallInstance()
 	inst.linkerInst = &linker.Instance{}
@@ -240,6 +284,33 @@ func TestPrepareCallContext_SyncPathUnchanged(t *testing.T) {
 	}
 	if GetAsyncify(ctx) != nil || GetScheduler(ctx) != nil {
 		t.Fatal("prepareCallContext attached asyncify or scheduler")
+	}
+}
+
+func TestPrepareCallContext_PreservesParentKeysAndWrappedLinkerIdentity(t *testing.T) {
+	parentAsyncify := NewAsyncify()
+	parentScheduler := NewScheduler(parentAsyncify)
+	parentInstance := &linker.Instance{}
+	parent := WithAsyncify(context.Background(), parentAsyncify)
+	parent = WithScheduler(parent, parentScheduler)
+	parent = linker.WithInstance(parent, parentInstance)
+	inst := newEngineCallInstance()
+	inst.linkerInst = &linker.Instance{}
+
+	ctx := inst.prepareCallContext(parent)
+	wrapped, cancel := context.WithCancel(context.WithValue(ctx, parentCtxKey{}, "wrapped"))
+	defer cancel()
+	if got := ResourcesFromContext(wrapped); got != inst.resources {
+		t.Fatalf("resources = %p, want %p", got, inst.resources)
+	}
+	if got := GetAsyncify(wrapped); got != parentAsyncify {
+		t.Fatalf("asyncify = %p, want parent %p", got, parentAsyncify)
+	}
+	if got := GetScheduler(wrapped); got != parentScheduler {
+		t.Fatalf("scheduler = %p, want parent %p", got, parentScheduler)
+	}
+	if got := linker.InstanceFromContext(wrapped); got != inst.linkerInst {
+		t.Fatalf("linker instance = %p, want owned %p", got, inst.linkerInst)
 	}
 }
 
@@ -295,7 +366,23 @@ func BenchmarkEngineCallContext(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ctx := withEngineCallContext(parent, inst)
+		engineContextBenchmarkSink = ctx
 		if ResourcesFromContext(ctx) != inst.resources || GetAsyncify(ctx) != inst.asyncify || GetScheduler(ctx) != inst.scheduler {
+			b.Fatal("engine keys missing")
+		}
+	}
+}
+
+func BenchmarkEngineCallContextWithLinker(b *testing.B) {
+	inst := newEngineCallInstance()
+	inst.linkerInst = &linker.Instance{}
+	parent := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ctx := withEngineCallContext(parent, inst)
+		engineContextBenchmarkSink = ctx
+		if ResourcesFromContext(ctx) != inst.resources || GetAsyncify(ctx) != inst.asyncify || GetScheduler(ctx) != inst.scheduler || linker.InstanceFromContext(ctx) != inst.linkerInst {
 			b.Fatal("engine keys missing")
 		}
 	}

@@ -330,3 +330,92 @@ func TestBindResult3_StackBoundsAndNilChecks(t *testing.T) {
 		t.Fatal("expected liftErr for nil paramTypes, got nil")
 	}
 }
+
+type ownedPayload struct {
+	Format string
+	Data   []byte
+}
+
+// TestBindResult3WithOwnedArgsCopiesGuestRecordList proves the owned callback
+// can retain its typed inputs after the host call. The mutation models guest
+// memory being reused after Send has suspended and yielded its command.
+func TestBindResult3WithOwnedArgsCopiesGuestRecordList(t *testing.T) {
+	compiler := transcoder.NewCompiler()
+	payloadType := &wit.TypeDef{Kind: &wit.Record{Fields: []wit.Field{
+		{Name: "format", Type: wit.String{}},
+		{Name: "data", Type: &wit.TypeDef{Kind: &wit.List{Type: wit.U8{}}}},
+	}}}
+	payloadsType := &wit.TypeDef{Kind: &wit.List{Type: payloadType}}
+	ctTarget, err := compiler.Compile(wit.String{}, reflect.TypeFor[string]())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctTopic, err := compiler.Compile(wit.String{}, reflect.TypeFor[string]())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctPayloads, err := compiler.Compile(payloadsType, reflect.TypeFor[[]ownedPayload]())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mem := newTestMemory(512)
+	const (
+		targetAddr  = 16
+		topicAddr   = 48
+		headersAddr = 96
+		formatAddr  = 160
+		dataAddr    = 208
+	)
+	target, topic, format := "{local@actors|target}", "reply", "bytes"
+	data := []byte("before-suspend")
+	for addr, value := range map[uint32][]byte{
+		targetAddr: []byte(target),
+		topicAddr:  []byte(topic),
+		formatAddr: []byte(format),
+		dataAddr:   data,
+	} {
+		if err := mem.Write(addr, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	header := make([]byte, 16)
+	for i, value := range []uint32{formatAddr, uint32(len(format)), dataAddr, uint32(len(data))} {
+		binary.LittleEndian.PutUint32(header[i*4:], value)
+	}
+	if err := mem.Write(headersAddr, header); err != nil {
+		t.Fatal(err)
+	}
+
+	fallbackCalls, ownedCalls := 0, 0
+	var retainedTarget, retainedTopic string
+	var retainedPayloads []ownedPayload
+	host := BindResult3WithOwnedArgsAndResume(
+		func(context.Context, string, string, []ownedPayload) (uint32, error) {
+			fallbackCalls++
+			return 0, nil
+		},
+		func(_ context.Context, target, topic string, payloads []ownedPayload) (uint32, error) {
+			ownedCalls++
+			retainedTarget, retainedTopic = target, topic
+			// sendPending retains the payload values; keep the same ownership shape.
+			retainedPayloads = append([]ownedPayload(nil), payloads...)
+			return 1, nil
+		},
+		func(context.Context) (uint32, error) { return 0, nil },
+	)
+	_, hostErr, liftErr := host.invoke(context.Background(), transcoder.NewDecoderWithCompiler(compiler), []*transcoder.CompiledType{ctTarget, ctTopic, ctPayloads}, []uint64{targetAddr, uint64(len(target)), topicAddr, uint64(len(topic)), headersAddr, 1}, mem)
+	if liftErr != nil || hostErr != nil {
+		t.Fatalf("invoke errors: lift=%v host=%v", liftErr, hostErr)
+	}
+	if fallbackCalls != 0 || ownedCalls != 1 {
+		t.Fatalf("fallback=%d owned=%d", fallbackCalls, ownedCalls)
+	}
+
+	for i := range mem.data {
+		mem.data[i] = '!'
+	}
+	if retainedTarget != target || retainedTopic != topic || len(retainedPayloads) != 1 || retainedPayloads[0].Format != format || string(retainedPayloads[0].Data) != string(data) {
+		t.Fatalf("retained values alias guest memory: target=%q topic=%q payloads=%+v", retainedTarget, retainedTopic, retainedPayloads)
+	}
+}

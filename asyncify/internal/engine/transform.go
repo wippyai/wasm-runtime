@@ -2,16 +2,13 @@ package engine
 
 import (
 	"fmt"
-	"math"
 
 	"github.com/wippyai/wasm-runtime/asyncify/internal/codegen"
 	"github.com/wippyai/wasm-runtime/asyncify/internal/handler"
 	"github.com/wippyai/wasm-runtime/asyncify/internal/ir"
+	"github.com/wippyai/wasm-runtime/asyncify/internal/semantics"
 	"github.com/wippyai/wasm-runtime/wasm"
 )
-
-// maxAsyncifyFrameSize is the maximum frame size that can be safely cast to int32.
-const maxAsyncifyFrameSize = math.MaxInt32
 
 // Block structure constants for asyncify.
 //
@@ -36,19 +33,21 @@ const (
 	scratchCallIndexSave   = 0 // i32: call site index for save path
 	scratchCallIndexRewind = 1 // i32: call site index loaded during rewind
 	scratchStackPtr        = 2 // i32: asyncify stack pointer
-	// 3-4: i64 scratch, 5-6: f32 scratch, 7-8: f64 scratch, 9: extra i32
-	scratchLocalCount = 10 // total scratch locals allocated
+	scratchLocalCount      = 3 // the three i32 control slots above
 )
 
 // CallSite describes an async call within a function.
 type CallSite struct {
-	CalleeType *wasm.FuncType
-	LiveLocals []uint32
-	InstrIdx   int
+	SourceOperands *ir.Continuation
+	ControlLocals  []uint32
+	Call           semantics.CallOperation
+	LiveLocals     []uint32
+	ActionIndex    int
 }
 
 // FunctionTransformer transforms individual functions to support asyncify.
 type FunctionTransformer struct {
+	calls          *semantics.Calls
 	registry       *handler.Registry
 	module         *wasm.Module
 	globals        GlobalIndices
@@ -59,6 +58,7 @@ type FunctionTransformer struct {
 // NewFunctionTransformer creates a transformer for the given module.
 func NewFunctionTransformer(registry *handler.Registry, m *wasm.Module, globals GlobalIndices, memoryIndex uint32, ignoreIndirect bool) *FunctionTransformer {
 	return &FunctionTransformer{
+		calls:          semantics.NewCalls(m),
 		registry:       registry,
 		module:         m,
 		globals:        globals,
@@ -74,11 +74,6 @@ func (ft *FunctionTransformer) Transform(funcIdx uint32, body *wasm.FuncBody, as
 		return nil
 	}
 
-	instrs, err := wasm.DecodeInstructions(body.Code)
-	if err != nil {
-		return err
-	}
-
 	// Count original locals before any transformations
 	numParams := len(funcType.Params)
 	numOriginalLocals := numParams
@@ -86,81 +81,94 @@ func (ft *FunctionTransformer) Transform(funcIdx uint32, body *wasm.FuncBody, as
 		numOriginalLocals += int(le.Count)
 	}
 
-	// Parse to IR tree and check for async calls
-	tree := ir.Parse(instrs, ft.module)
-	config := &ir.TransformConfig{
-		StateGlobal: ft.globals.StateGlobal,
-		DataGlobal:  ft.globals.DataGlobal,
-		AsyncFuncs:  asyncFuncs,
-		Module:      ft.module,
+	// Resolve suspension once on an owned source tree, before routing is added.
+	suspensionPolicy := func(call semantics.CallOperation) bool {
+		if call.Kind == semantics.DirectCall {
+			return asyncFuncs[call.TargetIndex]
+		}
+		return !ft.ignoreIndirect
 	}
-	analysis := ir.Analyze(tree, config)
-
-	if !analysis.NeedsTransform {
+	analysis, err := ir.Prepare(body.Code, ft.module, ft.calls, suspensionPolicy, funcType.Results)
+	if err != nil {
+		return err
+	}
+	if !analysis.NeedsTransform() {
 		return nil
 	}
 
-	// Validate that no reference types are used in parameters or locals
-	// Only check for functions that actually need transformation
+	// Resolve original local identities before generated locals can alias them.
+	localTypes := make([]wasm.ValType, 0, numOriginalLocals)
+	localTypes = append(localTypes, funcType.Params...)
+	for _, le := range body.Locals {
+		for i := uint32(0); i < le.Count; i++ {
+			localTypes = append(localTypes, le.ValType)
+		}
+	}
+
+	values, err := ir.PlanValues(analysis, func(instr wasm.Instruction) (ir.OperandShape, error) {
+		return ft.sourceOperandShape(instr, localTypes)
+	})
+	if err != nil {
+		return err
+	}
+
+	// Validate every original source operation before eliding non-executing
+	// code. Runtime reachability and Wasm's local-frame validation state differ.
+	source, err := ir.NormalizeSource(values)
+	if err != nil {
+		return err
+	}
+	if !source.NeedsTransform() {
+		return nil
+	}
 	if err := ValidateLocalsForAsyncify(funcType.Params, body.Locals); err != nil {
 		return err
 	}
 
 	// Linearize control flow for asyncify - transforms result-bearing
 	// blocks and if/else to handle rewind correctly
-	var linearizedLocals []uint32
 	allocLocal := func(vt wasm.ValType) uint32 {
 		idx := uint32(numOriginalLocals)
 		numOriginalLocals++
 		body.Locals = append(body.Locals, wasm.LocalEntry{Count: 1, ValType: vt})
-		linearizedLocals = append(linearizedLocals, idx)
+		localTypes = append(localTypes, vt)
 		return idx
 	}
 
 	linearConfig := &ir.LinearizeConfig{
 		StateGlobal:    ft.globals.StateGlobal,
 		StateRewinding: StateRewinding,
-		AsyncFuncs:     asyncFuncs,
-		Module:         ft.module,
 		AllocLocal:     allocLocal,
 	}
-	instrs = ir.Linearize(tree, linearConfig)
-	// Add trailing End instruction
-	instrs = append(instrs, wasm.Instruction{Opcode: wasm.OpEnd})
+	lowered, err := ir.LinearizeNormalized(source, linearConfig)
+	if err != nil {
+		return err
+	}
+	// Consume the checked action program; raw instructions are a projection
+	// for byte-level liveness analysis, not execution ownership.
+	actions, err := lowered.CopyActions()
+	if err != nil {
+		return err
+	}
+	plan, err := newExecutionPlan(actions, lowered)
+	if err != nil {
+		return err
+	}
+	instrs := plan.steps
 
-	// Find async call sites in the (possibly transformed) instructions
-	var callSites []CallSite
-	var asyncCallIndices []int
-	for i, instr := range instrs {
-		if target, ok := instr.GetCallTarget(); ok && asyncFuncs[target] {
-			callSites = append(callSites, CallSite{
-				InstrIdx:   i,
-				CalleeType: ft.module.GetFuncType(target),
-			})
-			asyncCallIndices = append(asyncCallIndices, i)
+	sites := lowered.SuspensionSites()
+
+	// Consume the source analysis's verified call identities and suspension
+	// decisions. Routing may move positions, but cannot invent or retarget calls.
+	callSites := make([]CallSite, 0, len(sites))
+	asyncCallIndices := make([]int, 0, len(sites))
+	for _, site := range sites {
+		callSites = append(callSites, CallSite{ActionIndex: site.ActionIndex, Call: site.Call, SourceOperands: site.Operands, ControlLocals: site.ControlLocals})
+		step, err := plan.sourceStep(site.ActionIndex)
+		if err != nil {
+			return err
 		}
-		if instr.IsIndirectCall() && !ft.ignoreIndirect {
-			var calleeType *wasm.FuncType
-			if imm, ok := instr.Imm.(wasm.CallIndirectImm); ok && int(imm.TypeIdx) < len(ft.module.Types) {
-				calleeType = &ft.module.Types[imm.TypeIdx]
-			}
-			callSites = append(callSites, CallSite{
-				InstrIdx:   i,
-				CalleeType: calleeType,
-			})
-			asyncCallIndices = append(asyncCallIndices, i)
-		}
-		if instr.Opcode == wasm.OpCallRef && !ft.ignoreIndirect {
-			var calleeType *wasm.FuncType
-			if imm, ok := instr.Imm.(wasm.CallRefImm); ok && int(imm.TypeIdx) < len(ft.module.Types) {
-				calleeType = &ft.module.Types[imm.TypeIdx]
-			}
-			callSites = append(callSites, CallSite{
-				InstrIdx:   i,
-				CalleeType: calleeType,
-			})
-			asyncCallIndices = append(asyncCallIndices, i)
-		}
+		asyncCallIndices = append(asyncCallIndices, step)
 	}
 
 	if len(callSites) == 0 {
@@ -171,34 +179,23 @@ func (ft *FunctionTransformer) Transform(funcIdx uint32, body *wasm.FuncBody, as
 	la := NewLivenessAnalyzer(numParams, numOriginalLocals-numParams)
 	livenessInfo := la.ComputeForCallSites(instrs, asyncCallIndices)
 	for i := range callSites {
-		callSites[i].LiveLocals = livenessInfo[callSites[i].InstrIdx]
+		callSites[i].LiveLocals = livenessInfo[asyncCallIndices[i]]
 	}
 
 	scratchStart := uint32(numOriginalLocals)
 
-	// Build local type map BEFORE adding scratch locals
-	localTypes := make([]wasm.ValType, 0, numOriginalLocals)
-	localTypes = append(localTypes, funcType.Params...)
-	for _, le := range body.Locals {
-		for i := uint32(0); i < le.Count; i++ {
-			localTypes = append(localTypes, le.ValType)
-		}
+	// Reserve exactly the control slots consumed by emission. Typed operand
+	// temporaries and call results are allocated separately from this region.
+	for range scratchLocalCount {
+		body.Locals = append(body.Locals, wasm.LocalEntry{Count: 1, ValType: wasm.ValI32})
+		localTypes = append(localTypes, wasm.ValI32)
 	}
 
-	// Add scratch locals with different types
-	scratchTypes := []wasm.ValType{
-		wasm.ValI32, wasm.ValI32, wasm.ValI32, // callIndexSave, callIndexRewind, stackPtr
-		wasm.ValI64, wasm.ValI64,
-		wasm.ValF32, wasm.ValF32,
-		wasm.ValF64, wasm.ValF64,
-		wasm.ValI32, // extra scratch
+	completion, err := lowered.Completion()
+	if err != nil {
+		return err
 	}
-	for _, vt := range scratchTypes {
-		body.Locals = append(body.Locals, wasm.LocalEntry{Count: 1, ValType: vt})
-		localTypes = append(localTypes, vt)
-	}
-
-	code, err := ft.transformLinear(instrs, callSites, funcType, scratchStart, localTypes, body, linearizedLocals)
+	code, err := ft.transformLinear(plan, callSites, funcType, scratchStart, localTypes, body, completion)
 	if err != nil {
 		return err
 	}
@@ -206,48 +203,30 @@ func (ft *FunctionTransformer) Transform(funcIdx uint32, body *wasm.FuncBody, as
 	return nil
 }
 
-// computeLiveUnion computes the union of all live locals across all call sites.
-// This is a conservative approximation - we save any local that is live at ANY call site.
-func computeLiveUnion(callSites []CallSite) map[uint32]bool {
-	union := make(map[uint32]bool)
-	for _, site := range callSites {
-		for _, local := range site.LiveLocals {
-			union[local] = true
-		}
-	}
-	return union
-}
-
 // simulateStackForCallSites does a dry run of instruction processing to track
 // which temporaries are on the simulated stack at each async call site.
-// Returns: set of local indices that need saving, type map for allocated temps, max local index, error.
+// Returns frozen per-continuation operand storage and the temporary allocation plan.
 // Returns error if reference types are on the stack at an async call site (cannot be saved to memory).
 func (ft *FunctionTransformer) simulateStackForCallSites(
-	instrs []wasm.Instruction,
+	actions []ir.Action,
 	callSites []CallSite,
 	scratchStart uint32,
 	localTypes []wasm.ValType,
 	body *wasm.FuncBody,
-	nextResultLocal uint32,
-	callSiteResultLocals map[int][]uint32,
-) (map[uint32]bool, map[uint32]wasm.ValType, uint32, error) {
-	result := make(map[uint32]bool)
-	allocatedTypes := make(map[uint32]wasm.ValType)
+	firstTempLocal uint32,
+	closedRegions map[int]int,
+	source ...*ir.LoweredControl,
+) (*continuationStorage, *TempAllocator, error) {
+	result, err := newContinuationStorage(callSites)
+	if err != nil {
+		return nil, nil, err
+	}
+	allocator := NewTempAllocator(firstTempLocal)
 
 	// Build call site map
 	siteMap := make(map[int]int)
 	for i, site := range callSites {
-		siteMap[site.InstrIdx] = i
-	}
-
-	// Simulate stack - track indices and types
-	// The actual locals will be added by handlers during transformLinear
-	simNextLocal := nextResultLocal
-	allocTemp := func(vt wasm.ValType) uint32 {
-		idx := simNextLocal
-		allocatedTypes[idx] = vt
-		simNextLocal++
-		return idx
+		siteMap[site.ActionIndex] = i
 	}
 
 	// Simple stack simulation
@@ -255,18 +234,125 @@ func (ft *FunctionTransformer) simulateStackForCallSites(
 	var ifSimSnapshots [][]stackEntry
 	var ctrlSimStack []byte
 
-	for i, instr := range instrs {
-		// Skip trailing End
-		if i == len(instrs)-1 && instr.Opcode == wasm.OpEnd {
+	var binding stackBindingStep
+	var routing routingBoundary
+	at := func(index int) (stackEntry, bool) {
+		if index < 0 || index >= len(stack) {
+			return stackEntry{}, false
+		}
+		return stack[index], true
+	}
+	bind := func(index int, token uint64) error { stack[index] = stack[index].WithBinding(token); return nil }
+	for i := 0; i < len(actions); i++ {
+		if err := binding.finish(len(stack), at, bind); err != nil {
+			return nil, nil, err
+		}
+		action := actions[i]
+		if len(source) > 0 && source[0] != nil {
+			domain, ok := action.Domain()
+			if err := routing.advance(ok && domain == semantics.RewindRouting, len(stack), at); err != nil {
+				return nil, nil, err
+			}
+		}
+		if end, ok := closedRegions[i]; ok {
+			allocator.ObserveClosedRegion()
+			i = end
 			continue
 		}
+
+		if len(source) > 0 && source[0] != nil {
+			contract, err := source[0].StackContract(i)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := binding.begin(contract, i, len(stack), at); err != nil {
+				return nil, nil, err
+			}
+		}
+		allocator.SetCurrentInstr(i)
+		if capture, ok := action.Capture(); ok {
+			allocator.ObserveCapture()
+			inputs, err := transferInputs(capture.OperandCount(), capture.Operand, stack)
+			if err != nil {
+				return nil, nil, fmt.Errorf("asyncify: capture action %d: %w", i, err)
+			}
+			for _, input := range inputs {
+				if local, stored := input.LocalIndex(); stored {
+					allocator.ReleaseOnPop(local)
+				}
+			}
+			stack = stack[:len(stack)-len(inputs)]
+			allocator.EndInstruction()
+			continue
+		}
+		if transfer, ok := action.Transfer(); ok {
+			allocator.ObserveTransfer()
+			inputs, err := transferInputs(transfer.OperandCount(), transfer.Operand, stack)
+			if err != nil {
+				return nil, nil, fmt.Errorf("asyncify: scope transfer action %d: %w", i, err)
+			}
+			for _, input := range inputs {
+				if local, stored := input.LocalIndex(); stored {
+					allocator.ReleaseOnPop(local)
+				}
+			}
+			stack = stack[:len(stack)-len(inputs)]
+			allocator.EndInstruction()
+			continue
+		}
+		if operation, ok := action.Branch(); ok {
+			allocator.ObserveBranch()
+			_, after, err := branchOperands(operation, stack)
+			if err != nil {
+				return nil, nil, fmt.Errorf("asyncify: branch action %d: %w", i, err)
+			}
+			allocator.RestoreStack(stack, after)
+			stack = after
+			allocator.EndInstruction()
+			continue
+		}
+		if operation, ok := action.Trap(); ok {
+			allocator.ObserveTrap()
+			prefix, err := retainedPrefix(operation.PrefixCount(), operation.PrefixOperand, stack)
+			if err != nil {
+				return nil, nil, fmt.Errorf("asyncify: trap action %d: %w", i, err)
+			}
+			allocator.ClearStack(stack[len(prefix):])
+			stack = prefix
+			allocator.EndInstruction()
+			continue
+		}
+		if operation, ok := action.Return(); ok {
+			allocator.ObserveReturn()
+			prefix, err := returnPrefix(operation, stack)
+			if err != nil {
+				return nil, nil, fmt.Errorf("asyncify: return action %d: %w", i, err)
+			}
+			if operation.ValidationReachable() {
+				if _, err := transferInputs(operation.OperandCount(), operation.Operand, stack[len(prefix):]); err != nil {
+					return nil, nil, fmt.Errorf("asyncify: return action %d: %w", i, err)
+				}
+			}
+			allocator.ClearStack(stack[len(prefix):])
+			stack = prefix
+			allocator.EndInstruction()
+			continue
+		}
+		instr, primitive := action.Primitive()
+		domain, hasDomain := action.Domain()
+		if !primitive || !hasDomain {
+			return nil, nil, fmt.Errorf("asyncify: action %d has no execution policy", i)
+		}
+		allocator.ObserveAction(instr, domain)
 
 		switch instr.Opcode {
 		case wasm.OpBlock, wasm.OpLoop, wasm.OpIf:
 			ctrlSimStack = append(ctrlSimStack, instr.Opcode)
 		case wasm.OpElse:
 			if len(ifSimSnapshots) > 0 {
+				oldStack := stack
 				stack = append([]stackEntry(nil), ifSimSnapshots[len(ifSimSnapshots)-1]...)
+				allocator.RestoreStack(oldStack, stack)
 			}
 		case wasm.OpEnd:
 			if len(ctrlSimStack) > 0 {
@@ -274,6 +360,7 @@ func (ft *FunctionTransformer) simulateStackForCallSites(
 				ctrlSimStack = ctrlSimStack[:len(ctrlSimStack)-1]
 				if k == wasm.OpIf && len(ifSimSnapshots) > 0 {
 					ifSimSnapshots = ifSimSnapshots[:len(ifSimSnapshots)-1]
+					allocator.PopSnapshot()
 				}
 			}
 		}
@@ -281,70 +368,180 @@ func (ft *FunctionTransformer) simulateStackForCallSites(
 		// Check if this is an async call site
 		callSiteIdx, isAsync := siteMap[i]
 		if isAsync {
+			if err := verifyContinuationOperands(callSites[callSiteIdx].SourceOperands, len(stack), at, allocator); err != nil {
+				return nil, nil, fmt.Errorf("asyncify: lowered continuation at instruction %d: %w", i, err)
+			}
 			// Check for reference types on stack - these cannot be saved to memory
 			for _, entry := range stack {
-				if IsReferenceType(entry.Type) {
-					return nil, nil, 0, fmt.Errorf("reference type %s on stack at async call site (instruction %d); reference types cannot be saved to linear memory", entry.Type, i)
+				if IsReferenceType(entry.Type()) {
+					return nil, nil, fmt.Errorf("reference type %s on stack at async call site (instruction %d); reference types cannot be saved to linear memory", entry.Type(), i)
 				}
-				result[entry.LocalIdx] = true
+			}
+			if err := result.capture(i, stack); err != nil {
+				return nil, nil, err
 			}
 		}
 
-		// For async calls, use preAllocatedResults instead of normal simulation
-		// This ensures simulation matches handler behavior
+		// Call results are ordinary guest definitions with operand lifetimes.
+		// Inputs remain owned until EndInstruction, preventing a dummy unwind
+		// result from overwriting parameters needed when this call resumes.
 		if isAsync {
 			site := callSites[callSiteIdx]
 			// Pop params from stack (simulation handles this normally)
-			if site.CalleeType != nil {
-				// Pop params
-				for range site.CalleeType.Params {
-					if len(stack) > 0 {
-						stack = stack[:len(stack)-1]
+
+			for range site.Call.ParamCount() {
+				if len(stack) > 0 {
+					last := stack[len(stack)-1]
+					stack = stack[:len(stack)-1]
+					if local, stored := last.LocalIndex(); stored {
+						allocator.ReleaseOnPop(local)
 					}
 				}
 			}
+
 			// Pop extra operand for call_indirect/call_ref
-			if instr.IsIndirectCall() || instr.Opcode == wasm.OpCallRef {
+			if site.Call.HasTargetOperand() {
 				if len(stack) > 0 {
+					last := stack[len(stack)-1]
 					stack = stack[:len(stack)-1]
+					if local, stored := last.LocalIndex(); stored {
+						allocator.ReleaseOnPop(local)
+					}
 				}
 			}
-			// Push preAllocatedResults
-			preAllocated := callSiteResultLocals[callSiteIdx]
-			if site.CalleeType != nil {
-				for i, rt := range site.CalleeType.Results {
-					stack = append(stack, stackEntry{LocalIdx: preAllocated[i], Type: rt})
-				}
+			for j := range site.Call.ResultCount() {
+				rt := site.Call.ResultType(j)
+				local := allocator.Alloc(rt)
+				stack = append(stack, semantics.StoredOperand(local, rt))
 			}
+
+			allocator.EndInstruction()
 			continue
 		}
 
 		// Simulate stack effects for non-async instructions
-		ft.simulateInstrStack(&stack, instr, allocTemp, localTypes)
+		ft.simulateInstrStack(&stack, instr, allocator, localTypes)
 
 		if instr.Opcode == wasm.OpIf {
-			ifSimSnapshots = append(ifSimSnapshots, append([]stackEntry(nil), stack...))
+			snapshot := append([]stackEntry(nil), stack...)
+			ifSimSnapshots = append(ifSimSnapshots, snapshot)
+			allocator.PushSnapshot(snapshot)
 		}
+
+		allocator.EndInstruction()
 	}
 
-	return result, allocatedTypes, simNextLocal, nil
+	if err := binding.finish(len(stack), at, bind); err != nil {
+		return nil, nil, err
+	}
+	if err := routing.advance(false, len(stack), at); err != nil {
+		return nil, nil, err
+	}
+	if err := allocator.Err(); err != nil {
+		return nil, nil, err
+	}
+	if err := result.seal(); err != nil {
+		return nil, nil, err
+	}
+	return result, allocator, nil
 }
 
 // stackEntry is an alias for handler.StackEntry used in stack simulation.
 type stackEntry = handler.StackEntry
 
 // simulateInstrStack simulates the stack effect of an instruction.
-func (ft *FunctionTransformer) simulateInstrStack(stack *[]stackEntry, instr wasm.Instruction, allocTemp func(wasm.ValType) uint32, localTypes []wasm.ValType) {
+func (ft *FunctionTransformer) simulateInstrStack(stack *[]stackEntry, instr wasm.Instruction, allocator *TempAllocator, localTypes []wasm.ValType) {
 	pop := func() stackEntry {
 		if len(*stack) == 0 {
-			return stackEntry{LocalIdx: 0, Type: wasm.ValI32}
+			return semantics.StoredOperand(0, wasm.ValI32)
 		}
 		last := (*stack)[len(*stack)-1]
 		*stack = (*stack)[:len(*stack)-1]
+		if local, stored := last.LocalIndex(); stored {
+			allocator.ReleaseOnPop(local)
+		}
 		return last
 	}
 	push := func(vt wasm.ValType) {
-		*stack = append(*stack, stackEntry{LocalIdx: allocTemp(vt), Type: vt})
+		idx := allocator.Alloc(vt)
+		*stack = append(*stack, semantics.StoredOperand(idx, vt))
+	}
+
+	// Exact literal definitions use the same resolver as LiteralHandler.
+	// They own no physical storage; consumers reconstruct their original bits.
+	if literal, handled, err := semantics.ResolveLiteral(instr); handled {
+		if err != nil {
+			allocator.failf("%v", err)
+			return
+		}
+		*stack = append(*stack, semantics.LiteralOperand(literal))
+		return
+	}
+
+	forward := func(entry stackEntry) {
+		result, err := entry.MaterializedAt(allocator.Alloc(entry.Type()))
+		if err != nil {
+			allocator.failf("%v", err)
+			return
+		}
+		*stack = append(*stack, result)
+	}
+
+	// Resolve local value flow through the same semantic description used by
+	// emission. Do not fabricate i32 types for invalid local identities.
+	if op, handled, err := semantics.ResolveLocal(instr, localTypes); handled {
+		if err != nil {
+			allocator.failf("%v", err)
+			return
+		}
+		if op.Effects&semantics.AssignLocal != 0 {
+			allocator.InvalidateLocal(op.Index)
+		}
+		if op.Effects == semantics.ProduceSnapshot {
+			idx := allocator.SnapshotLocal(op.Index, op.Type)
+			*stack = append(*stack, semantics.StoredOperand(idx, op.Type))
+			return
+		}
+		var consumed stackEntry
+		if op.Effects&semantics.ConsumeOperand != 0 {
+			consumed = pop()
+		}
+		if op.Effects&semantics.ProduceSnapshot != 0 {
+			forward(consumed)
+		}
+		return
+	}
+
+	// Resolve globals before generic effects so invalid metadata is never
+	// accepted by a static pop count or independently inferred emission type.
+	if op, handled, err := semantics.ResolveGlobal(instr, ft.module); handled {
+		if err != nil {
+			allocator.failf("%v", err)
+			return
+		}
+		if op.Write {
+			pop()
+		} else {
+			push(op.Type)
+		}
+		return
+	}
+
+	if call, handled, err := ft.calls.Resolve(instr); handled {
+		if err != nil {
+			allocator.failf("%v", err)
+			return
+		}
+		if call.HasTargetOperand() {
+			pop()
+		}
+		for range call.ParamCount() {
+			pop()
+		}
+		for i := range call.ResultCount() {
+			push(call.ResultType(i))
+		}
+		return
 	}
 
 	// Query handlers first (they implement StackEffecter), then fall back to static table
@@ -360,33 +557,6 @@ func (ft *FunctionTransformer) simulateInstrStack(stack *[]stackEntry, instr was
 
 	// Handle instructions with dynamic/complex stack effects
 	switch instr.Opcode {
-	// Local operations (type depends on local)
-	case wasm.OpLocalGet:
-		imm := instr.Imm.(wasm.LocalImm)
-		vt := wasm.ValI32
-		if int(imm.LocalIdx) < len(localTypes) {
-			vt = localTypes[imm.LocalIdx]
-		}
-		push(vt)
-	case wasm.OpLocalSet:
-		pop()
-	case wasm.OpLocalTee:
-		imm := instr.Imm.(wasm.LocalImm)
-		vt := wasm.ValI32
-		if int(imm.LocalIdx) < len(localTypes) {
-			vt = localTypes[imm.LocalIdx]
-		}
-		pop()
-		push(vt)
-
-	// Global operations (type depends on global)
-	case wasm.OpGlobalGet:
-		imm := instr.Imm.(wasm.GlobalImm)
-		vt := ft.getGlobalType(imm.GlobalIdx)
-		push(vt)
-	case wasm.OpGlobalSet:
-		pop()
-
 	// Reference types with dynamic type
 	case wasm.OpRefNull:
 		imm := instr.Imm.(wasm.RefNullImm)
@@ -396,11 +566,10 @@ func (ft *FunctionTransformer) simulateInstrStack(stack *[]stackEntry, instr was
 			push(wasm.ValExtern)
 		}
 	case wasm.OpRefAsNonNull:
-		entry := pop()
-		push(entry.Type)
+		forward(pop())
 	case wasm.OpBrOnNull:
 		entry := pop()
-		push(entry.Type)
+		push(entry.Type())
 	case wasm.OpBrOnNonNull:
 		pop()
 
@@ -409,7 +578,7 @@ func (ft *FunctionTransformer) simulateInstrStack(stack *[]stackEntry, instr was
 		pop()
 		falseVal := pop()
 		pop()
-		push(falseVal.Type)
+		push(falseVal.Type())
 	case wasm.OpSelectType:
 		pop()
 		pop()
@@ -420,79 +589,26 @@ func (ft *FunctionTransformer) simulateInstrStack(stack *[]stackEntry, instr was
 			push(wasm.ValI32)
 		}
 
-	// Calls (type depends on callee)
-	case wasm.OpCall:
-		imm := instr.Imm.(wasm.CallImm)
-		if funcType := ft.module.GetFuncType(imm.FuncIdx); funcType != nil {
-			for range funcType.Params {
-				pop()
-			}
-			for _, rt := range funcType.Results {
-				push(rt)
-			}
-		}
-	case wasm.OpCallIndirect:
-		pop()
-		imm := instr.Imm.(wasm.CallIndirectImm)
-		if int(imm.TypeIdx) < len(ft.module.Types) {
-			funcType := &ft.module.Types[imm.TypeIdx]
-			for range funcType.Params {
-				pop()
-			}
-			for _, rt := range funcType.Results {
-				push(rt)
-			}
-		}
-	case wasm.OpCallRef:
-		pop()
-		imm := instr.Imm.(wasm.CallRefImm)
-		if int(imm.TypeIdx) < len(ft.module.Types) {
-			funcType := &ft.module.Types[imm.TypeIdx]
-			for range funcType.Params {
-				pop()
-			}
-			for _, rt := range funcType.Results {
-				push(rt)
-			}
-		}
-
 	// Control flow
 	case wasm.OpIf:
 		pop()
-	case wasm.OpBrIf:
-		pop()
-	case wasm.OpBrTable:
-		pop()
+	case wasm.OpBr, wasm.OpBrIf, wasm.OpBrTable:
+		allocator.failf("source branch requires a typed action")
 	case wasm.OpReturn:
-		*stack = (*stack)[:0]
+		allocator.failf("source return requires a typed action")
 	}
-}
-
-// getGlobalType returns the type of a global variable.
-// Callers guarantee globalIdx is within bounds.
-func (ft *FunctionTransformer) getGlobalType(globalIdx uint32) wasm.ValType {
-	numImportedGlobals := uint32(0)
-	for _, imp := range ft.module.Imports {
-		if imp.Desc.Kind == wasm.KindGlobal {
-			if globalIdx == numImportedGlobals {
-				return imp.Desc.Global.ValType
-			}
-			numImportedGlobals++
-		}
-	}
-	localIdx := globalIdx - numImportedGlobals
-	return ft.module.Globals[localIdx].Type.ValType
 }
 
 func (ft *FunctionTransformer) transformLinear(
-	instrs []wasm.Instruction,
+	program *executionPlan,
 	callSites []CallSite,
 	funcType *wasm.FuncType,
 	scratchStart uint32,
 	localTypes []wasm.ValType,
 	body *wasm.FuncBody,
-	linearizedLocals []uint32,
+	completion ir.FunctionCompletion,
 ) ([]byte, error) {
+	actions, instrs := program.actions, program.steps
 	// Pre-size emitter: transformed code is typically 3-5x larger
 	estimatedSize := len(instrs) * 12
 	em := codegen.GetEmitterWithCapacity(estimatedSize)
@@ -503,40 +619,36 @@ func (ft *FunctionTransformer) transformLinear(
 	localCallIndexRewind := scratchStart + scratchCallIndexRewind
 	localStackPtr := scratchStart + scratchStackPtr
 
-	// Compute live locals union for prelude
-	liveUnion := computeLiveUnion(callSites)
-	for _, l := range linearizedLocals {
-		liveUnion[l] = true
+	// All operand definitions, including async call results, share the checked
+	// lifetime allocator. Scratch and source control locals precede this range.
+	firstTempLocal := scratchStart + scratchLocalCount
+
+	excludedActions := make(map[int]bool, len(callSites))
+	for _, site := range callSites {
+		excludedActions[site.ActionIndex] = true
 	}
-
-	// Pre-allocate result locals for each call site
-	// Map from call site index to its pre-allocated result locals
-	callSiteResultLocals := make(map[int][]uint32)
-	nextResultLocal := scratchStart + scratchLocalCount
-
-	for i, site := range callSites {
-		if site.CalleeType != nil && len(site.CalleeType.Results) > 0 {
-			var resultLocals []uint32
-			for _, rt := range site.CalleeType.Results {
-				localIdx := nextResultLocal
-				nextResultLocal++
-				body.Locals = append(body.Locals, wasm.LocalEntry{Count: 1, ValType: rt})
-				localTypes = append(localTypes, rt)
-				resultLocals = append(resultLocals, localIdx)
-				// Add to liveUnion so it gets saved/restored
-				liveUnion[localIdx] = true
-			}
-			callSiteResultLocals[i] = resultLocals
+	// Routing actions cannot be copied into a guest-only loop span. This policy
+	// comes from action ownership even if an instruction annotation disagrees.
+	for index, action := range actions {
+		if domain, ok := action.Domain(); ok && domain == semantics.RewindRouting {
+			excludedActions[index] = true
 		}
+	}
+	// Planning and emission skip these spans with the same map.
+	closedRegions, err := ft.closedActionRegions(program, excludedActions)
+	if err != nil {
+		return nil, err
 	}
 
 	// Simulation pass: track simulated stack to find temporaries that need saving
 	// These are locals holding operand values at async call sites
 	// The simulation returns local indices, their types, and max local index
-	stackLocalsAtCallSites, allocatedTypes, maxSimLocal, err := ft.simulateStackForCallSites(instrs, callSites, scratchStart, localTypes, body, nextResultLocal, callSiteResultLocals)
+	continuations, allocator, err := ft.simulateStackForCallSites(actions, callSites, scratchStart, localTypes, body, firstTempLocal, closedRegions, program.source)
 	if err != nil {
 		return nil, err
 	}
+	allocatedTypes := allocator.AllocatedTypes()
+	maxSimLocal := allocator.MaxLocal()
 
 	// Pre-declare locals up to maxSimLocal with correct types
 	// The handlers will allocate additional locals starting from maxSimLocal
@@ -549,14 +661,19 @@ func (ft *FunctionTransformer) transformLinear(
 		localTypes = append(localTypes, vt)
 	}
 
-	for localIdx := range stackLocalsAtCallSites {
-		liveUnion[localIdx] = true
-	}
-
-	// Prelude: restore live locals (including pre-allocated result locals)
-	if err := ft.emitPrelude(em, localTypes, liveUnion); err != nil {
+	liveUnion, err := continuations.savedLocals()
+	if err != nil {
 		return nil, err
 	}
+
+	// Build frame plan once immediately before prelude emission
+	plan, err := newFramePlan(localTypes, liveUnion)
+	if err != nil {
+		return nil, err
+	}
+
+	// Prelude: restore the selected live values.
+	ft.emitPrelude(em, plan)
 
 	// Main structure: 3 nested blocks
 	// Outer block is ALWAYS i32 to capture the call index for save path
@@ -570,22 +687,27 @@ func (ft *FunctionTransformer) transformLinear(
 		em.GlobalGet(ft.globals.DataGlobal).
 			I32Load(2, 0). // load stack_ptr (already at frame base)
 			I32Load(2, 0). // load call_index from offset 0
-			LocalSet(localCallIndexRewind).
-			End()
+			LocalSet(localCallIndexRewind)
+		// Guard elision after the final call assumes rewind selects a real site.
+		// Reject malformed frame indices before dispatch can reach guest effects.
+		em.LocalGet(localCallIndexRewind).I32Const(int32(len(callSites))).I32GeU().
+			If(codegen.BlockVoid).Unreachable().End()
+		em.End()
 	}
 
 	// Build call site map
 	siteMap := make(map[int]int)
 	for i, site := range callSites {
-		siteMap[site.InstrIdx] = i
+		siteMap[site.ActionIndex] = i
 	}
 
 	// Stack tracking
-	// Handlers start allocating from nextResultLocal (same as simulation)
+	// Handlers start allocating from firstTempLocal (same as simulation)
 	// This ensures handler-allocated locals match simulation-tracked locals
 	// so that locals live at async call sites are correctly saved/restored
 	stack := handler.NewStack(localCallIndexSave) // fallback for empty stack pops (unreachable paths)
-	locals := handler.NewLocals(nextResultLocal, body, localTypes)
+	locals := handler.NewLocals(firstTempLocal, body, localTypes)
+	locals.SetAllocationPlan(allocator.Plan())
 	ctx := handler.NewContext(em, stack, locals, ft.globals.StateGlobal, ft.globals.DataGlobal)
 	ctx.Module = ft.module
 
@@ -617,12 +739,106 @@ func (ft *FunctionTransformer) transformLinear(
 		}
 	}
 
-	// Process instructions incrementally, preserving control flow structure
-	for i, instr := range instrs {
-		// Skip trailing End
-		if i == len(instrs)-1 && instr.Opcode == wasm.OpEnd {
+	lastAsyncSiteIdx := -1
+	if len(callSites) > 0 {
+		lastAsyncSiteIdx = callSites[len(callSites)-1].ActionIndex
+	}
+
+	// Dispatch the action program; the final function end belongs to this
+	// emitter's enclosing continuation structure, not to a source action.
+	var binding stackBindingStep
+	var routing routingBoundary
+	for i := 0; i < len(actions); i++ {
+		if err := binding.finish(stack.Len(), stack.At, stack.BindAt); err != nil {
+			return nil, err
+		}
+		action := actions[i]
+		if program.source != nil {
+			domain, ok := action.Domain()
+			if err := routing.advance(ok && domain == semantics.RewindRouting, stack.Len(), stack.At); err != nil {
+				return nil, err
+			}
+		}
+		afterLastAsync := lastAsyncSiteIdx >= 0 && i > lastAsyncSiteIdx
+
+		if end, ok := closedRegions[i]; ok {
+			if !afterLastAsync {
+				ensureNormalGuard()
+			}
+			ctx.Locals.BeginClosedRegion(i)
+			em.EmitInstrs(instrs[program.ranges[i].start:program.ranges[end].end])
+			i = end
 			continue
 		}
+		if program.source != nil {
+			contract, err := program.source.StackContract(i)
+			if err != nil {
+				return nil, err
+			}
+			if err := binding.begin(contract, i, stack.Len(), stack.At); err != nil {
+				return nil, err
+			}
+		}
+		if capture, ok := action.Capture(); ok {
+			closeNormalGuard()
+			ctx.Locals.BeginCapture(i)
+			if err := emitEntryCapture(ctx, capture); err != nil {
+				return nil, fmt.Errorf("asyncify: capture action %d: %w", i, err)
+			}
+			continue
+		}
+		if transfer, ok := action.Transfer(); ok {
+			ctx.Locals.BeginTransfer(i)
+			if !afterLastAsync {
+				ensureNormalGuard()
+			}
+			if err := emitScopeTransfer(ctx, transfer); err != nil {
+				return nil, fmt.Errorf("asyncify: scope transfer action %d: %w", i, err)
+			}
+			continue
+		}
+		if operation, ok := action.Branch(); ok {
+			closeNormalGuard()
+			ctx.Locals.BeginBranch(i)
+			if err := emitSourceBranch(ctx, operation, !afterLastAsync, ft.globals.StateGlobal); err != nil {
+				return nil, fmt.Errorf("asyncify: branch action %d: %w", i, err)
+			}
+			continue
+		}
+		if operation, ok := action.Trap(); ok {
+			closeNormalGuard()
+			ctx.Locals.BeginTrap(i)
+			if !afterLastAsync {
+				em.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
+			}
+			if err := emitSourceTrap(ctx, operation); err != nil {
+				return nil, fmt.Errorf("asyncify: trap action %d: %w", i, err)
+			}
+			if !afterLastAsync {
+				em.End()
+			}
+			continue
+		}
+		if operation, ok := action.Return(); ok {
+			closeNormalGuard()
+			ctx.Locals.BeginReturn(i)
+			if !afterLastAsync {
+				em.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
+			}
+			if err := emitSourceReturn(ctx, operation); err != nil {
+				return nil, fmt.Errorf("asyncify: return action %d: %w", i, err)
+			}
+			if !afterLastAsync {
+				em.End()
+			}
+			continue
+		}
+		instr, primitive := action.Primitive()
+		domain, hasDomain := action.Domain()
+		if !primitive || !hasDomain {
+			return nil, fmt.Errorf("asyncify: action %d has no execution policy", i)
+		}
+		ctx.Locals.BeginAction(i, domain, semantics.LocalKnowledgeEffect(instr, domain))
 
 		// Track control flow depth for br targeting
 		switch instr.Opcode {
@@ -651,13 +867,18 @@ func (ft *FunctionTransformer) transformLinear(
 			closeNormalGuard()
 
 			site := callSites[callSiteIdx]
-			preAllocatedResults := callSiteResultLocals[callSiteIdx]
-			ft.emitAsyncCallSite(ctx, &instr, site, callSiteIdx, localCallIndexRewind, funcType, controlDepth, preAllocatedResults)
+			if err := verifyContinuationOperands(site.SourceOperands, stack.Len(), stack.At, allocator); err != nil {
+				return nil, fmt.Errorf("asyncify: emitted continuation at action %d: %w", i, err)
+			}
+			if err := continuations.verify(i, stack.Len(), stack.At); err != nil {
+				return nil, err
+			}
+			ft.emitAsyncCallSite(ctx, &instr, site, callSiteIdx, localCallIndexRewind, funcType, controlDepth)
 			continue
 		}
 
-		if instr.Synthetic {
-			// Synthetic instruction: routing must execute unconditionally across rewind and normal
+		if domain, ok := action.Domain(); ok && domain == semantics.RewindRouting {
+			// Routing actions execute across rewind and normal.
 			closeNormalGuard()
 			if err := ft.emitSingleInstruction(ctx, instr); err != nil {
 				return nil, err
@@ -668,7 +889,7 @@ func (ft *FunctionTransformer) transformLinear(
 			continue
 		}
 
-		if isStructuralControlFlow(instr.Opcode) {
+		if action.Kind() == ir.GuestStructureInstruction {
 			// Structural control flow: open/close blocks unconditionally
 			closeNormalGuard()
 			if err := ft.emitSingleInstruction(ctx, instr); err != nil {
@@ -677,37 +898,67 @@ func (ft *FunctionTransformer) transformLinear(
 			if instr.Opcode == wasm.OpIf {
 				ifSnapshots = append(ifSnapshots, ctx.Stack.Snapshot())
 			}
-		} else if isBranchOrReturn(instr.Opcode) {
-			// Guest branch/return: must only execute during normal execution, not rewinding
+		} else if isReferenceBranch(instr.Opcode) {
+			// Guest branch: must only execute during normal execution, not rewinding
 			closeNormalGuard()
-			if err := ft.emitBranchOrReturn(ctx, instr); err != nil {
-				return nil, err
+			if afterLastAsync {
+				if err := ft.emitUnconditionalReferenceBranch(ctx, instr); err != nil {
+					return nil, err
+				}
+			} else {
+				if err := ft.emitReferenceBranch(ctx, instr); err != nil {
+					return nil, err
+				}
 			}
 		} else {
-			// Non-control-flow instruction: wrap in normal guard
-			ensureNormalGuard()
+			// Non-control-flow instruction: wrap in normal guard only when rewinding could reach it
+			if !afterLastAsync {
+				ensureNormalGuard()
+			}
 			if err := ft.emitSingleInstruction(ctx, instr); err != nil {
 				return nil, err
 			}
 		}
 	}
 
+	if err := binding.finish(stack.Len(), stack.At, stack.BindAt); err != nil {
+		return nil, err
+	}
+	if err := routing.advance(false, stack.Len(), stack.At); err != nil {
+		return nil, err
+	}
 	// Close any remaining normal guard
 	closeNormalGuard()
 
 	// Close inner block
 	em.End()
 
-	// Return based on function result type
-	if len(funcType.Results) > 0 {
+	// Never manufacture a value from the empty-stack fallback local: it is
+	// an i32 scratch slot, not a polymorphic WASM result.
+	if completion.Kind() == ir.UnreachableCompletion {
+		em.Unreachable()
+	} else if stack.Len() < len(funcType.Results) {
+		return nil, fmt.Errorf("asyncify: missing function results on fallthrough: have %d, want %d", stack.Len(), len(funcType.Results))
+	} else if len(funcType.Results) > 0 {
+		if program.source != nil {
+			for position := range funcType.Results {
+				value, ok := completion.ResultValue(position)
+				if !ok {
+					return nil, fmt.Errorf("asyncify: missing source completion identity")
+				}
+				if err := matchStackValue(value, stack.Len()-len(funcType.Results)+position, stack.At); err != nil {
+					return nil, err
+				}
+			}
+		}
 		// Pop all results from simulated stack (in reverse order)
-		var resultLocals []uint32
+		var resultLocals []semantics.Operand
 		for i := 0; i < len(funcType.Results); i++ {
 			resultLocals = append(resultLocals, stack.Pop())
 		}
 		// Push all results onto real stack (reverse to get correct order)
 		for i := len(resultLocals) - 1; i >= 0; i-- {
-			em.LocalGet(resultLocals[i])
+			em.Operand(resultLocals[i])
 		}
 		em.Return()
 	} else {
@@ -722,10 +973,8 @@ func (ft *FunctionTransformer) transformLinear(
 	em.End()
 	em.LocalSet(localCallIndexSave)
 
-	// Save path - save live locals (including pre-allocated result locals)
-	if err := ft.emitSavePath(em, localStackPtr, localCallIndexSave, localTypes, liveUnion); err != nil {
-		return nil, err
-	}
+	// Save path uses the same selected-value frame as the restore prelude.
+	ft.emitSavePath(em, localStackPtr, localCallIndexSave, plan)
 
 	// Function end - emit dummy return value of correct type
 	for _, rt := range funcType.Results {
@@ -748,114 +997,52 @@ func (ft *FunctionTransformer) transformLinear(
 	}
 	em.End()
 
+	if err := locals.FinishPlan(); err != nil {
+		return nil, err
+	}
+	if err := em.Err(); err != nil {
+		return nil, err
+	}
 	return em.Copy(), nil
 }
 
-// getLocalType returns the type of a local.
-// Callers guarantee localIdx is within bounds.
-func getLocalType(localTypes []wasm.ValType, localIdx uint32) wasm.ValType {
-	return localTypes[localIdx]
-}
-
-func (ft *FunctionTransformer) emitPrelude(em *codegen.Emitter, localTypes []wasm.ValType, liveLocals map[uint32]bool) error {
+func (ft *FunctionTransformer) emitPrelude(em *codegen.Emitter, plan *framePlan) {
 	em.StateCheck(ft.globals.StateGlobal, StateRewinding).If(codegen.BlockVoid)
-
-	// Build sorted list of live locals (ascending order - same as save)
-	liveList := sortedLocals(liveLocals, true)
-
-	// Compute total frame size for decrement
-	frameSize := uint32(4) // call index
-	for _, localIdx := range liveList {
-		frameSize += uint32(ValTypeSize(getLocalType(localTypes, localIdx)))
-	}
-
-	// Validate frame size fits in int32 to prevent overflow
-	if frameSize > maxAsyncifyFrameSize {
-		return fmt.Errorf("asyncify: frame size %d exceeds maximum %d", frameSize, maxAsyncifyFrameSize)
-	}
 
 	// Decrement stack_ptr once to point to start of frame
 	// stack_ptr = stack_ptr - frameSize
 	em.GlobalGet(ft.globals.DataGlobal).
 		GlobalGet(ft.globals.DataGlobal).
 		I32Load(2, 0).
-		I32Const(int32(frameSize)).
+		I32Const(int32(plan.frameSize)).
 		I32Sub().
 		I32Store(2, 0)
 
 	// Restore all locals at computed offsets
 	// Layout: [call_index (4 bytes)][local0][local1]...[localN]
-	offset := uint32(4) // Start after call index
-	for _, localIdx := range liveList {
-		vt := getLocalType(localTypes, localIdx)
-		size := ValTypeSize(vt)
-
-		// Load local from base + offset
+	for _, slot := range plan.slots {
 		em.GlobalGet(ft.globals.DataGlobal).I32Load(2, 0)
-		if IsV128Type(vt) {
-			em.EmitInstr(MakeV128Load(4, offset))
+		if IsV128Type(slot.valType) {
+			em.EmitInstr(MakeV128Load(4, slot.offset))
 		} else {
-			loadOp, loadAlign := ValTypeLoadOp(vt)
-			em.EmitInstr(wasm.Instruction{Opcode: loadOp, Imm: wasm.MemoryImm{Align: loadAlign, Offset: uint64(offset)}})
+			op, align := ValTypeLoadOp(slot.valType)
+			em.EmitInstr(wasm.Instruction{Opcode: op, Imm: wasm.MemoryImm{Align: align, Offset: uint64(slot.offset)}})
 		}
-		em.LocalSet(localIdx)
-		offset += uint32(size)
+		em.LocalSet(slot.localIdx)
 	}
 
 	em.End()
-	return nil
 }
 
-// sortedLocals returns a sorted slice of local indices from the map.
-// If ascending is true, sorts low to high; otherwise high to low.
-func sortedLocals(locals map[uint32]bool, ascending bool) []uint32 {
-	result := make([]uint32, 0, len(locals))
-	for local := range locals {
-		result = append(result, local)
-	}
-	// Simple insertion sort (locals count is typically small)
-	for i := 1; i < len(result); i++ {
-		for j := i; j > 0; j-- {
-			swap := false
-			if ascending {
-				swap = result[j] < result[j-1]
-			} else {
-				swap = result[j] > result[j-1]
-			}
-			if swap {
-				result[j], result[j-1] = result[j-1], result[j]
-			} else {
-				break
-			}
-		}
-	}
-	return result
-}
-
-func (ft *FunctionTransformer) emitSavePath(em *codegen.Emitter, localStackPtr, localCallIndexSave uint32, localTypes []wasm.ValType, liveLocals map[uint32]bool) error {
+func (ft *FunctionTransformer) emitSavePath(em *codegen.Emitter, localStackPtr, localCallIndexSave uint32, plan *framePlan) {
 	em.StateCheck(ft.globals.StateGlobal, StateUnwinding).If(codegen.BlockVoid)
-
-	// Build sorted list of live locals (ascending order for save)
-	liveList := sortedLocals(liveLocals, true)
-
-	// Compute total frame size first for bounds check
-	// Layout: [call_index (4 bytes)][local0][local1]...[localN]
-	frameSize := uint32(4) // call index
-	for _, localIdx := range liveList {
-		frameSize += uint32(ValTypeSize(getLocalType(localTypes, localIdx)))
-	}
-
-	// Validate frame size fits in int32 to prevent overflow
-	if frameSize > maxAsyncifyFrameSize {
-		return fmt.Errorf("asyncify: frame size %d exceeds maximum %d", frameSize, maxAsyncifyFrameSize)
-	}
 
 	// Load base pointer into local once
 	em.GlobalGet(ft.globals.DataGlobal).I32Load(2, 0).LocalSet(localStackPtr)
 
 	// Bounds check BEFORE writing: verify new_stack_ptr <= stack_end
 	em.LocalGet(localStackPtr).
-		I32Const(int32(frameSize)).
+		I32Const(int32(plan.frameSize)).
 		I32Add().
 		GlobalGet(ft.globals.DataGlobal).I32Load(2, 4). // stack_end
 		I32GtU().                                       // (stack_ptr + frameSize) > stack_end
@@ -865,31 +1052,24 @@ func (ft *FunctionTransformer) emitSavePath(em *codegen.Emitter, localStackPtr, 
 	em.LocalGet(localStackPtr).LocalGet(localCallIndexSave).I32Store(2, 0)
 
 	// Save all locals at computed offsets
-	offset := uint32(4) // Start after call index
-	for _, localIdx := range liveList {
-		vt := getLocalType(localTypes, localIdx)
-		size := ValTypeSize(vt)
-
-		// Store local at base + offset
-		em.LocalGet(localStackPtr).LocalGet(localIdx)
-		if IsV128Type(vt) {
-			em.EmitInstr(MakeV128Store(4, offset))
+	for _, slot := range plan.slots {
+		em.LocalGet(localStackPtr).LocalGet(slot.localIdx)
+		if IsV128Type(slot.valType) {
+			em.EmitInstr(MakeV128Store(4, slot.offset))
 		} else {
-			storeOp, storeAlign := ValTypeStoreOp(vt)
-			em.EmitInstr(wasm.Instruction{Opcode: storeOp, Imm: wasm.MemoryImm{Align: storeAlign, Offset: uint64(offset)}})
+			op, align := ValTypeStoreOp(slot.valType)
+			em.EmitInstr(wasm.Instruction{Opcode: op, Imm: wasm.MemoryImm{Align: align, Offset: uint64(slot.offset)}})
 		}
-		offset += uint32(size)
 	}
 
 	// Update stack_ptr once with total size
 	em.GlobalGet(ft.globals.DataGlobal).
 		LocalGet(localStackPtr).
-		I32Const(int32(offset)).
+		I32Const(int32(plan.frameSize)).
 		I32Add().
 		I32Store(2, 0)
 
 	em.End()
-	return nil
 }
 
 // needsSingleStackValue returns true if the opcode consumes exactly one value from stack
@@ -898,83 +1078,313 @@ func needsSingleStackValue(op byte) bool {
 	return op == wasm.OpIf
 }
 
-// isStructuralControlFlow returns true if the opcode opens or closes block structure.
-func isStructuralControlFlow(op byte) bool {
+// isReferenceBranch identifies reference branches pending typed transfer support.
+// These must not execute during rewind.
+func isReferenceBranch(op byte) bool {
 	switch op {
-	case wasm.OpBlock, wasm.OpLoop, wasm.OpIf, wasm.OpElse, wasm.OpEnd:
+	case wasm.OpBrOnNull, wasm.OpBrOnNonNull:
 		return true
 	}
 	return false
 }
 
-// isBranchOrReturn returns true if the opcode is an original branch or return instruction
-// that should not execute during rewind.
-func isBranchOrReturn(op byte) bool {
-	switch op {
-	case wasm.OpBr, wasm.OpBrIf, wasm.OpBrTable, wasm.OpReturn,
-		wasm.OpBrOnNull, wasm.OpBrOnNonNull:
-		return true
-	}
-	return false
+type closedRegionFrame struct {
+	startHeight int
+	opcode      byte
+	unreachable bool
 }
 
-func (ft *FunctionTransformer) emitBranchOrReturn(ctx *handler.Context, instr wasm.Instruction) error {
+func matchControlEnd(instrs []wasm.Instruction, start int) (int, bool) {
+	depth := 0
+	for i := start; i < len(instrs); i++ {
+		switch instrs[i].Opcode {
+		case wasm.OpBlock, wasm.OpLoop, wasm.OpIf, wasm.OpTry, wasm.OpTryTable:
+			depth++
+		case wasm.OpEnd:
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func popHeight(height *int, n int) bool {
+	if *height < n {
+		return false
+	}
+	*height -= n
+	return true
+}
+
+func (ft *FunctionTransformer) voidControlType(instr wasm.Instruction) bool {
+	switch imm := instr.Imm.(type) {
+	case wasm.BlockImm:
+		return ft.voidBlockType(imm.Type)
+	case wasm.TryTableImm:
+		return ft.voidBlockType(imm.BlockType)
+	default:
+		return false
+	}
+}
+
+func (ft *FunctionTransformer) voidBlockType(blockType int32) bool {
+	switch blockType {
+	case wasm.BlockTypeVoid:
+		return true
+	default:
+		if blockType >= 0 && ft.module != nil && int(blockType) < len(ft.module.Types) {
+			sig := ft.module.Types[blockType]
+			return len(sig.Params) == 0 && len(sig.Results) == 0
+		}
+		return false
+	}
+}
+
+func (ft *FunctionTransformer) applyCallHeight(height *int, instr wasm.Instruction) bool {
+	call, handled, err := ft.calls.Resolve(instr)
+	if err != nil || !handled {
+		return false
+	}
+	pops := call.ParamCount()
+	if call.HasTargetOperand() {
+		pops++
+	}
+	if !popHeight(height, pops) {
+		return false
+	}
+	*height += call.ResultCount()
+	return true
+}
+
+func (ft *FunctionTransformer) applyClosedRegionHeight(height *int, instr wasm.Instruction) bool {
 	switch instr.Opcode {
-	case wasm.OpBr:
-		imm := instr.Imm.(wasm.BranchImm)
-		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal)
-		ctx.Emit.BrIf(imm.LabelIdx)
-	case wasm.OpBrIf:
-		imm := instr.Imm.(wasm.BranchImm)
-		if ctx.Stack.Len() > 0 {
-			entry := ctx.Stack.PopTyped()
-			ctx.Emit.LocalGet(entry.LocalIdx)
+	case wasm.OpNop:
+		return true
+	case wasm.OpLocalGet, wasm.OpGlobalGet, wasm.OpRefNull, wasm.OpRefFunc, wasm.OpMemorySize:
+		*height++
+		return true
+	case wasm.OpLocalSet, wasm.OpGlobalSet:
+		return popHeight(height, 1)
+	case wasm.OpLocalTee, wasm.OpRefAsNonNull:
+		return *height >= 1
+	case wasm.OpSelect, wasm.OpSelectType:
+		if !popHeight(height, 3) {
+			return false
 		}
-		// br_if treats every nonzero i32 as true, including even values.
-		ctx.Emit.I32Eqz().I32Eqz()
-		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal)
-		ctx.Emit.I32And()
-		ctx.Emit.BrIf(imm.LabelIdx)
-	case wasm.OpBrTable:
-		imm := instr.Imm.(wasm.BrTableImm)
-		var indexLocal uint32
-		if ctx.Stack.Len() > 0 {
-			indexLocal = ctx.Stack.Pop()
+		*height++
+		return true
+	case wasm.OpCall:
+		return ft.applyCallHeight(height, instr)
+	}
+	if effect := GetStackEffectFromRegistry(ft.registry, instr.Opcode, instr, ft.module); effect != nil {
+		if !popHeight(height, effect.Pops) {
+			return false
 		}
-		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
-		newLabels := make([]uint32, len(imm.Labels))
-		for i, l := range imm.Labels {
-			newLabels[i] = l + 1
+		*height += len(effect.Pushes)
+		return true
+	}
+	return false
+}
+
+// closedVoidRegionSpans maps maximal closed block/loop starts to their end.
+// An eligible region has zero params/results on every construct, with
+// balanced stack and only in-region branches. One normal-state guard encloses
+// the original instructions, so guest branch depths stay unchanged.
+func (ft *FunctionTransformer) closedVoidRegionSpans(instrs []wasm.Instruction, excludedActions map[int]bool) map[int]int {
+	spans := make(map[int]int)
+	for i := 0; i < len(instrs); i++ {
+		if instrs[i].Opcode != wasm.OpLoop && instrs[i].Opcode != wasm.OpBlock {
+			continue
 		}
-		newDefault := imm.Default + 1
-		ctx.Emit.LocalGet(indexLocal)
-		ctx.Emit.BrTable(newLabels, newDefault)
-		ctx.Emit.End()
-	case wasm.OpReturn:
-		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
-		ft.emitReturn(ctx)
-		ctx.Emit.End()
+		end, ok := matchControlEnd(instrs, i)
+		if !ok {
+			continue
+		}
+		if ft.closedVoidRegionEligible(instrs, i, end, excludedActions) {
+			spans[i] = end
+			i = end
+		}
+	}
+	return spans
+}
+
+func (ft *FunctionTransformer) closedVoidRegionEligible(instrs []wasm.Instruction, start, end int, excludedActions map[int]bool) bool {
+	if start < 0 || end >= len(instrs) || start >= end {
+		return false
+	}
+	if (instrs[start].Opcode != wasm.OpLoop && instrs[start].Opcode != wasm.OpBlock) || instrs[end].Opcode != wasm.OpEnd {
+		return false
+	}
+	if !ft.voidControlType(instrs[start]) {
+		return false
+	}
+
+	height := 0
+	var frames []closedRegionFrame
+
+	for i := start; i <= end; i++ {
+		instr := instrs[i]
+		if excludedActions[i] {
+			return false
+		}
+		switch instr.Opcode {
+		case wasm.OpCallIndirect, wasm.OpCallRef,
+			wasm.OpReturn, wasm.OpReturnCall, wasm.OpReturnCallIndirect, wasm.OpReturnCallRef,
+			wasm.OpThrow, wasm.OpThrowRef, wasm.OpRethrow,
+			wasm.OpTry, wasm.OpCatch, wasm.OpCatchAll, wasm.OpDelegate, wasm.OpTryTable,
+			wasm.OpBrOnNull, wasm.OpBrOnNonNull:
+			return false
+		}
+
+		unreachable := len(frames) > 0 && frames[len(frames)-1].unreachable
+		if unreachable {
+			switch instr.Opcode {
+			case wasm.OpBlock, wasm.OpLoop, wasm.OpIf:
+				if !ft.voidControlType(instr) {
+					return false
+				}
+				frames = append(frames, closedRegionFrame{opcode: instr.Opcode, startHeight: height, unreachable: true})
+			case wasm.OpElse:
+				if len(frames) == 0 || frames[len(frames)-1].opcode != wasm.OpIf {
+					return false
+				}
+				frames[len(frames)-1].unreachable = false
+				height = frames[len(frames)-1].startHeight
+			case wasm.OpEnd:
+				if len(frames) == 0 {
+					return false
+				}
+				height = frames[len(frames)-1].startHeight
+				frames = frames[:len(frames)-1]
+				if i == end {
+					return len(frames) == 0 && height == 0
+				}
+			}
+			continue
+		}
+
+		switch instr.Opcode {
+		case wasm.OpBlock, wasm.OpLoop:
+			if !ft.voidControlType(instr) {
+				return false
+			}
+			frames = append(frames, closedRegionFrame{opcode: instr.Opcode, startHeight: height})
+		case wasm.OpIf:
+			if !ft.voidControlType(instr) {
+				return false
+			}
+			if !popHeight(&height, 1) {
+				return false
+			}
+			frames = append(frames, closedRegionFrame{opcode: wasm.OpIf, startHeight: height})
+		case wasm.OpElse:
+			if len(frames) == 0 || frames[len(frames)-1].opcode != wasm.OpIf {
+				return false
+			}
+			if height != frames[len(frames)-1].startHeight {
+				return false
+			}
+		case wasm.OpEnd:
+			if len(frames) == 0 {
+				return false
+			}
+			if height != frames[len(frames)-1].startHeight {
+				return false
+			}
+			frames = frames[:len(frames)-1]
+			if i == end {
+				return len(frames) == 0 && height == 0
+			}
+		case wasm.OpBr:
+			imm, ok := instr.Imm.(wasm.BranchImm)
+			if !ok || int(imm.LabelIdx) >= len(frames) {
+				return false
+			}
+			target := frames[len(frames)-1-int(imm.LabelIdx)]
+			if height != target.startHeight {
+				return false
+			}
+			frames[len(frames)-1].unreachable = true
+		case wasm.OpBrIf:
+			imm, ok := instr.Imm.(wasm.BranchImm)
+			if !ok || int(imm.LabelIdx) >= len(frames) {
+				return false
+			}
+			if !popHeight(&height, 1) {
+				return false
+			}
+			target := frames[len(frames)-1-int(imm.LabelIdx)]
+			if height != target.startHeight {
+				return false
+			}
+		case wasm.OpBrTable:
+			imm, ok := instr.Imm.(wasm.BrTableImm)
+			if !ok {
+				return false
+			}
+			if !popHeight(&height, 1) {
+				return false
+			}
+			if int(imm.Default) >= len(frames) {
+				return false
+			}
+			if height != frames[len(frames)-1-int(imm.Default)].startHeight {
+				return false
+			}
+			for _, label := range imm.Labels {
+				if int(label) >= len(frames) {
+					return false
+				}
+				if height != frames[len(frames)-1-int(label)].startHeight {
+					return false
+				}
+			}
+			frames[len(frames)-1].unreachable = true
+		case wasm.OpUnreachable:
+			if len(frames) == 0 {
+				return false
+			}
+			frames[len(frames)-1].unreachable = true
+		default:
+			if !ft.applyClosedRegionHeight(&height, instr) {
+				return false
+			}
+		}
+	}
+	return false
+}
+
+func (ft *FunctionTransformer) emitReferenceBranch(ctx *handler.Context, instr wasm.Instruction) error {
+	switch instr.Opcode {
 	case wasm.OpBrOnNull:
 		imm := instr.Imm.(wasm.BranchImm)
-		var refLocal uint32
+		var refLocal semantics.Operand
+		refType := wasm.ValFuncRef
 		if ctx.Stack.Len() > 0 {
-			refLocal = ctx.Stack.Pop()
+			entry := ctx.Stack.Pop()
+			refLocal = entry
+			refType = entry.Type()
 		}
+		tmp := ctx.AllocTemp(refType)
 		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
-		ctx.Emit.LocalGet(refLocal)
+		ctx.Emit.Operand(refLocal)
 		ctx.Emit.EmitInstr(wasm.Instruction{
 			Opcode: wasm.OpBrOnNull,
 			Imm:    wasm.BranchImm{LabelIdx: imm.LabelIdx + 1},
 		})
+		ctx.Emit.LocalSet(tmp)
 		ctx.Emit.End()
+		ctx.Stack.Push(tmp, refType)
 	case wasm.OpBrOnNonNull:
 		imm := instr.Imm.(wasm.BranchImm)
-		var refLocal uint32
+		var refLocal semantics.Operand
 		if ctx.Stack.Len() > 0 {
 			refLocal = ctx.Stack.Pop()
 		}
 		ctx.Emit.StateCheck(ft.globals.StateGlobal, StateNormal).If(codegen.BlockVoid)
-		ctx.Emit.LocalGet(refLocal)
+		ctx.Emit.Operand(refLocal)
 		ctx.Emit.EmitInstr(wasm.Instruction{
 			Opcode: wasm.OpBrOnNonNull,
 			Imm:    wasm.BranchImm{LabelIdx: imm.LabelIdx + 1},
@@ -984,24 +1394,61 @@ func (ft *FunctionTransformer) emitBranchOrReturn(ctx *handler.Context, instr wa
 	return nil
 }
 
+// emitUnconditionalBranch emits guest branch instructions directly without
+// state checks. This is sound for code following the last async call site, where execution
+// is guaranteed to be in StateNormal (rewind never reaches past the resumed call site).
+func (ft *FunctionTransformer) emitUnconditionalReferenceBranch(ctx *handler.Context, instr wasm.Instruction) error {
+	switch instr.Opcode {
+	case wasm.OpBrOnNull:
+		imm := instr.Imm.(wasm.BranchImm)
+		var refLocal semantics.Operand
+		refType := wasm.ValFuncRef
+		if ctx.Stack.Len() > 0 {
+			entry := ctx.Stack.Pop()
+			refLocal = entry
+			refType = entry.Type()
+		}
+		tmp := ctx.AllocTemp(refType)
+		ctx.Emit.Operand(refLocal)
+		ctx.Emit.EmitInstr(wasm.Instruction{
+			Opcode: wasm.OpBrOnNull,
+			Imm:    wasm.BranchImm{LabelIdx: imm.LabelIdx},
+		})
+		ctx.Emit.LocalSet(tmp)
+		ctx.Stack.Push(tmp, refType)
+	case wasm.OpBrOnNonNull:
+		imm := instr.Imm.(wasm.BranchImm)
+		var refLocal semantics.Operand
+		if ctx.Stack.Len() > 0 {
+			refLocal = ctx.Stack.Pop()
+		}
+		ctx.Emit.Operand(refLocal)
+		ctx.Emit.EmitInstr(wasm.Instruction{
+			Opcode: wasm.OpBrOnNonNull,
+			Imm:    wasm.BranchImm{LabelIdx: imm.LabelIdx},
+		})
+	}
+	return nil
+}
+
 // emitSingleInstruction emits a single non-async instruction, preserving control flow.
 func (ft *FunctionTransformer) emitSingleInstruction(ctx *handler.Context, instr wasm.Instruction) error {
 	// Handle non-async calls
 	if instr.Opcode == wasm.OpCall || instr.Opcode == wasm.OpCallIndirect || instr.Opcode == wasm.OpCallRef {
-		ft.emitNonAsyncCall(ctx, instr)
-		return nil
+		return ft.emitNonAsyncCall(ctx, instr)
 	}
 
-	// Handle return
+	if instr.Opcode == wasm.OpBr || instr.Opcode == wasm.OpBrIf || instr.Opcode == wasm.OpBrTable {
+		return fmt.Errorf("asyncify: source branch requires a typed action")
+	}
 	if instr.Opcode == wasm.OpReturn {
-		ft.emitReturn(ctx)
-		return nil
+		return fmt.Errorf("asyncify: source return requires a typed action")
 	}
 
 	// For control flow that needs single stack value, reload from simulated stack
 	if needsSingleStackValue(instr.Opcode) && ctx.Stack.Len() > 0 {
-		entry := ctx.Stack.PopTyped()
-		ctx.Emit.LocalGet(entry.LocalIdx)
+		entry := ctx.Stack.Pop()
+		ctx.Emit.Operand(entry)
 	}
 
 	// Use handler if available, otherwise emit raw instruction
@@ -1016,82 +1463,61 @@ func (ft *FunctionTransformer) emitSingleInstruction(ctx *handler.Context, instr
 	return nil
 }
 
-// emitReturn handles return instruction by popping all result values from simulated stack.
-func (ft *FunctionTransformer) emitReturn(ctx *handler.Context) {
-	// Pop all values from simulated stack and push to real stack (in reverse order)
-	var resultLocals []uint32
-	for ctx.Stack.Len() > 0 {
-		resultLocals = append(resultLocals, ctx.Stack.Pop())
-	}
-	// Push in reverse order so first result ends up at bottom of stack
-	for i := len(resultLocals) - 1; i >= 0; i-- {
-		ctx.Emit.LocalGet(resultLocals[i])
-	}
-	ctx.Emit.Return()
-}
-
 // emitNonAsyncCall handles non-async calls by popping params from simulated stack.
-func (ft *FunctionTransformer) emitNonAsyncCall(ctx *handler.Context, instr wasm.Instruction) {
-	var funcType *wasm.FuncType
-	isIndirect := instr.Opcode == wasm.OpCallIndirect
-	isCallRef := instr.Opcode == wasm.OpCallRef
-
-	switch instr.Opcode {
-	case wasm.OpCallIndirect:
-		imm := instr.Imm.(wasm.CallIndirectImm)
-		if int(imm.TypeIdx) < len(ctx.Module.Types) {
-			funcType = &ctx.Module.Types[imm.TypeIdx]
-		}
-	case wasm.OpCallRef:
-		imm := instr.Imm.(wasm.CallRefImm)
-		if int(imm.TypeIdx) < len(ctx.Module.Types) {
-			funcType = &ctx.Module.Types[imm.TypeIdx]
-		}
-	default:
-		imm := instr.Imm.(wasm.CallImm)
-		funcType = ctx.Module.GetFuncType(imm.FuncIdx)
+func (ft *FunctionTransformer) emitNonAsyncCall(ctx *handler.Context, instr wasm.Instruction) error {
+	call, handled, err := ft.calls.Resolve(instr)
+	if err != nil {
+		return err
 	}
-
+	if !handled {
+		return fmt.Errorf("asyncify: non-call opcode %#x in call emitter", instr.Opcode)
+	}
 	// Pop table index for call_indirect or func ref for call_ref
-	var extraOperandLocal uint32
-	if (isIndirect || isCallRef) && ctx.Stack.Len() > 0 {
+	var extraOperandLocal semantics.Operand
+	if call.HasTargetOperand() && ctx.Stack.Len() > 0 {
 		extraOperandLocal = ctx.Stack.Pop()
 	}
 
 	// Pop params from simulated stack (reverse order - last param is on top)
-	var paramLocals []uint32
-	if funcType != nil {
-		for i := 0; i < len(funcType.Params) && ctx.Stack.Len() > 0; i++ {
-			paramLocals = append(paramLocals, ctx.Stack.Pop())
-		}
-		// Reverse to get correct order
-		for i, j := 0, len(paramLocals)-1; i < j; i, j = i+1, j-1 {
-			paramLocals[i], paramLocals[j] = paramLocals[j], paramLocals[i]
-		}
+	var paramLocals []semantics.Operand
+
+	for i := 0; i < call.ParamCount() && ctx.Stack.Len() > 0; i++ {
+		paramLocals = append(paramLocals, ctx.Stack.Pop())
+	}
+	// Reverse to get correct order
+	for i, j := 0, len(paramLocals)-1; i < j; i, j = i+1, j-1 {
+		paramLocals[i], paramLocals[j] = paramLocals[j], paramLocals[i]
 	}
 
 	// Push params onto real stack
 	for _, local := range paramLocals {
-		ctx.Emit.LocalGet(local)
+		ctx.Emit.Operand(local)
 	}
 
 	// Push table index for call_indirect or func ref for call_ref
-	if isIndirect || isCallRef {
-		ctx.Emit.LocalGet(extraOperandLocal)
+	if call.HasTargetOperand() {
+		ctx.Emit.Operand(extraOperandLocal)
 	}
 
 	// Emit the call
 	ctx.Emit.EmitInstr(instr)
 
 	// Push results onto simulated stack
-	if funcType != nil && len(funcType.Results) > 0 {
-		for i := len(funcType.Results) - 1; i >= 0; i-- {
-			resultType := funcType.Results[i]
-			tmpLocal := ctx.Locals.Alloc(resultType)
-			ctx.Emit.LocalSet(tmpLocal)
-			ctx.Stack.Push(tmpLocal, resultType)
+	if call.ResultCount() > 0 {
+		resLocals := make([]uint32, call.ResultCount())
+		for i := range call.ResultCount() {
+			rt := call.ResultType(i)
+			resLocals[i] = ctx.Locals.Alloc(rt)
+		}
+		for i := call.ResultCount() - 1; i >= 0; i-- {
+			ctx.Emit.LocalSet(resLocals[i])
+		}
+		for i := range call.ResultCount() {
+			rt := call.ResultType(i)
+			ctx.Stack.Push(resLocals[i], rt)
 		}
 	}
+	return nil
 }
 
 func (ft *FunctionTransformer) emitAsyncCallSite(
@@ -1102,27 +1528,30 @@ func (ft *FunctionTransformer) emitAsyncCallSite(
 	localCallIndexRewind uint32,
 	funcType *wasm.FuncType,
 	controlDepth int,
-	preAllocatedResults []uint32,
 ) {
 	em := ctx.Emit
 	stack := ctx.Stack
 
 	// For call_indirect/call_ref, there's an extra operand (table index / func ref) not in the type
-	var extraOperandLocal uint32
-	isIndirect := instr.IsIndirectCall()
-	isCallRef := instr.Opcode == wasm.OpCallRef
-	if isIndirect || isCallRef {
+	var extraOperandLocal semantics.Operand
+	if site.Call.HasTargetOperand() {
 		extraOperandLocal = stack.Pop()
 	}
 
-	var paramLocals []uint32
-	if site.CalleeType != nil {
-		for range site.CalleeType.Params {
-			paramLocals = append(paramLocals, stack.Pop())
-		}
-		for j, k := 0, len(paramLocals)-1; j < k; j, k = j+1, k-1 {
-			paramLocals[j], paramLocals[k] = paramLocals[k], paramLocals[j]
-		}
+	var paramLocals []semantics.Operand
+
+	for range site.Call.ParamCount() {
+		paramLocals = append(paramLocals, stack.Pop())
+	}
+	for j, k := 0, len(paramLocals)-1; j < k; j, k = j+1, k-1 {
+		paramLocals[j], paramLocals[k] = paramLocals[k], paramLocals[j]
+	}
+
+	// Consume the exact result definitions planned by operand simulation.
+	// The plan prevents these writes from aliasing still-owned input operands.
+	results := make([]uint32, site.Call.ResultCount())
+	for i := range results {
+		results[i] = ctx.AllocTemp(site.Call.ResultType(i))
 	}
 
 	// if (normal || (rewinding && call_index == site_idx))
@@ -1137,20 +1566,20 @@ func (ft *FunctionTransformer) emitAsyncCallSite(
 
 	// Push parameters and call
 	for _, local := range paramLocals {
-		em.LocalGet(local)
+		em.Operand(local)
 	}
 	// For call_indirect/call_ref, push the extra operand after params
-	if isIndirect || isCallRef {
-		em.LocalGet(extraOperandLocal)
+	if site.Call.HasTargetOperand() {
+		em.Operand(extraOperandLocal)
 	}
 	em.EmitInstr(*instr)
 
-	// Handle results - use pre-allocated locals for multi-value returns
-	// Pre-allocated locals are already in liveUnion for save/restore
-	if site.CalleeType != nil && len(site.CalleeType.Results) > 0 {
+	// Results are written only when the call actually executes. A result is
+	// saved only if it is an operand of a later suspended continuation.
+	if site.Call.ResultCount() > 0 {
 		// Store results in reverse order (last result is on top of stack)
-		for i := len(site.CalleeType.Results) - 1; i >= 0; i-- {
-			em.LocalSet(preAllocatedResults[i])
+		for i := site.Call.ResultCount() - 1; i >= 0; i-- {
+			em.LocalSet(results[i])
 		}
 	}
 
@@ -1166,9 +1595,9 @@ func (ft *FunctionTransformer) emitAsyncCallSite(
 	em.End()
 
 	// Push results onto simulated stack (in order)
-	if site.CalleeType != nil && len(preAllocatedResults) > 0 {
-		for i, resultLocal := range preAllocatedResults {
-			stack.Push(resultLocal, site.CalleeType.Results[i])
+	if len(results) > 0 {
+		for i, resultLocal := range results {
+			stack.Push(resultLocal, site.Call.ResultType(i))
 		}
 	}
 }

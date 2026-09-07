@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -45,7 +46,11 @@ func ClassifyError(err error) ErrorKind {
 //   - [4:8] stack end
 //   - [8:stackSize] stack data
 type Asyncify struct {
-	exports struct {
+	// Bound once before publication by the instance. Standalone controllers have
+	// no owner; their caller must keep the underlying module alive.
+	lifetime   *executionLifetime
+	generation *asyncifyGeneration
+	exports    struct {
 		getState    api.Function
 		startUnwind api.Function
 		stopUnwind  api.Function
@@ -92,14 +97,29 @@ func (a *Asyncify) SetDataAddr(addr uint32) {
 	a.dataAddr = addr
 }
 
-// Init initializes asyncify. Call after module instantiation.
+// Init initializes caller-owned controls. Instance reconfiguration prepares all
+// cores first and commits their headers together under caller serialization.
 func (a *Asyncify) Init(mod api.Module) error {
+	if a.lifetime != nil || a.generation != nil {
+		return fmt.Errorf("asyncify: instance-owned controls cannot be rebound; use EnableAsyncify")
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	header, err := a.prepareInit(mod)
+	if err != nil {
+		return err
+	}
+	header.commit()
+	return nil
+}
 
+// prepareInit resolves controls and validates the complete header without writing
+// guest memory. The returned slice is borrowed until commit; no guest execution
+// or memory growth may occur between preparation and commit.
+func (a *Asyncify) prepareInit(mod api.Module) (asyncifyHeader, error) {
 	a.memory = mod.Memory()
 	if a.memory == nil {
-		return fmt.Errorf("asyncify: module has no memory")
+		return asyncifyHeader{}, fmt.Errorf("asyncify: module has no memory")
 	}
 
 	a.exports.getState = mod.ExportedFunction("asyncify_get_state")
@@ -109,7 +129,7 @@ func (a *Asyncify) Init(mod api.Module) error {
 	a.exports.stopRewind = mod.ExportedFunction("asyncify_stop_rewind")
 
 	if a.exports.getState == nil {
-		return fmt.Errorf("asyncify: module missing asyncify_get_state export (run wasm-opt --asyncify)")
+		return asyncifyHeader{}, fmt.Errorf("asyncify: module missing asyncify_get_state export (run wasm-opt --asyncify)")
 	}
 
 	a.module = mod
@@ -125,17 +145,16 @@ func (a *Asyncify) Init(mod api.Module) error {
 		}
 	}
 
-	stackPtr := a.dataAddr + 8
-	stackEnd := stackPtr + a.stackSize
-
-	if !a.memory.WriteUint32Le(a.dataAddr, stackPtr) {
-		return fmt.Errorf("asyncify: failed to write stack pointer")
+	pointer := uint64(a.dataAddr) + 8
+	end := pointer + uint64(a.stackSize)
+	if end > uint64(^uint32(0)) {
+		return asyncifyHeader{}, fmt.Errorf("asyncify: stack address overflow")
 	}
-	if !a.memory.WriteUint32Le(a.dataAddr+4, stackEnd) {
-		return fmt.Errorf("asyncify: failed to write stack end")
+	bytes, ok := a.memory.Read(a.dataAddr, 8)
+	if !ok {
+		return asyncifyHeader{}, fmt.Errorf("asyncify: stack header outside memory")
 	}
-
-	return nil
+	return asyncifyHeader{bytes: bytes, pointer: uint32(pointer), end: uint32(end)}, nil
 }
 
 func (a *Asyncify) GetState(_ context.Context) int32 {
@@ -143,7 +162,13 @@ func (a *Asyncify) GetState(_ context.Context) int32 {
 }
 
 // SyncState reads state from WASM module. Allocates; use only for debugging.
+// If execution is stopped or the guest read fails, it returns the cached state.
 func (a *Asyncify) SyncState(ctx context.Context) int32 {
+	ctx, finish, err := a.enterControl(ctx)
+	if err != nil {
+		return atomic.LoadInt32(&a.state)
+	}
+	defer finish()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -202,6 +227,11 @@ func (a *Asyncify) directControl(ctx context.Context, expected, next int32, star
 }
 
 func (a *Asyncify) StartUnwind(ctx context.Context) error {
+	ctx, finish, err := a.enterControl(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	if a.directControl(ctx, 0, 1, true) {
 		return nil
 	}
@@ -217,6 +247,11 @@ func (a *Asyncify) StartUnwind(ctx context.Context) error {
 }
 
 func (a *Asyncify) StopUnwind(ctx context.Context) error {
+	ctx, finish, err := a.enterControl(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	if a.directControl(ctx, 1, 0, false) {
 		return nil
 	}
@@ -232,6 +267,11 @@ func (a *Asyncify) StopUnwind(ctx context.Context) error {
 }
 
 func (a *Asyncify) StartRewind(ctx context.Context) error {
+	ctx, finish, err := a.enterControl(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	if a.directControl(ctx, 0, 2, true) {
 		return nil
 	}
@@ -247,6 +287,11 @@ func (a *Asyncify) StartRewind(ctx context.Context) error {
 }
 
 func (a *Asyncify) StopRewind(ctx context.Context) error {
+	ctx, finish, err := a.enterControl(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	if a.directControl(ctx, 2, 0, false) {
 		return nil
 	}
@@ -261,17 +306,42 @@ func (a *Asyncify) StopRewind(ctx context.Context) error {
 	return nil
 }
 
-// ResetStack resets the stack pointer. Call before each new async operation.
-func (a *Asyncify) ResetStack() {
+// ResetStack resets the stack pointer. On a stopped instance it has no effect.
+// Use ResetStackContext when the caller needs the rejection error.
+func (a *Asyncify) ResetStack() { _ = a.ResetStackContext(context.Background()) }
+
+// ResetStackContext resets the stack before a new async operation. The caller
+// must serialize it with execution, just like the other Asyncify controls.
+func (a *Asyncify) ResetStackContext(ctx context.Context) error {
+	_, finish, err := a.enterControl(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	a.ClearHostArgs()
 	if a.memory != nil {
 		stackPtr := a.dataAddr + 8
 		if !a.memory.WriteUint32Le(a.dataAddr, stackPtr) {
 			Logger().Warn("ResetStack: failed to write stack pointer to asyncify data",
-				zap.Uint32("dataAddr", a.dataAddr),
-				zap.Uint32("stackPtr", stackPtr))
+				zap.Uint32("dataAddr", a.dataAddr), zap.Uint32("stackPtr", stackPtr))
+			return fmt.Errorf("asyncify: failed to reset stack pointer")
 		}
 	}
+	return nil
+}
+
+// enterControl borrows an enclosing active execution lease, or admits an
+// external control operation. Borrowing keeps internal unwind/rewind allocation
+// free while teardown still joins the enclosing call. It is not a concurrency
+// lock: callers must serialize controls with the guest's execution protocol.
+func (a *Asyncify) enterControl(ctx context.Context) (context.Context, func(), error) {
+	if a.generation != nil && a.generation.revoked.Load() {
+		return ctx, finishUntrackedExecution, ErrAsyncifySuperseded
+	}
+	if a.lifetime == nil || a.lifetime.heldBy(ctx) {
+		return ctx, finishUntrackedExecution, nil
+	}
+	return a.lifetime.enter(ctx)
 }
 
 // ParkHostArgs copies the Canonical ABI host-call stack for the in-flight
@@ -379,19 +449,33 @@ func (s *Scheduler) ClearPending() {
 }
 
 // Execute initializes execution. Call Step() to advance.
+// Scheduler methods must be serialized by the caller; shutdown leases protect
+// resource lifetime, not concurrent scheduling or canonical-session ownership.
 func (s *Scheduler) Execute(ctx context.Context, fn api.Function, args ...uint64) error {
+	ctx, finish, err := s.asyncify.enterControl(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	if !s.asyncify.IsNormal(ctx) {
 		return fmt.Errorf("scheduler: asyncify not in normal state")
+	}
+	if err := s.asyncify.ResetStackContext(ctx); err != nil {
+		return err
 	}
 	s.fn = fn
 	s.args = args
 	s.initialized = true
-	s.asyncify.ResetStack()
 	return nil
 }
 
 // Step advances execution. Pass nil for first call, or YieldResult to resume.
 func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, error) {
+	ctx, finish, err := s.asyncify.enterControl(ctx)
+	if err != nil {
+		return StepResult{Error: err, ErrorKind: ClassifyError(err)}, err
+	}
+	defer finish()
 	if err := ctx.Err(); err != nil {
 		s.asyncify.ClearHostArgs()
 		return StepResult{Error: err, ErrorKind: ClassifyError(err)}, err
@@ -563,4 +647,22 @@ func MakeAsyncHandler(createOp func(ctx context.Context, mod api.Module, stack [
 			}
 		}
 	}
+}
+
+// Generation owns permission to manipulate a configuration's guest control state;
+// executionLifetime independently owns the lifetime of the underlying modules.
+type asyncifyGeneration struct{ revoked atomic.Bool }
+
+var ErrAsyncifySuperseded = errors.New("asyncify: controls superseded by reconfiguration")
+
+type asyncifyHeader struct {
+	bytes        []byte
+	pointer, end uint32
+}
+
+// commit cannot fail: preparation borrowed the entire header under the caller's
+// serialized execution contract. No rollback writes are necessary.
+func (h asyncifyHeader) commit() {
+	binary.LittleEndian.PutUint32(h.bytes[:4], h.pointer)
+	binary.LittleEndian.PutUint32(h.bytes[4:], h.end)
 }

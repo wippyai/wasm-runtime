@@ -9,7 +9,7 @@
 // - Data layout (stack ptr at offset 0, stack end at offset 4)
 // - Value types (i32, i64, f32, f64, v128)
 // - Reference type rejection (funcref, externref)
-// - Scratch locals (11 total, matching Binaryen)
+// - Continuation frame access independent of compiler scratch-local layout
 // - Control flow handling
 package engine
 
@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wippyai/wasm-runtime/asyncify/internal/testutil"
 	"github.com/wippyai/wasm-runtime/wasm"
 	"github.com/wippyai/wasm-runtime/wat"
 )
@@ -172,8 +173,8 @@ func TestBinaryen_GlobalsAdded(t *testing.T) {
 	}
 }
 
-// TestBinaryen_ScratchLocals verifies 11 scratch locals are added.
-func TestBinaryen_ScratchLocals(t *testing.T) {
+// TestBinaryen_ContinuationFrame verifies generated continuation accesses.
+func TestBinaryen_ContinuationFrame(t *testing.T) {
 	m := &wasm.Module{
 		Types: []wasm.FuncType{
 			{},
@@ -213,15 +214,7 @@ func TestBinaryen_ScratchLocals(t *testing.T) {
 	}
 
 	body := transformed.Code[0]
-	localCount := 0
-	for _, entry := range body.Locals {
-		localCount += int(entry.Count)
-	}
-
-	// Binaryen adds 11 scratch locals + any temp locals from flattening
-	if localCount < 10 {
-		t.Errorf("locals = %d, want at least 11 (Binaryen scratch locals)", localCount)
-	}
+	testutil.RequireContinuationFrame(t, transformed, body)
 }
 
 // TestBinaryen_ValueTypes verifies all Binaryen-supported types work.
@@ -393,18 +386,12 @@ func TestBinaryen_CallGraphTransitivity(t *testing.T) {
 		t.Fatalf("ParseModule() error = %v", err)
 	}
 
-	// Both original functions should have scratch locals added (sign of transformation)
+	// Both original functions should access continuation frames
 	// Only check the first 2 functions (B and A), not the asyncify helper functions
 	originalFuncCount := 2
 	for i := 0; i < originalFuncCount && i < len(transformed.Code); i++ {
 		body := transformed.Code[i]
-		localCount := 0
-		for _, entry := range body.Locals {
-			localCount += int(entry.Count)
-		}
-		if localCount < 10 {
-			t.Errorf("func %d: locals = %d, want >= 10 (should be transformed transitively)", i, localCount)
-		}
+		testutil.RequireContinuationFrame(t, transformed, body)
 	}
 }
 

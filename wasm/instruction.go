@@ -11,7 +11,8 @@ import (
 type Instruction struct {
 	Imm    interface{}
 	Opcode byte
-	// Synthetic marks transformer routing that must also execute during rewind.
+	// Synthetic is a legacy projection marker for transformer routing. Asyncify
+	// execution ownership comes from checked lowering actions, not this flag.
 	// It is internal metadata and is never encoded into the binary.
 	Synthetic bool
 }

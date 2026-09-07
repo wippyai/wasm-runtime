@@ -1,6 +1,8 @@
 package ir
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/wippyai/wasm-runtime/wasm"
@@ -15,16 +17,15 @@ func TestLinearize_NoAsync(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Should have same structure (minus the trailing End which is part of SeqNode parse)
 	if len(result) != 3 {
@@ -44,16 +45,15 @@ func TestLinearize_AsyncInThenBranch(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(10)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    5,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{0: true},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Verify structure:
 	// - i32.const 1
@@ -106,16 +106,15 @@ func TestLinearize_AsyncInElseBranch(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{0: true},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Should have three if blocks:
 	// 1. condition-save: if (rewinding) { drop } else { local.set $cond }
@@ -145,16 +144,15 @@ func TestLinearize_AsyncInBothBranches(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{0: true, 1: true},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// When BOTH branches have async, we use just the saved condition (no rewinding || cond).
 	// This ensures only the originally-taken branch executes during rewind.
@@ -200,16 +198,15 @@ func TestLinearize_NestedIfWithAsync(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{0: true},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Should have multiple linearized if blocks
 	ifCount := 0
@@ -240,16 +237,15 @@ func TestLinearize_BlockNoAsyncNoResult(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{}, // no async funcs
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Should have: block, i32.const, drop, end
 	foundBlock := false
@@ -278,16 +274,15 @@ func TestLinearize_IfNoAsyncNoResult(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	foundIf := false
 	foundEnd := false
@@ -317,16 +312,15 @@ func TestLinearize_IfNoAsyncNoResultWithElse(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	foundIf := false
 	foundElse := false
@@ -357,16 +351,15 @@ func TestLinearize_BlockWithResult(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{0: true},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Should have local.set and local.get for result
 	foundSet := false
@@ -394,16 +387,15 @@ func TestLinearize_LoopWithResult(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{0: true},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Should emit as void loop with result locals
 	loopFound := false
@@ -435,16 +427,15 @@ func TestLinearize_CallIndirectTreatedAsAsync(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{}, // no explicit async funcs
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Should detect call_indirect as async and linearize
 	// 1 condition-save if + 2 branch ifs = 3 total
@@ -676,16 +667,16 @@ func TestLinearize_BlockWithParams(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs, module)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
+		Module:         module,
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{0: true},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Should have local.set for param and local.get to reload it
 	setCount := 0
@@ -726,16 +717,16 @@ func TestLinearize_IfWithParams(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs, module)
 	nextLocal := uint32(0)
-	config := &LinearizeConfig{
+	config := &testLinearizeConfig{
+		Module:         module,
 		StateGlobal:    0,
 		StateRewinding: 2,
 		AsyncFuncs:     map[uint32]bool{0: true},
 		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
 	}
 
-	result := Linearize(tree, config)
+	result := mustLinearize(t, instrs, config)
 
 	// Should linearize with param handling
 	if len(result) == 0 {
@@ -768,8 +759,7 @@ func TestBranchHasAsync_NestedBlocks(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
-	if !branchHasAsync(tree, asyncFuncs) {
+	if !prepareFixture(t, instrs, &testLinearizeConfig{AsyncFuncs: asyncFuncs}).NeedsTransform() {
 		t.Error("should detect async in nested block")
 	}
 }
@@ -788,8 +778,7 @@ func TestBranchHasAsync_IfBranches(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
-	if !branchHasAsync(tree, asyncFuncs) {
+	if !prepareFixture(t, instrs, &testLinearizeConfig{AsyncFuncs: asyncFuncs}).NeedsTransform() {
 		t.Error("should detect async in if then branch")
 	}
 }
@@ -808,8 +797,7 @@ func TestBranchHasAsync_ElseBranch(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
-	if !branchHasAsync(tree, asyncFuncs) {
+	if !prepareFixture(t, instrs, &testLinearizeConfig{AsyncFuncs: asyncFuncs}).NeedsTransform() {
 		t.Error("should detect async in else branch")
 	}
 }
@@ -824,7 +812,7 @@ func TestBranchHasAsync(t *testing.T) {
 	}{
 		{
 			name:   "no calls",
-			instrs: []wasm.Instruction{{Opcode: wasm.OpI32Const}, {Opcode: wasm.OpEnd}},
+			instrs: []wasm.Instruction{{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 0}}, {Opcode: wasm.OpEnd}},
 			want:   false,
 		},
 		{
@@ -851,11 +839,456 @@ func TestBranchHasAsync(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tree := Parse(tt.instrs)
-			got := branchHasAsync(tree, asyncFuncs)
+			got := prepareFixture(t, tt.instrs, &testLinearizeConfig{AsyncFuncs: asyncFuncs}).NeedsTransform()
 			if got != tt.want {
 				t.Errorf("branchHasAsync() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func linearizeWith(t *testing.T, instrs []wasm.Instruction, asyncFuncs map[uint32]bool, nextLocal uint32, module ...*wasm.Module) []wasm.Instruction {
+	t.Helper()
+	config := &testLinearizeConfig{
+		StateGlobal:    5,
+		StateRewinding: 2,
+		AsyncFuncs:     asyncFuncs,
+		AllocLocal:     func(vt wasm.ValType) uint32 { l := nextLocal; nextLocal++; return l },
+	}
+	if len(module) > 0 {
+		config.Module = module[0]
+	}
+	return mustLinearize(t, instrs, config)
+}
+
+func countOpcode(instrs []wasm.Instruction, op byte) int {
+	n := 0
+	for _, instr := range instrs {
+		if instr.Opcode == op {
+			n++
+		}
+	}
+	return n
+}
+
+func countOpcodeSynth(instrs []wasm.Instruction, op byte, synthetic bool) int {
+	n := 0
+	for _, instr := range instrs {
+		if instr.Opcode == op && instr.Synthetic == synthetic {
+			n++
+		}
+	}
+	return n
+}
+
+func dumpInstrs(instrs []wasm.Instruction) string {
+	var b strings.Builder
+	for i, ins := range instrs {
+		fmt.Fprintf(&b, "%d: %s %v synth=%v\n", i, opcodeName(ins.Opcode), ins.Imm, ins.Synthetic)
+	}
+	return b.String()
+}
+
+func opcodeName(op byte) string {
+	switch op {
+	case wasm.OpIf:
+		return "if"
+	case wasm.OpElse:
+		return "else"
+	case wasm.OpEnd:
+		return "end"
+	case wasm.OpBr:
+		return "br"
+	case wasm.OpI32Const:
+		return "i32.const"
+	case wasm.OpI32Add:
+		return "i32.add"
+	case wasm.OpI32Eq:
+		return "i32.eq"
+	case wasm.OpI32Ne:
+		return "i32.ne"
+	case wasm.OpI32And:
+		return "i32.and"
+	case wasm.OpI32Or:
+		return "i32.or"
+	case wasm.OpI32Eqz:
+		return "i32.eqz"
+	case wasm.OpLocalGet:
+		return "local.get"
+	case wasm.OpLocalSet:
+		return "local.set"
+	case wasm.OpGlobalGet:
+		return "global.get"
+	case wasm.OpDrop:
+		return "drop"
+	case wasm.OpCall:
+		return "call"
+	case wasm.OpNop:
+		return "nop"
+	default:
+		return fmt.Sprintf("0x%02x", op)
+	}
+}
+
+func TestLinearize_IfResultNoAsync_KeepsSingleIfElse(t *testing.T) {
+	instrs := []wasm.Instruction{
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+		{Opcode: wasm.OpIf, Imm: wasm.BlockImm{Type: -1}},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 7}},
+		{Opcode: wasm.OpElse},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 9}},
+		{Opcode: wasm.OpEnd},
+		{Opcode: wasm.OpEnd},
+	}
+
+	result := linearizeWith(t, instrs, map[uint32]bool{99: true}, 0)
+
+	if n := countOpcode(result, wasm.OpGlobalGet); n != 0 {
+		t.Errorf("expected 0 global.get, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpIf); n != 1 {
+		t.Errorf("expected 1 if, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpElse); n != 1 {
+		t.Errorf("expected 1 else, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcodeSynth(result, wasm.OpIf, true); n != 0 {
+		t.Errorf("expected 0 synthetic if, got %d\n%s", n, dumpInstrs(result))
+	}
+
+	want := []struct {
+		imm interface{}
+		op  byte
+	}{
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 1}},
+		{op: wasm.OpIf, imm: wasm.BlockImm{Type: -64}},
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 7}},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 0}},
+		{op: wasm.OpElse},
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 9}},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 0}},
+		{op: wasm.OpEnd},
+		{op: wasm.OpLocalGet, imm: wasm.LocalImm{LocalIdx: 0}},
+	}
+	if len(result) != len(want) {
+		t.Fatalf("if-lowering instruction count %d, want %d (8 after condition)\n%s", len(result), len(want), dumpInstrs(result))
+	}
+	for i, w := range want {
+		if result[i].Opcode != w.op {
+			t.Fatalf("result[%d] opcode %#x, want %#x\n%s", i, result[i].Opcode, w.op, dumpInstrs(result))
+		}
+		if result[i].Synthetic {
+			t.Fatalf("result[%d] marked synthetic\n%s", i, dumpInstrs(result))
+		}
+		if w.imm != nil && result[i].Imm != w.imm {
+			t.Fatalf("result[%d] imm %v, want %v\n%s", i, result[i].Imm, w.imm, dumpInstrs(result))
+		}
+	}
+}
+
+func TestLinearize_IfResultNoAsync_NestedUnderAsyncIf(t *testing.T) {
+	instrs := []wasm.Instruction{
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+		{Opcode: wasm.OpIf, Imm: wasm.BlockImm{Type: -1}},
+		{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+		{Opcode: wasm.OpIf, Imm: wasm.BlockImm{Type: -1}},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 7}},
+		{Opcode: wasm.OpElse},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 9}},
+		{Opcode: wasm.OpEnd},
+		{Opcode: wasm.OpElse},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 88}},
+		{Opcode: wasm.OpEnd},
+		{Opcode: wasm.OpEnd},
+	}
+
+	result := linearizeWith(t, instrs, map[uint32]bool{0: true}, 0)
+
+	if n := countOpcode(result, wasm.OpGlobalGet); n == 0 {
+		t.Errorf("expected rewind checks on outer async if\n%s", dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpIf); n != 4 {
+		t.Errorf("expected 4 ifs (3 outer routing + 1 inner cheap), got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcodeSynth(result, wasm.OpIf, true); n != 3 {
+		t.Errorf("expected 3 synthetic routing ifs, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcodeSynth(result, wasm.OpIf, false); n != 1 {
+		t.Errorf("expected 1 non-synthetic inner if, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcodeSynth(result, wasm.OpElse, false); n != 1 {
+		t.Errorf("expected 1 non-synthetic else (inner cheap if/else), got %d\n%s", n, dumpInstrs(result))
+	}
+
+	foundCheapVoid := false
+	for _, instr := range result {
+		if instr.Opcode == wasm.OpIf && !instr.Synthetic {
+			imm, ok := instr.Imm.(wasm.BlockImm)
+			if !ok || imm.Type != -64 {
+				t.Errorf("cheap inner if imm %v, want void", instr.Imm)
+			}
+			foundCheapVoid = true
+		}
+	}
+	if !foundCheapVoid {
+		t.Error("inner cheap if not found")
+	}
+}
+
+func TestLinearize_IfParamsResultsNoAsync(t *testing.T) {
+	module := &wasm.Module{
+		Types: []wasm.FuncType{
+			{Params: []wasm.ValType{wasm.ValI32}, Results: []wasm.ValType{wasm.ValI32}},
+		},
+	}
+	instrs := []wasm.Instruction{
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 10}},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+		{Opcode: wasm.OpIf, Imm: wasm.BlockImm{Type: 0}},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+		{Opcode: wasm.OpI32Add},
+		{Opcode: wasm.OpElse},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 2}},
+		{Opcode: wasm.OpI32Add},
+		{Opcode: wasm.OpEnd},
+		{Opcode: wasm.OpEnd},
+	}
+
+	result := linearizeWith(t, instrs, map[uint32]bool{}, 0, module)
+
+	if n := countOpcode(result, wasm.OpGlobalGet); n != 0 {
+		t.Errorf("expected 0 global.get, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpIf); n != 1 {
+		t.Errorf("expected 1 if, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpElse); n != 1 {
+		t.Errorf("expected 1 else, got %d\n%s", n, dumpInstrs(result))
+	}
+
+	want := []struct {
+		imm interface{}
+		op  byte
+	}{
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 10}},
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 1}},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 0}},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 1}},
+		{op: wasm.OpLocalGet, imm: wasm.LocalImm{LocalIdx: 0}},
+		{op: wasm.OpIf, imm: wasm.BlockImm{Type: -64}},
+		{op: wasm.OpLocalGet, imm: wasm.LocalImm{LocalIdx: 1}},
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 1}},
+		{op: wasm.OpI32Add},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 2}},
+		{op: wasm.OpElse},
+		{op: wasm.OpLocalGet, imm: wasm.LocalImm{LocalIdx: 1}},
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 2}},
+		{op: wasm.OpI32Add},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 2}},
+		{op: wasm.OpEnd},
+		{op: wasm.OpLocalGet, imm: wasm.LocalImm{LocalIdx: 2}},
+	}
+	if len(result) != len(want) {
+		t.Fatalf("instruction count %d, want %d\n%s", len(result), len(want), dumpInstrs(result))
+	}
+	for i, w := range want {
+		if result[i].Opcode != w.op {
+			t.Fatalf("result[%d] opcode %#x, want %#x\n%s", i, result[i].Opcode, w.op, dumpInstrs(result))
+		}
+		if result[i].Synthetic {
+			t.Fatalf("result[%d] marked synthetic\n%s", i, dumpInstrs(result))
+		}
+		if w.imm != nil && result[i].Imm != w.imm {
+			t.Fatalf("result[%d] imm %v, want %v\n%s", i, result[i].Imm, w.imm, dumpInstrs(result))
+		}
+	}
+}
+
+func TestLinearize_IfParamsResultsNoAsync_MissingElseIdentity(t *testing.T) {
+	module := &wasm.Module{
+		Types: []wasm.FuncType{
+			{Params: []wasm.ValType{wasm.ValI32}, Results: []wasm.ValType{wasm.ValI32}},
+		},
+	}
+	instrs := []wasm.Instruction{
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 10}},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 0}},
+		{Opcode: wasm.OpIf, Imm: wasm.BlockImm{Type: 0}},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+		{Opcode: wasm.OpI32Add},
+		{Opcode: wasm.OpEnd},
+		{Opcode: wasm.OpEnd},
+	}
+
+	result := linearizeWith(t, instrs, map[uint32]bool{}, 0, module)
+
+	if n := countOpcode(result, wasm.OpGlobalGet); n != 0 {
+		t.Errorf("expected 0 global.get, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpIf); n != 1 {
+		t.Errorf("expected 1 if, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpElse); n != 1 {
+		t.Errorf("expected synthesized else for param->result identity, got %d\n%s", n, dumpInstrs(result))
+	}
+
+	want := []struct {
+		imm interface{}
+		op  byte
+	}{
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 10}},
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 0}},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 0}},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 1}},
+		{op: wasm.OpLocalGet, imm: wasm.LocalImm{LocalIdx: 0}},
+		{op: wasm.OpIf, imm: wasm.BlockImm{Type: -64}},
+		{op: wasm.OpLocalGet, imm: wasm.LocalImm{LocalIdx: 1}},
+		{op: wasm.OpI32Const, imm: wasm.I32Imm{Value: 1}},
+		{op: wasm.OpI32Add},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 2}},
+		{op: wasm.OpElse},
+		{op: wasm.OpLocalGet, imm: wasm.LocalImm{LocalIdx: 1}},
+		{op: wasm.OpLocalSet, imm: wasm.LocalImm{LocalIdx: 2}},
+		{op: wasm.OpEnd},
+		{op: wasm.OpLocalGet, imm: wasm.LocalImm{LocalIdx: 2}},
+	}
+	if len(result) != len(want) {
+		t.Fatalf("instruction count %d, want %d\n%s", len(result), len(want), dumpInstrs(result))
+	}
+	for i, w := range want {
+		if result[i].Opcode != w.op {
+			t.Fatalf("result[%d] opcode %#x, want %#x\n%s", i, result[i].Opcode, w.op, dumpInstrs(result))
+		}
+		if w.imm != nil && result[i].Imm != w.imm {
+			t.Fatalf("result[%d] imm %v, want %v\n%s", i, result[i].Imm, w.imm, dumpInstrs(result))
+		}
+	}
+}
+
+func TestLinearize_IfResultNoAsync_BranchToResultLabel(t *testing.T) {
+	instrs := []wasm.Instruction{
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+		{Opcode: wasm.OpIf, Imm: wasm.BlockImm{Type: -1}},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 7}},
+		{Opcode: wasm.OpBr, Imm: wasm.BranchImm{LabelIdx: 0}},
+		{Opcode: wasm.OpElse},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 9}},
+		{Opcode: wasm.OpEnd},
+		{Opcode: wasm.OpEnd},
+	}
+
+	result := linearizeWith(t, instrs, map[uint32]bool{}, 0)
+
+	if n := countOpcode(result, wasm.OpIf); n != 1 {
+		t.Errorf("expected 1 if, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpElse); n != 1 {
+		t.Errorf("expected 1 else, got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpGlobalGet); n != 0 {
+		t.Errorf("expected 0 global.get, got %d\n%s", n, dumpInstrs(result))
+	}
+
+	brAt := -1
+	for i, instr := range result {
+		if instr.Opcode == wasm.OpBr {
+			brAt = i
+			break
+		}
+	}
+	if brAt < 1 {
+		t.Fatalf("br 0 not found\n%s", dumpInstrs(result))
+	}
+	if result[brAt-1].Opcode != wasm.OpLocalSet {
+		t.Fatalf("expected local.set before br, got %#x\n%s", result[brAt-1].Opcode, dumpInstrs(result))
+	}
+	if imm, ok := result[brAt-1].Imm.(wasm.LocalImm); !ok || imm.LocalIdx != 0 {
+		t.Fatalf("br result store targets %v, want local 0\n%s", result[brAt-1].Imm, dumpInstrs(result))
+	}
+}
+
+func TestLinearize_IfNoAsyncNoResult_UnchangedShape(t *testing.T) {
+	instrs := []wasm.Instruction{
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+		{Opcode: wasm.OpIf, Imm: wasm.BlockImm{Type: -64}},
+		{Opcode: wasm.OpNop},
+		{Opcode: wasm.OpElse},
+		{Opcode: wasm.OpNop},
+		{Opcode: wasm.OpEnd},
+		{Opcode: wasm.OpEnd},
+	}
+
+	result := linearizeWith(t, instrs, map[uint32]bool{}, 0)
+
+	want := []byte{wasm.OpI32Const, wasm.OpIf, wasm.OpNop, wasm.OpElse, wasm.OpNop, wasm.OpEnd}
+	if len(result) != len(want) {
+		t.Fatalf("instruction count %d, want %d\n%s", len(result), len(want), dumpInstrs(result))
+	}
+	for i, op := range want {
+		if result[i].Opcode != op {
+			t.Fatalf("result[%d] opcode %#x, want %#x\n%s", i, result[i].Opcode, op, dumpInstrs(result))
+		}
+		if result[i].Synthetic {
+			t.Fatalf("result[%d] marked synthetic\n%s", i, dumpInstrs(result))
+		}
+	}
+	imm, ok := result[1].Imm.(wasm.BlockImm)
+	if !ok || imm.Type != -64 {
+		t.Fatalf("void if imm %v, want original void", result[1].Imm)
+	}
+}
+
+func TestLinearize_AsyncIfParamsNoElse_IdentityElse(t *testing.T) {
+	module := &wasm.Module{
+		Types: []wasm.FuncType{
+			{Params: []wasm.ValType{wasm.ValI32}, Results: []wasm.ValType{wasm.ValI32}},
+		},
+	}
+	instrs := []wasm.Instruction{
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 10}},
+		{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+		{Opcode: wasm.OpIf, Imm: wasm.BlockImm{Type: 0}},
+		{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}},
+		{Opcode: wasm.OpEnd},
+		{Opcode: wasm.OpEnd},
+	}
+
+	result := linearizeWith(t, instrs, map[uint32]bool{0: true}, 0, module)
+
+	if n := countOpcode(result, wasm.OpIf); n != 4 {
+		t.Errorf("expected 4 ifs (cond-save + param-save + then + identity else), got %d\n%s", n, dumpInstrs(result))
+	}
+	if n := countOpcode(result, wasm.OpGlobalGet); n == 0 {
+		t.Errorf("expected rewind checks on async if\n%s", dumpInstrs(result))
+	}
+
+	foundIdentity := false
+	for i := 0; i < len(result)-1; i++ {
+		get, okGet := result[i].Imm.(wasm.LocalImm)
+		set, okSet := result[i+1].Imm.(wasm.LocalImm)
+		if result[i].Opcode == wasm.OpLocalGet && okGet && get.LocalIdx == 1 &&
+			result[i+1].Opcode == wasm.OpLocalSet && okSet && set.LocalIdx == 2 {
+			foundIdentity = true
+			break
+		}
+	}
+	if !foundIdentity {
+		t.Errorf("expected identity else param local.get 1 -> result local.set 2\n%s", dumpInstrs(result))
+	}
+
+	foundGuestParamGet := false
+	for _, instr := range result {
+		if instr.Opcode == wasm.OpLocalGet {
+			if imm, ok := instr.Imm.(wasm.LocalImm); ok && imm.LocalIdx == 1 {
+				if instr.Synthetic {
+					t.Fatal("guest parameter materialization marked as rewind routing")
+				}
+				foundGuestParamGet = true
+			}
+		}
+	}
+	if !foundGuestParamGet {
+		t.Errorf("expected guest parameter snapshot of local 1\n%s", dumpInstrs(result))
 	}
 }

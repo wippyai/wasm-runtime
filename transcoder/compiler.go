@@ -17,8 +17,8 @@ type Compiler struct {
 }
 
 type cacheKey struct {
-	goType reflect.Type
-	witPtr uintptr
+	goType  reflect.Type
+	witType wit.Type
 }
 
 func NewCompiler() *Compiler {
@@ -33,15 +33,27 @@ func (c *Compiler) Compile(witType wit.Type, goType reflect.Type) (*CompiledType
 			Detail("Go type cannot be nil").
 			Build()
 	}
+	if err := validateWITCacheKey(witType); err != nil {
+		return nil, err
+	}
 
 	// Dereference pointer types, except for Option which expects pointer
 	if goType.Kind() == reflect.Pointer && !isOptionType(witType) {
 		goType = goType.Elem()
 	}
 
-	key := cacheKey{witPtr: witTypePtr(witType), goType: goType}
+	// Keep the WIT value itself in the key. Primitive WIT types are distinct
+	// zero-sized Go values, so their byte size is not a semantic identity; a
+	// TypeDef pointer is intentionally retained to prevent address reuse after
+	// its definition would otherwise become unreachable.
+	key := cacheKey{witType: witType, goType: goType}
 	if cached, ok := c.cache.Load(key); ok {
 		return cached.(*CompiledType), nil
+	}
+	// Compiled WIT schemas are immutable after registration. Keep cache hits
+	// cheap; perform the structural walk only before the first layout/compile.
+	if err := validateWITSchema(witType, errors.PhaseCompile, nil); err != nil {
+		return nil, err
 	}
 
 	ct, err := c.compile(witType, goType, nil)
@@ -53,21 +65,32 @@ func (c *Compiler) Compile(witType wit.Type, goType reflect.Type) (*CompiledType
 	return ct, nil
 }
 
+func validateWITCacheKey(t wit.Type) error {
+	if t == nil {
+		return errors.New(errors.PhaseCompile, errors.KindInvalidData).
+			Detail("WIT type cannot be nil").
+			Build()
+	}
+	rv := reflect.ValueOf(t)
+	if isNilSchemaValue(rv) {
+		return errors.New(errors.PhaseCompile, errors.KindInvalidData).
+			Detail("WIT type cannot be nil").
+			Build()
+	}
+	if !rv.Comparable() {
+		return errors.New(errors.PhaseCompile, errors.KindUnsupported).
+			Detail("WIT type %T cannot be used as a compiler cache key", t).
+			Build()
+	}
+	return nil
+}
+
 func isOptionType(t wit.Type) bool {
 	if td, ok := t.(*wit.TypeDef); ok {
 		_, isOption := td.Kind.(*wit.Option)
 		return isOption
 	}
 	return false
-}
-
-func witTypePtr(t wit.Type) uintptr {
-	switch v := t.(type) {
-	case *wit.TypeDef:
-		return reflect.ValueOf(v).Pointer()
-	default:
-		return reflect.TypeOf(t).Size()
-	}
 }
 
 func (c *Compiler) compile(witType wit.Type, goType reflect.Type, path []string) (*CompiledType, error) {
@@ -323,9 +346,6 @@ func (c *Compiler) compileList(l *wit.List, goType reflect.Type, layout LayoutIn
 		return nil, err
 	}
 
-	// Cache SliceType to avoid repeated reflect.SliceOf calls during decoding
-	elemType.SliceType = goType
-
 	return &CompiledType{
 		GoType:    goType,
 		GoSize:    goType.Size(),
@@ -402,10 +422,22 @@ func (c *Compiler) compileTuple(t *wit.Tuple, goType reflect.Type, layout Layout
 }
 
 func (c *Compiler) compileEnum(e *wit.Enum, goType reflect.Type, layout LayoutInfo, path []string) (*CompiledType, error) {
+	if len(e.Cases) == 0 {
+		return nil, errors.New(errors.PhaseCompile, errors.KindInvalidData).
+			Path(path...).
+			Detail("enum type must contain at least one case").
+			Build()
+	}
 	switch goType.Kind() {
 	case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Int8, reflect.Int16, reflect.Int32:
 	default:
 		return nil, errors.TypeMismatch(errors.PhaseCompile, path, goType.String(), "integer")
+	}
+	if !unsignedValueFits(goType, uint64(len(e.Cases)-1)) {
+		return nil, errors.New(errors.PhaseCompile, errors.KindTypeMismatch).
+			Path(path...).
+			Detail("Go type %s cannot represent every enum discriminant", goType).
+			Build()
 	}
 
 	// Populate Cases with names for discriminant size calculation
@@ -426,17 +458,20 @@ func (c *Compiler) compileEnum(e *wit.Enum, goType reflect.Type, layout LayoutIn
 }
 
 func (c *Compiler) compileFlags(f *wit.Flags, goType reflect.Type, layout LayoutInfo, path []string) (*CompiledType, error) {
-	if len(f.Flags) > 64 {
-		return nil, errors.New(errors.PhaseCompile, errors.KindInvalidData).
-			Path(path...).
-			Detail("flags type exceeds maximum 64 flags, got %d", len(f.Flags)).
-			Build()
+	if err := validateFlagsCount(len(f.Flags), errors.PhaseCompile, path); err != nil {
+		return nil, err
 	}
 
 	switch goType.Kind() {
 	case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 	default:
 		return nil, errors.TypeMismatch(errors.PhaseCompile, path, goType.String(), "unsigned integer")
+	}
+	if goType.Size() < uintptr(layout.Size) {
+		return nil, errors.New(errors.PhaseCompile, errors.KindTypeMismatch).
+			Path(path...).
+			Detail("Go type %s is too narrow for %d flags", goType, len(f.Flags)).
+			Build()
 	}
 
 	// Populate Cases with names for flag count sizing
@@ -454,6 +489,32 @@ func (c *Compiler) compileFlags(f *wit.Flags, goType reflect.Type, layout Layout
 		Cases:     cases,
 		Kind:      KindFlags,
 	}, nil
+}
+
+func unsignedValueFits(goType reflect.Type, value uint64) bool {
+	bits := goType.Bits()
+	if goType.Kind() >= reflect.Int && goType.Kind() <= reflect.Int64 {
+		if bits >= 64 {
+			return value <= ^uint64(0)>>1
+		}
+		return value <= (uint64(1)<<(bits-1))-1
+	}
+	if bits >= 64 {
+		return true
+	}
+	return value <= (uint64(1)<<bits)-1
+}
+
+const maxCanonicalFlags = 32
+
+func validateFlagsCount(count int, phase errors.Phase, path []string) error {
+	if count == 0 || count > maxCanonicalFlags {
+		return errors.New(phase, errors.KindInvalidData).
+			Path(path...).
+			Detail("flags type must contain 1 through %d flags, got %d", maxCanonicalFlags, count).
+			Build()
+	}
+	return nil
 }
 
 func (c *Compiler) compileOption(o *wit.Option, goType reflect.Type, layout LayoutInfo, path []string) (*CompiledType, error) {

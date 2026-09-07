@@ -211,7 +211,7 @@ func (p *Parser) parseFunc(funcIdx *uint32) error {
 				return err
 			}
 			p.pos--
-			instrs, err := p.parseInstrs(localMap)
+			instrs, err := p.parseFoldedInstr(localMap)
 			if err != nil {
 				return err
 			}

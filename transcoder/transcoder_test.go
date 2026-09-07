@@ -1404,28 +1404,27 @@ func TestLayoutCalculator_ComplexTypes(t *testing.T) {
 		}
 	})
 
-	t.Run("flags_33", func(t *testing.T) {
+	t.Run("flags_33_invalid", func(t *testing.T) {
 		flags := make([]wit.Flag, 33)
 		for i := range flags {
 			flags[i] = wit.Flag{Name: string(rune('a' + i))}
 		}
 		flagsType := &wit.TypeDef{Kind: &wit.Flags{Flags: flags}}
 		layout := lc.Calculate(flagsType)
-		if layout.Size != 8 || layout.Align != 8 {
-			t.Errorf("33 flags: got size=%d align=%d, want size=8 align=8", layout.Size, layout.Align)
+		if layout.Size != 0 || layout.Align != 1 {
+			t.Errorf("invalid 33 flags: got size=%d align=%d, want size=0 align=1", layout.Size, layout.Align)
 		}
 	})
 
-	t.Run("flags_65", func(t *testing.T) {
+	t.Run("flags_65_invalid", func(t *testing.T) {
 		flags := make([]wit.Flag, 65)
 		for i := range flags {
 			flags[i] = wit.Flag{Name: string(rune('a' + i))}
 		}
 		flagsType := &wit.TypeDef{Kind: &wit.Flags{Flags: flags}}
 		layout := lc.Calculate(flagsType)
-		// 65 flags need 3 u32s = 12 bytes
-		if layout.Size != 12 || layout.Align != 4 {
-			t.Errorf("65 flags: got size=%d align=%d, want size=12 align=4", layout.Size, layout.Align)
+		if layout.Size != 0 || layout.Align != 1 {
+			t.Errorf("invalid 65 flags: got size=%d align=%d, want size=0 align=1", layout.Size, layout.Align)
 		}
 	})
 }

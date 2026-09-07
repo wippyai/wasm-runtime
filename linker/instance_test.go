@@ -4066,6 +4066,31 @@ func TestInstanceFromContext_NilInstance(t *testing.T) {
 	}
 }
 
+func TestInstanceContext_DelegatesOrOwnsAcrossStandardWrappers(t *testing.T) {
+	parentInstance := &Instance{}
+	ownedInstance := &Instance{}
+	parent := WithInstance(context.Background(), parentInstance)
+
+	delegating := NewInstanceContext(parent, nil)
+	if got := InstanceFromContext(delegating); got != parentInstance {
+		t.Fatalf("delegating instance = %p, want parent %p", got, parentInstance)
+	}
+
+	owned := NewInstanceContext(parent, ownedInstance)
+	wrapped := context.WithValue(owned, struct{ name string }{"trace"}, "request")
+	wrapped, cancel := context.WithCancel(wrapped)
+	defer cancel()
+	if got := InstanceFromContext(wrapped); got != ownedInstance {
+		t.Fatalf("wrapped instance = %p, want owned %p", got, ownedInstance)
+	}
+
+	// WithInstance(nil) is an explicit override and must continue to hide both
+	// the owned and parent values.
+	if got := InstanceFromContext(WithInstance(wrapped, nil)); got != nil {
+		t.Fatalf("explicit nil instance = %p, want nil", got)
+	}
+}
+
 func TestInstanceFromContext_WrongType(t *testing.T) {
 	ctx := context.Background()
 

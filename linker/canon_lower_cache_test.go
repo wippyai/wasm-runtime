@@ -66,6 +66,11 @@ func testCanonLowerBindings(t *testing.T, explicitRealloc bool) {
 		t.Fatalf("instantiate caller: %v", err)
 	}
 	defer callerMod.Close(ctx)
+	callerMod2, err := rt.InstantiateModule(ctx, callerComp, wazero.NewModuleConfig().WithName("caller-2"))
+	if err != nil {
+		t.Fatalf("instantiate second caller: %v", err)
+	}
+	defer callerMod2.Close(ctx)
 
 	l := NewWithDefaults(rt)
 	var observedMarkerA []byte
@@ -164,12 +169,13 @@ func testCanonLowerBindings(t *testing.T, explicitRealloc bool) {
 	// Call instA multiple times
 	fnA(WithInstance(ctx, instB), callerMod, nil)
 	fnA(WithInstance(ctx, instB), callerMod, nil)
+	fnA(WithInstance(ctx, instB), callerMod2, nil)
 
 	// Call instB multiple times
 	fnB(WithInstance(ctx, instA), callerMod, nil)
 	fnB(WithInstance(ctx, instA), callerMod, nil)
 
-	if len(observedMarkerA) != 2 || observedMarkerA[0] != 0xAA || observedMarkerA[1] != 0xAA {
+	if len(observedMarkerA) != 3 || observedMarkerA[0] != 0xAA || observedMarkerA[1] != 0xAA || observedMarkerA[2] != 0xAA {
 		t.Fatalf("instA observed markers incorrect: %v", observedMarkerA)
 	}
 	if len(observedMarkerB) != 2 || observedMarkerB[0] != 0xBB || observedMarkerB[1] != 0xBB {
@@ -177,9 +183,28 @@ func testCanonLowerBindings(t *testing.T, explicitRealloc bool) {
 	}
 	// A host may retain its module argument beyond the invocation. Later calls
 	// must not replace the memory or allocator seen by an earlier call.
+	if len(retained) != 5 {
+		t.Fatalf("retained wrappers = %d, want 5", len(retained))
+	}
+	if explicitRealloc {
+		if retained[0] != retained[1] {
+			t.Fatal("same caller did not reuse instA canonical wrapper")
+		}
+		if retained[0] == retained[2] {
+			t.Fatal("different caller reused instA canonical wrapper")
+		}
+		if retained[3] != retained[4] {
+			t.Fatal("same caller did not reuse instB canonical wrapper")
+		}
+		if retained[0] == retained[3] {
+			t.Fatal("different canonical bindings shared a retained wrapper")
+		}
+	} else if retained[0] == retained[1] {
+		t.Fatal("partial binding cached a caller-dependent wrapper")
+	}
 	for index, mod := range retained {
 		want := modA
-		if index >= 2 {
+		if index >= 3 {
 			want = modB
 		}
 		if mod.Memory() != want.Memory() {
@@ -188,7 +213,7 @@ func testCanonLowerBindings(t *testing.T, explicitRealloc bool) {
 		allocatorOwner := want
 		if !explicitRealloc {
 			allocatorOwner = modA
-			if index < 2 {
+			if index < 3 {
 				allocatorOwner = modB
 			}
 		}

@@ -6,13 +6,11 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"unsafe"
 
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/sys"
 	"go.bytecodealliance.org/wit"
-	"go.uber.org/zap"
 
 	wasmruntime "github.com/wippyai/wasm-runtime"
 	"github.com/wippyai/wasm-runtime/component"
@@ -53,6 +51,7 @@ type LowerWrapper struct {
 	resultAreaSize      uint32
 	hasCtx              bool
 	errorOnly           bool
+	indirectResults     bool
 }
 
 func (w *LowerWrapper) Name() string {
@@ -88,19 +87,20 @@ func NewLowerWrapper(def *component.LowerDef, handler any) (*LowerWrapper, error
 	}
 
 	w := &LowerWrapper{
-		def:            def,
-		validateRaw:    validateRaw,
-		handler:        handlerVal,
-		handlerTyp:     handlerType,
-		handlerIf:      handler,
-		encoder:        transcoder.NewEncoder(),
-		decoder:        transcoder.NewDecoder(),
-		compiler:       transcoder.NewCompiler(),
-		numIn:          numIn,
-		hasCtx:         hasCtx,
-		goParamStart:   goParamStart,
-		argTypes:       argTypes,
-		callMemoryPool: sync.Pool{New: func() any { return new(lowerCallMemory) }},
+		def:             def,
+		indirectResults: usesRetptr(def.Results),
+		validateRaw:     validateRaw,
+		handler:         handlerVal,
+		handlerTyp:      handlerType,
+		handlerIf:       handler,
+		encoder:         transcoder.NewEncoder(),
+		decoder:         transcoder.NewDecoder(),
+		compiler:        transcoder.NewCompiler(),
+		numIn:           numIn,
+		hasCtx:          hasCtx,
+		goParamStart:    goParamStart,
+		argTypes:        argTypes,
+		callMemoryPool:  sync.Pool{New: func() any { return new(lowerCallMemory) }},
 		argsPool: sync.Pool{
 			New: func() any {
 				s := make([]reflect.Value, numIn)
@@ -334,7 +334,6 @@ func (w *LowerWrapper) tryBuildStringFastFunc(paramCount, resultCount int) api.G
 			if _, ok2 := w.def.Params[1].(wit.String); ok2 {
 				if _, ok3 := w.def.Results[0].(wit.String); ok3 {
 					if fn, ok := w.handlerIf.(func(context.Context, string, string) string); ok {
-						var cachedAllocFunc atomic.Value
 						return func(ctx context.Context, mod api.Module, stack []uint64) {
 							if len(stack) < 5 {
 								return
@@ -358,48 +357,7 @@ func (w *LowerWrapper) tryBuildStringFastFunc(paramCount, resultCount int) api.G
 							s1 := unsafe.String(unsafe.SliceData(data1), len(data1))
 							s2 := unsafe.String(unsafe.SliceData(data2), len(data2))
 							result := fn(ctx, s1, s2)
-							var allocFunc api.Function
-							if cached := cachedAllocFunc.Load(); cached != nil {
-								if fn, ok := cached.(api.Function); ok {
-									allocFunc = fn
-								}
-							}
-							if allocFunc == nil {
-								allocFunc = mod.ExportedFunction(CabiRealloc)
-								if allocFunc != nil {
-									cachedAllocFunc.Store(allocFunc)
-								}
-							}
-							if allocFunc != nil && len(result) > 0 {
-								resultLen := uint32(len(result))
-								var allocStack [4]uint64
-								allocStack[0] = 0
-								allocStack[1] = 0
-								allocStack[2] = 1
-								allocStack[3] = uint64(resultLen)
-								if err := allocFunc.CallWithStack(ctx, allocStack[:]); err != nil {
-									Logger().Warn("string fast path: allocation failed",
-										zap.Error(err))
-									// Write zero-length result on allocation failure
-									mem.WriteUint32Le(retptr, 0)
-									mem.WriteUint32Le(retptr+4, 0)
-									return
-								}
-								resultPtr := uint32(allocStack[0])
-								if !mem.WriteString(resultPtr, result) {
-									Logger().Warn("string fast path: failed to write result string",
-										zap.Uint32("ptr", resultPtr),
-										zap.Int("len", len(result)))
-									return
-								}
-								if !mem.WriteUint32Le(retptr, resultPtr) || !mem.WriteUint32Le(retptr+4, resultLen) {
-									Logger().Warn("string fast path: failed to write result pointer")
-									return
-								}
-							} else if !mem.WriteUint32Le(retptr, 0) || !mem.WriteUint32Le(retptr+4, 0) {
-								Logger().Warn("string fast path: failed to write zero result")
-								return
-							}
+							w.lowerFastStringResult(ctx, mod, mem, retptr, result)
 						}
 					}
 				}
@@ -412,7 +370,6 @@ func (w *LowerWrapper) tryBuildStringFastFunc(paramCount, resultCount int) api.G
 			if _, ok2 := w.def.Params[1].(wit.String); ok2 {
 				if _, ok3 := w.def.Results[0].(wit.String); ok3 {
 					if fn, ok := w.handlerIf.(func(string, string) string); ok {
-						var cachedAllocFunc atomic.Value
 						return func(ctx context.Context, mod api.Module, stack []uint64) {
 							if len(stack) < 5 {
 								return
@@ -436,47 +393,7 @@ func (w *LowerWrapper) tryBuildStringFastFunc(paramCount, resultCount int) api.G
 							s1 := unsafe.String(unsafe.SliceData(data1), len(data1))
 							s2 := unsafe.String(unsafe.SliceData(data2), len(data2))
 							result := fn(s1, s2)
-							var allocFunc api.Function
-							if cached := cachedAllocFunc.Load(); cached != nil {
-								if fn, ok := cached.(api.Function); ok {
-									allocFunc = fn
-								}
-							}
-							if allocFunc == nil {
-								allocFunc = mod.ExportedFunction(CabiRealloc)
-								if allocFunc != nil {
-									cachedAllocFunc.Store(allocFunc)
-								}
-							}
-							if allocFunc != nil && len(result) > 0 {
-								resultLen := uint32(len(result))
-								var allocStack [4]uint64
-								allocStack[0] = 0
-								allocStack[1] = 0
-								allocStack[2] = 1
-								allocStack[3] = uint64(resultLen)
-								if err := allocFunc.CallWithStack(ctx, allocStack[:]); err != nil {
-									Logger().Warn("string2 fast path: allocation failed",
-										zap.Error(err))
-									mem.WriteUint32Le(retptr, 0)
-									mem.WriteUint32Le(retptr+4, 0)
-									return
-								}
-								resultPtr := uint32(allocStack[0])
-								if !mem.WriteString(resultPtr, result) {
-									Logger().Warn("string2 fast path: failed to write result string",
-										zap.Uint32("ptr", resultPtr),
-										zap.Int("len", len(result)))
-									return
-								}
-								if !mem.WriteUint32Le(retptr, resultPtr) || !mem.WriteUint32Le(retptr+4, resultLen) {
-									Logger().Warn("string2 fast path: failed to write result pointer")
-									return
-								}
-							} else if !mem.WriteUint32Le(retptr, 0) || !mem.WriteUint32Le(retptr+4, 0) {
-								Logger().Warn("string2 fast path: failed to write zero result")
-								return
-							}
+							w.lowerFastStringResult(ctx, mod, mem, retptr, result)
 						}
 					}
 				}
@@ -533,6 +450,39 @@ func (w *LowerWrapper) tryBuildBoolFastFunc(paramCount, resultCount int) api.GoM
 	return nil
 }
 
+// lowerFastStringResult uses only the calling instance's canonical bindings.
+// Failures trap: an allocation failure is not a successful empty string result.
+func (w *LowerWrapper) lowerFastStringResult(ctx context.Context, mod api.Module, mem api.Memory, retptr uint32, result string) {
+	// Validate the entire record before allocating or publishing either field.
+	if _, ok := mem.Read(retptr, 8); !ok {
+		trapCanon(w.def.Name, "string result", fmt.Errorf("result record out of bounds"))
+	}
+	var resultPtr uint32
+	if len(result) > 0 {
+		if uint64(len(result)) > uint64(^uint32(0)) {
+			trapCanon(w.def.Name, "string result", fmt.Errorf("length exceeds wasm32"))
+		}
+		allocFunc := mod.ExportedFunction(CabiRealloc)
+		if allocFunc == nil {
+			trapCanon(w.def.Name, "string result", fmt.Errorf("cabi_realloc not found"))
+		}
+		allocStack := [4]uint64{0, 0, 1, uint64(len(result))}
+		if err := allocFunc.CallWithStack(ctx, allocStack[:]); err != nil {
+			trapCanon(w.def.Name, "string allocation", err)
+		}
+		resultPtr = uint32(allocStack[0])
+		if resultPtr == 0 {
+			trapCanon(w.def.Name, "string allocation", fmt.Errorf("null pointer for nonempty result"))
+		}
+		if !mem.WriteString(resultPtr, result) {
+			trapCanon(w.def.Name, "string result", fmt.Errorf("allocated range out of bounds"))
+		}
+	}
+	if !mem.WriteUint32Le(retptr, resultPtr) || !mem.WriteUint32Le(retptr+4, uint32(len(result))) {
+		trapCanon(w.def.Name, "string result", fmt.Errorf("result record out of bounds"))
+	}
+}
+
 func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []uint64) {
 	// A wasi:cli/exit host call unwinds here as wazero's sys.ExitError. Apply the
 	// exit code via CloseWithExitCode (the module has already stopped) and stop;
@@ -554,9 +504,8 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 		panic(fmt.Errorf("canonical host %s: module has no memory", w.def.Name))
 	}
 	allocFunc := mod.ExportedFunction(CabiRealloc)
-	if allocFunc == nil {
-		panic(fmt.Errorf("canonical host %s: cabi_realloc not found", w.def.Name))
-	}
+	// Fixed-size results use the caller's return area. Missing realloc is an
+	// error only when lowering actually allocates, as checked by moduleAllocator.
 	callMemory := w.callMemoryPool.Get().(*lowerCallMemory)
 	callMemory.memory.mem = mod.Memory()
 	callMemory.allocator.ctx = ctx
@@ -1053,7 +1002,7 @@ func (w *LowerWrapper) FlatSignature() (paramCount, resultCount int) {
 }
 
 func (w *LowerWrapper) usesRetptr() bool {
-	return usesRetptr(w.def.Results)
+	return w.indirectResults
 }
 
 func (w *LowerWrapper) FlatParamTypes() []api.ValueType {

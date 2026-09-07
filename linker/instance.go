@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -28,6 +29,46 @@ var instanceRegistry sync.Map // map[uint64]*Instance
 // instanceContextKey is the context key for the active instance.
 // Used by host handlers when the caller module lacks an instanceID suffix.
 type instanceContextKey struct{}
+
+// InstanceContext carries an optional active Instance through a context chain.
+//
+// It is a value type so callers that already allocate a context wrapper can
+// embed it and retain the private-key lookup contract without a second
+// context.WithValue allocation. A nil instance delegates to the parent, which
+// preserves the existing behavior of callers that have no owned instance.
+// Use WithInstance when an explicit nil value must shadow an instance in the
+// parent chain.
+type InstanceContext struct {
+	parent   context.Context
+	instance *Instance
+}
+
+// NewInstanceContext constructs an immutable context carrier for inst. parent
+// must not be nil. A nil inst deliberately delegates instance lookup to parent.
+func NewInstanceContext(parent context.Context, inst *Instance) InstanceContext {
+	if parent == nil {
+		panic("cannot create context from nil parent")
+	}
+	return InstanceContext{parent: parent, instance: inst}
+}
+
+// Deadline delegates to the parent context.
+func (c InstanceContext) Deadline() (time.Time, bool) { return c.parent.Deadline() }
+
+// Done delegates to the parent context.
+func (c InstanceContext) Done() <-chan struct{} { return c.parent.Done() }
+
+// Err delegates to the parent context.
+func (c InstanceContext) Err() error { return c.parent.Err() }
+
+// Value returns the owned instance for the linker's private lookup key and
+// delegates every other lookup to the parent context.
+func (c InstanceContext) Value(key any) any {
+	if _, ok := key.(instanceContextKey); ok && c.instance != nil {
+		return c.instance
+	}
+	return c.parent.Value(key)
+}
 
 // InstanceFromContext extracts the instance from context, or nil if not present.
 func InstanceFromContext(ctx context.Context) *Instance {
@@ -165,6 +206,7 @@ type CanonExport struct {
 	Memory      api.Memory   // linear memory for data
 	Realloc     api.Function // allocation function
 	PostReturn  api.Function // cleanup function (may be nil)
+	ReallocMod  api.Module   // owning module instance of realloc function from provenance
 	ParamTypes  []wit.Type   // WIT types for parameters
 	ResultTypes []wit.Type   // WIT types for results (usually 0-1)
 	Encoding    byte         // string encoding: 0=UTF8, 1=UTF16, 2=CompactUTF16
@@ -245,6 +287,68 @@ func (w *boundModuleWrapper) ExportedFunction(name string) api.Function {
 		return w.boundAlloc
 	}
 	return w.Module.ExportedFunction(name)
+}
+
+// canonicalBoundModuleCache retains at most one immutable wrapper for a
+// canonical-lower binding. Its memory and allocator are fixed when canonical
+// resolution completes. Wazero modules are pointer-backed. Reusing a wrapper
+// for that exact caller is therefore safe. A different or non-pointer caller
+// receives a fresh wrapper, so a host that retains an earlier module cannot
+// observe a later call's identity.
+//
+// The cache is captured by one binding closure and is released with that
+// binding. It is deliberately neither shared across bindings nor pooled.
+type canonicalBoundModuleCache struct {
+	boundMem   api.Memory
+	boundAlloc api.Function
+	wrapper    atomic.Pointer[boundModuleWrapper]
+}
+
+func newCanonicalBoundModuleCache(boundMem api.Memory, boundAlloc api.Function) *canonicalBoundModuleCache {
+	return &canonicalBoundModuleCache{boundMem: boundMem, boundAlloc: boundAlloc}
+}
+
+func (c *canonicalBoundModuleCache) wrap(caller api.Module) *boundModuleWrapper {
+	newWrapper := func() *boundModuleWrapper {
+		return &boundModuleWrapper{
+			Module:     caller,
+			boundMem:   c.boundMem,
+			boundAlloc: c.boundAlloc,
+			allocName:  "cabi_realloc",
+		}
+	}
+	if !isPointerModule(caller) {
+		return newWrapper()
+	}
+
+	if cached := c.wrapper.Load(); cached != nil {
+		if samePointerModule(cached.Module, caller) {
+			return cached
+		}
+		return newWrapper()
+	}
+	candidate := newWrapper()
+	if c.wrapper.CompareAndSwap(nil, candidate) {
+		return candidate
+	}
+	cached := c.wrapper.Load()
+	if samePointerModule(cached.Module, caller) {
+		return cached
+	}
+	return newWrapper()
+}
+
+// isPointerModule accepts only the concrete representation used by wazero.
+// api.Module can technically be wrapped in an arbitrary non-comparable value,
+// so equality is never attempted unless both values are known pointers.
+func isPointerModule(module api.Module) bool {
+	t := reflect.TypeOf(module)
+	return t != nil && t.Kind() == reflect.Pointer
+}
+
+func samePointerModule(a, b api.Module) bool {
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	return ta != nil && ta == tb && ta.Kind() == reflect.Pointer && a == b
 }
 
 // createBoundHandlerFromDef creates a handler with an explicit memory/realloc binding.
@@ -332,6 +436,17 @@ func createSharedMemoryHandlerFromDef(def resolve.HostFuncDef) api.GoModuleFunc 
 
 // NewInstance creates a new live instance.
 func (pre *InstancePre) NewInstance(ctx context.Context) (*Instance, error) {
+	return pre.NewInstanceWithCoreContext(ctx, ctx)
+}
+
+// NewInstanceWithCoreContext separates shared host/bridge setup from owned core
+// instantiation and guest startup. Per-instance close hooks belong in coreCtx;
+// installing them on shared modules couples independent instance lifetimes.
+// Both contexts must describe the same startup request and cancellation budget.
+func (pre *InstancePre) NewInstanceWithCoreContext(ctx, coreCtx context.Context) (*Instance, error) {
+	if pre.closed.Load() {
+		return nil, instError("instantiate", -1, "", "compiled component is closed", nil)
+	}
 	numInst := pre.numInstances
 	if numInst == 0 {
 		numInst = 1
@@ -393,7 +508,7 @@ func (pre *InstancePre) NewInstance(ctx context.Context) (*Instance, error) {
 
 		switch parsedInst.Kind {
 		case component.CoreInstanceInstantiate:
-			mod, err := inst.instantiateModule(ctx, idx, parsedInst)
+			mod, err := inst.instantiateModule(ctx, coreCtx, idx, parsedInst)
 			if err != nil {
 				inst.Close(ctx)
 				// Error already wrapped by instantiateModule
@@ -419,7 +534,7 @@ func (pre *InstancePre) NewInstance(ctx context.Context) (*Instance, error) {
 
 	inst.buildExports()
 
-	if err := inst.callStart(ctx); err != nil {
+	if err := inst.callStart(coreCtx); err != nil {
 		inst.Close(ctx)
 		// Error already wrapped by callStart
 		return nil, err
@@ -430,7 +545,7 @@ func (pre *InstancePre) NewInstance(ctx context.Context) (*Instance, error) {
 
 // instantiateModule creates a core module instance.
 func (inst *Instance) instantiateModule(
-	ctx context.Context,
+	ctx, coreCtx context.Context,
 	instanceIdx int,
 	parsed *component.ParsedCoreInstance,
 ) (api.Module, error) {
@@ -585,7 +700,7 @@ func (inst *Instance) instantiateModule(
 		}
 	}
 
-	mod, err := inst.pre.linker.runtime.InstantiateModule(ctx, compiled, modConfig)
+	mod, err := inst.pre.linker.runtime.InstantiateModule(coreCtx, compiled, modConfig)
 	if err != nil {
 		return nil, instError("module_instantiate", instanceIdx, "", "wazero instantiation failed", err)
 	}
@@ -1676,10 +1791,11 @@ func (inst *Instance) createVirtualInstance(
 							memoryIndex := int(coreEntry.MemoryIdx)
 							reallocIndex := int(coreEntry.ReallocIdx)
 							var (
-								resolveOnce sync.Once
-								boundMemory api.Memory
-								allocator   api.Function
-								resolveErr  string
+								resolveOnce  sync.Once
+								boundMemory  api.Memory
+								allocator    api.Function
+								resolveErr   string
+								wrapperCache *canonicalBoundModuleCache
 							)
 							boundDef.Handler = func(ctx context.Context, caller api.Module, stack []uint64) {
 								resolveOnce.Do(func() {
@@ -1702,11 +1818,22 @@ func (inst *Instance) createVirtualInstance(
 											return
 										}
 									}
+									// A cache is sound only when canonical ABI resolved both
+									// bindings. Partial bindings delegate the missing half
+									// through the caller wrapper, whose value can depend on
+									// the active instance for this call.
+									if memoryIndex >= 0 && reallocIndex >= 0 {
+										wrapperCache = newCanonicalBoundModuleCache(boundMemory, allocator)
+									}
 								})
 								if resolveErr != "" {
 									panic(resolveErr)
 								}
-								original(ctx, &boundModuleWrapper{Module: caller, boundMem: boundMemory, boundAlloc: allocator, allocName: "cabi_realloc"}, stack)
+								if wrapperCache != nil {
+									original(ctx, wrapperCache.wrap(caller), stack)
+								} else {
+									original(ctx, &boundModuleWrapper{Module: caller, boundMem: boundMemory, boundAlloc: allocator, allocName: "cabi_realloc"}, stack)
+								}
 							}
 							if memoryIndex >= 0 && reallocIndex >= 0 {
 								entity.Source = HostFunc{Def: &canonicalBoundFuncDef{FuncDef: boundDef}}
@@ -2130,21 +2257,34 @@ func (inst *Instance) resolveCanon(funcIdx uint32) *CanonExport {
 		Encoding:    info.Encoding,
 	}
 
-	// Resolve memory
-	memSpace := buildCoreEntitySpace(comp, 0x02)
-	if int(info.MemoryIndex) < len(memSpace) {
-		entry := memSpace[info.MemoryIndex]
-		if ci := inst.coreInstances[entry.instanceIdx]; ci != nil && ci.module != nil {
-			canon.Memory = ci.module.ExportedMemory(entry.exportName)
+	// Resolve the memory option belonging to this exact canonical lift.
+	if info.HasMemory {
+		memSpace := buildCoreEntitySpace(comp, 0x02)
+		if int(info.MemoryIndex) < len(memSpace) {
+			entry := memSpace[info.MemoryIndex]
+			if ci := inst.coreInstances[entry.instanceIdx]; ci != nil && ci.module != nil {
+				canon.Memory = ci.module.ExportedMemory(entry.exportName)
+			}
 		}
 	}
 
 	// Resolve realloc
 	if info.ReallocIndex >= 0 {
 		canon.Realloc = inst.getCoreFunc(comp, int(info.ReallocIndex))
-	} else {
-		// Fall back to searching for common allocator names
-		canon.Realloc = inst.Allocator()
+		if int(info.ReallocIndex) < len(comp.CoreFuncIndexSpace) {
+			entry := comp.CoreFuncIndexSpace[info.ReallocIndex]
+			if entry.Kind == component.CoreFuncAliasExport {
+				owner := inst.GetModule(entry.InstanceIdx)
+				if owner != nil {
+					def := owner.ExportedFunctionDefinitions()[entry.ExportName]
+					if def != nil {
+						if _, _, imported := def.Import(); !imported {
+							canon.ReallocMod = owner
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Resolve post-return

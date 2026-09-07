@@ -1540,12 +1540,12 @@ func TestLiftOptionFromStack_DiscriminantValidation(t *testing.T) {
 	}
 }
 
-// TestCompileFlags_Max64 tests that flags types with >64 flags are rejected
-func TestCompileFlags_Max64(t *testing.T) {
+// TestCompileFlags_Max32 tests that only canonical flags declarations compile.
+func TestCompileFlags_Max32(t *testing.T) {
 	enc := NewEncoder()
 
-	t.Run("64_flags_ok", func(t *testing.T) {
-		flags := make([]wit.Flag, 64)
+	t.Run("32_flags_ok", func(t *testing.T) {
+		flags := make([]wit.Flag, 32)
 		for i := range flags {
 			flags[i] = wit.Flag{Name: "f" + string(rune('a'+i%26)) + string(rune('0'+i/26))}
 		}
@@ -1554,12 +1554,12 @@ func TestCompileFlags_Max64(t *testing.T) {
 		}
 		_, err := enc.compiler.Compile(flagsDef, reflect.TypeOf(uint64(0)))
 		if err != nil {
-			t.Errorf("expected 64 flags to compile, got error: %v", err)
+			t.Errorf("expected 32 flags to compile, got error: %v", err)
 		}
 	})
 
-	t.Run("65_flags_rejected", func(t *testing.T) {
-		flags := make([]wit.Flag, 65)
+	t.Run("33_flags_rejected", func(t *testing.T) {
+		flags := make([]wit.Flag, 33)
 		for i := range flags {
 			flags[i] = wit.Flag{Name: "f" + string(rune('a'+i%26)) + string(rune('0'+i/26))}
 		}
@@ -1568,7 +1568,7 @@ func TestCompileFlags_Max64(t *testing.T) {
 		}
 		_, err := enc.compiler.Compile(flagsDef, reflect.TypeOf(uint64(0)))
 		if err == nil {
-			t.Error("expected 65 flags to be rejected, got nil error")
+			t.Error("expected 33 flags to be rejected, got nil error")
 		}
 	})
 }

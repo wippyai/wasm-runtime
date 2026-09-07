@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wippyai/wasm-runtime/memory/budget"
 	"github.com/wippyai/wasm-runtime/resource"
 )
 
@@ -105,6 +106,14 @@ func (t *ResourceTable) SocketBudget() *SocketBudget {
 		return nil
 	}
 	return t.budget.socketBudget
+}
+
+// HostBufferBudget returns this table's optional host-buffer domain.
+func (t *ResourceTable) HostBufferBudget() *HostBufferBudget {
+	if t == nil || t.budget == nil {
+		return nil
+	}
+	return t.budget.hostBufferBudget
 }
 
 // resourceAdapter adapts preview2.Resource to resource.WASIResource
@@ -604,6 +613,7 @@ const (
 
 // TCPSocketResource represents a TCP socket with full connection lifecycle.
 type TCPSocketResource struct {
+	duplexCharge       *tcpDuplexRingCharge
 	listener           interface{}
 	pendingErr         error
 	conn               interface{}
@@ -633,6 +643,27 @@ type TCPSocketResource struct {
 	keepAliveEnabled   bool
 }
 
+// tcpDuplexRingCharge is owned by the socket, not individual stream handles.
+// Its reservations remain held until socket teardown joins both pumps.
+type tcpDuplexRingCharge struct {
+	input, output *budget.Reservation
+	once          sync.Once
+}
+
+func (c *tcpDuplexRingCharge) Release() {
+	if c == nil {
+		return
+	}
+	c.once.Do(func() {
+		if c.input != nil {
+			c.input.Release()
+		}
+		if c.output != nil {
+			c.output.Release()
+		}
+	})
+}
+
 func NewTCPSocketResource(family uint8) *TCPSocketResource {
 	return &TCPSocketResource{
 		family:            family,
@@ -653,11 +684,12 @@ func (s *TCPSocketResource) Drop() {
 		s.mu.Lock()
 		s.dropped = true
 		s.state = TCPStateClosed
-		conn, listener, input, output, acceptQueue, pendingOp := s.conn, s.listener, s.input, s.output, s.acceptQueue, s.pendingOp
+		conn, listener, input, output, acceptQueue, pendingOp, duplexCharge := s.conn, s.listener, s.input, s.output, s.acceptQueue, s.pendingOp, s.duplexCharge
 		s.conn = nil
 		s.listener = nil
 		s.acceptQueue = nil
 		s.pendingOp = nil
+		s.duplexCharge = nil
 		if s.notifyCh != nil {
 			close(s.notifyCh)
 			s.notifyCh = nil
@@ -690,6 +722,9 @@ func (s *TCPSocketResource) Drop() {
 		if acceptQueue != nil {
 			acceptQueue.WaitClosed()
 		}
+		// Both rings are no longer reachable by a pump. This is the one terminal
+		// release point for their capacity reservations.
+		duplexCharge.Release()
 	})
 }
 func (s *TCPSocketResource) Family() uint8   { s.mu.Lock(); defer s.mu.Unlock(); return s.family }
@@ -929,6 +964,49 @@ func (s *TCPSocketResource) SetKeepAliveCount(v uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.keepAliveCount = v
+}
+
+// NewTCPDuplexStreams creates the two fixed TCP host rings under this table's
+// optional host-buffer budget. Both capacities are reserved before either ring
+// is allocated or its pump starts, so a denied second reservation cannot leak a
+// partially published input stream.
+func (t *ResourceTable) NewTCPDuplexStreams(socket *TCPSocketResource) (*TCPInputStreamResource, *TCPOutputStreamResource, error) {
+	return newTCPDuplexStreams(socket, t.HostBufferBudget())
+}
+
+func newTCPDuplexStreams(socket *TCPSocketResource, hostBuffers *HostBufferBudget) (*TCPInputStreamResource, *TCPOutputStreamResource, error) {
+	if socket == nil {
+		return nil, nil, errors.New("nil TCP socket")
+	}
+	socket.mu.Lock()
+	defer socket.mu.Unlock()
+	if socket.input != nil || socket.output != nil {
+		return nil, nil, errors.New("TCP streams already initialized")
+	}
+	conn, ok := socket.conn.(net.Conn)
+	if !ok || socket.dropped || socket.state == TCPStateClosed {
+		return nil, nil, resource.ErrClosed
+	}
+
+	inputCharge, err := hostBuffers.reserve(DefaultBufferSize)
+	if err != nil {
+		return nil, nil, err
+	}
+	outputCharge, err := hostBuffers.reserve(DefaultBufferSize)
+	if err != nil {
+		if inputCharge != nil {
+			inputCharge.Release()
+		}
+		return nil, nil, err
+	}
+
+	input := &TCPInputStreamResource{socket: socket}
+	output := &TCPOutputStreamResource{socket: socket}
+	input.buffer = newTCPInputBuffer(conn, DefaultBufferSize)
+	output.buffer = newTCPOutputBuffer(conn, DefaultBufferSize)
+	socket.input, socket.output = input, output
+	socket.duplexCharge = &tcpDuplexRingCharge{input: inputCharge, output: outputCharge}
+	return input, output, nil
 }
 
 // TCPInputStreamResource reads a bounded host buffer; network reads run off-worker.

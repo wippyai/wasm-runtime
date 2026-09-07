@@ -161,3 +161,32 @@ func TestCanonicalResultAreaCheckedBeforeHost(t *testing.T) {
 	}()
 	w.BuildRawFunc()(ctx, inst.instance, []uint64{uint64(addr)})
 }
+
+func TestOwnedBindingUsesFallbackWhenTypedDispatchUnavailable(t *testing.T) {
+	ctx, eng, inst := instantiateLowerTestModule(t)
+	defer eng.Close(ctx)
+	def := &component.LowerDef{Name: "owned-fallback", Params: []wit.Type{wit.U32{}, wit.U32{}, wit.U32{}}, Results: []wit.Type{&wit.TypeDef{Kind: &wit.Result{OK: wit.U32{}, Err: wit.String{}}}}}
+	fallbackCalls, ownedCalls := 0, 0
+	w, err := NewLowerWrapper(def, BindResult3WithOwnedArgsAndResume(
+		func(_ context.Context, a any, b, c uint32) (uint32, error) {
+			fallbackCalls++
+			return a.(uint32) + b + c, nil
+		},
+		func(context.Context, any, uint32, uint32) (uint32, error) {
+			ownedCalls++
+			return 0, nil
+		},
+		func(context.Context) (uint32, error) { return 0, nil },
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.typedInvoke != nil {
+		t.Fatal("interface parameter must select the public fallback")
+	}
+	w.BuildRawFunc()(ctx, inst.instance, []uint64{1, 2, 3, 64})
+	value, _ := inst.instance.Memory().ReadUint32Le(68)
+	if fallbackCalls != 1 || ownedCalls != 0 || value != 6 {
+		t.Fatalf("fallback=%d owned=%d value=%d", fallbackCalls, ownedCalls, value)
+	}
+}

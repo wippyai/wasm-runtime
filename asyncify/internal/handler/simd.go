@@ -110,27 +110,25 @@ func (h SIMDHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		subOp == wasm.SimdV128Load32Zero || subOp == wasm.SimdV128Load64Zero:
 		addr := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(addr).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(addr).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 
 	// Store (address, v128) -> ()
 	case subOp == wasm.SimdV128Store:
 		val := ctx.Stack.Pop()
 		addr := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(addr).LocalGet(val).EmitInstr(instr)
+		ctx.Emit.Operand(addr).Operand(val).EmitInstr(instr)
 
-	// v128.const pushes constant
+	// Vector constants share the same bit-exact literal semantics as scalars.
 	case subOp == wasm.SimdV128Const:
-		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.EmitInstr(instr).LocalSet(tmp)
-		ctx.Stack.Push(tmp, wasm.ValV128)
+		return (LiteralHandler{}).Handle(ctx, instr)
 
 	// Shuffle: (v128, v128) -> v128
 	case subOp == wasm.SimdI8x16Shuffle:
 		b := ctx.Stack.Pop()
 		a := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(a).LocalGet(b).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(a).Operand(b).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 
 	// Swizzle: (v128, v128) -> v128
@@ -138,14 +136,14 @@ func (h SIMDHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		b := ctx.Stack.Pop()
 		a := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(a).LocalGet(b).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(a).Operand(b).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 
 	// Splat: scalar -> v128
 	case subOp >= wasm.SimdI8x16Splat && subOp <= wasm.SimdF64x2Splat:
 		scalar := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(scalar).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(scalar).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 
 	// Extract lane: v128 -> scalar
@@ -154,25 +152,25 @@ func (h SIMDHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		subOp == wasm.SimdI32x4ExtractLane:
 		vec := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI32)
-		ctx.Emit.LocalGet(vec).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(vec).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI32)
 
 	case subOp == wasm.SimdI64x2ExtractLane:
 		vec := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI64)
-		ctx.Emit.LocalGet(vec).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(vec).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI64)
 
 	case subOp == wasm.SimdF32x4ExtractLane:
 		vec := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValF32)
-		ctx.Emit.LocalGet(vec).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(vec).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValF32)
 
 	case subOp == wasm.SimdF64x2ExtractLane:
 		vec := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValF64)
-		ctx.Emit.LocalGet(vec).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(vec).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValF64)
 
 	// Replace lane: (v128, scalar) -> v128
@@ -182,7 +180,7 @@ func (h SIMDHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		scalar := ctx.Stack.Pop()
 		vec := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(vec).LocalGet(scalar).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(vec).Operand(scalar).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 
 	// Lane load: (address, v128) -> v128
@@ -190,14 +188,14 @@ func (h SIMDHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		vec := ctx.Stack.Pop()
 		addr := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(addr).LocalGet(vec).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(addr).Operand(vec).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 
 	// Lane store: (address, v128) -> ()
 	case subOp >= wasm.SimdV128Store8Lane && subOp <= wasm.SimdV128Store64Lane:
 		vec := ctx.Stack.Pop()
 		addr := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(addr).LocalGet(vec).EmitInstr(instr)
+		ctx.Emit.Operand(addr).Operand(vec).EmitInstr(instr)
 
 	// Bitmask and all_true: v128 -> i32
 	case subOp == wasm.SimdV128AnyTrue ||
@@ -207,7 +205,7 @@ func (h SIMDHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		subOp == wasm.SimdI32x4Bitmask || subOp == wasm.SimdI64x2Bitmask:
 		vec := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI32)
-		ctx.Emit.LocalGet(vec).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(vec).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI32)
 
 	// Binary v128 operations: (v128, v128) -> v128
@@ -216,14 +214,14 @@ func (h SIMDHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		b := ctx.Stack.Pop()
 		a := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(a).LocalGet(b).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(a).Operand(b).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 
 	// Unary v128 operations: v128 -> v128
 	case isUnaryV128Op(subOp):
 		a := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(a).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(a).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 
 	// Ternary v128 operations (bitselect): (v128, v128, v128) -> v128
@@ -232,7 +230,7 @@ func (h SIMDHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		b := ctx.Stack.Pop()
 		a := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(a).LocalGet(b).LocalGet(c).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(a).Operand(b).Operand(c).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 
 	default:
@@ -240,7 +238,7 @@ func (h SIMDHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		b := ctx.Stack.Pop()
 		a := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValV128)
-		ctx.Emit.LocalGet(a).LocalGet(b).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(a).Operand(b).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValV128)
 	}
 

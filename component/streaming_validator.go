@@ -388,6 +388,9 @@ func (v *StreamingValidator) addDefinedType(current *arena.State, ty Type) error
 		defType = arena.DefinedType{Kind: arena.DefinedKindEnum, Data: t.Cases}
 
 	case FlagsType:
+		if len(t.Names) == 0 || len(t.Names) > 32 {
+			return fmt.Errorf("flags count must be 1 through 32, got %d", len(t.Names))
+		}
 		defType = arena.DefinedType{Kind: arena.DefinedKindFlags, Data: t.Names}
 
 	case OptionType:

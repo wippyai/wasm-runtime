@@ -62,7 +62,11 @@ func (d *Decoder) DecodeResults(resultTypes []wit.Type, flat []uint64, mem Memor
 	offset := 0
 
 	for i, resultType := range resultTypes {
-		result, consumed, err := d.liftValue(resultType, flat[offset:], mem, []string{"result[" + strconv.Itoa(i) + "]"})
+		resultPath := []string{"result[" + strconv.Itoa(i) + "]"}
+		if err := validateWITSchema(resultType, errors.PhaseDecode, resultPath); err != nil {
+			return nil, err
+		}
+		result, consumed, err := d.liftValue(resultType, flat[offset:], mem, resultPath)
 		if err != nil {
 			return nil, err
 		}
@@ -74,6 +78,9 @@ func (d *Decoder) DecodeResults(resultTypes []wit.Type, flat []uint64, mem Memor
 }
 
 func (d *Decoder) LoadValue(witType wit.Type, addr uint32, mem Memory) (any, error) {
+	if err := validateWITSchema(witType, errors.PhaseDecode, nil); err != nil {
+		return nil, err
+	}
 	return d.loadValue(witType, addr, mem, nil)
 }
 
@@ -290,10 +297,15 @@ func (d *Decoder) decodeListFromMemory(addr uint32, ct *CompiledType, ptr unsafe
 			Build()
 	}
 
-	// Create slice via reflect - use cached SliceType when available
-	sliceType := ct.ElemType.SliceType
-	if sliceType == nil {
-		sliceType = reflect.SliceOf(ct.ElemType.GoType)
+	// A compiled list owns its Go slice type. The fallback keeps hand-built
+	// legacy CompiledType values working without mutating a shared element.
+	sliceType := ct.GoType
+	if sliceType == nil || sliceType.Kind() != reflect.Slice {
+		if ct.ElemType.SliceType != nil {
+			sliceType = ct.ElemType.SliceType
+		} else {
+			sliceType = reflect.SliceOf(ct.ElemType.GoType)
+		}
 	}
 	slice := reflect.MakeSlice(sliceType, int(length), int(length))
 
@@ -319,9 +331,10 @@ func (d *Decoder) decodeListFromMemory(addr uint32, ct *CompiledType, ptr unsafe
 			Build()
 	}
 
-	// Fast path for primitive types - direct memory read
-	switch ct.ElemType.GoType.Kind() {
-	case reflect.Uint8:
+	// Semantic kind selects the canonical layout and validation. Go kind is
+	// only the storage representation, so enum/flags/char cannot hit raw paths.
+	switch ct.ElemType.Kind {
+	case KindU8:
 		// []byte - single bulk read
 		data, err := mem.Read(dataAddr, length)
 		if err != nil {
@@ -332,7 +345,7 @@ func (d *Decoder) decodeListFromMemory(addr uint32, ct *CompiledType, ptr unsafe
 		dstSlice := reflect.NewAt(sliceType, ptr).Elem()
 		dstSlice.Set(slice)
 		return nil
-	case reflect.Int32, reflect.Uint32:
+	case KindU32, KindS32:
 		dst := unsafe.Slice((*uint32)(unsafe.Pointer(slice.Index(0).UnsafeAddr())), length)
 		for i := uint32(0); i < length; i++ {
 			val, err := mem.ReadU32(dataAddr + i*4)
@@ -344,7 +357,7 @@ func (d *Decoder) decodeListFromMemory(addr uint32, ct *CompiledType, ptr unsafe
 		dstSlice := reflect.NewAt(sliceType, ptr).Elem()
 		dstSlice.Set(slice)
 		return nil
-	case reflect.Int64, reflect.Uint64:
+	case KindU64, KindS64:
 		dst := unsafe.Slice((*uint64)(unsafe.Pointer(slice.Index(0).UnsafeAddr())), length)
 		for i := uint32(0); i < length; i++ {
 			val, err := mem.ReadU64(dataAddr + i*8)
@@ -356,7 +369,7 @@ func (d *Decoder) decodeListFromMemory(addr uint32, ct *CompiledType, ptr unsafe
 		dstSlice := reflect.NewAt(sliceType, ptr).Elem()
 		dstSlice.Set(slice)
 		return nil
-	case reflect.Float32:
+	case KindF32:
 		dst := unsafe.Slice((*float32)(unsafe.Pointer(slice.Index(0).UnsafeAddr())), length)
 		for i := uint32(0); i < length; i++ {
 			val, err := mem.ReadU32(dataAddr + i*4)
@@ -369,7 +382,7 @@ func (d *Decoder) decodeListFromMemory(addr uint32, ct *CompiledType, ptr unsafe
 		dstSlice := reflect.NewAt(sliceType, ptr).Elem()
 		dstSlice.Set(slice)
 		return nil
-	case reflect.Float64:
+	case KindF64:
 		dst := unsafe.Slice((*float64)(unsafe.Pointer(slice.Index(0).UnsafeAddr())), length)
 		for i := uint32(0); i < length; i++ {
 			val, err := mem.ReadU64(dataAddr + i*8)
@@ -585,62 +598,38 @@ func (d *Decoder) decodeEnumFromMemory(addr uint32, ct *CompiledType, ptr unsafe
 		return errors.InvalidDiscriminant(errors.PhaseDecode, path, disc, uint32(len(ct.Cases)-1))
 	}
 
-	// Write discriminant based on Go type size
-	switch ct.GoSize {
-	case 1:
-		*(*uint8)(ptr) = uint8(disc)
-	case 2:
-		*(*uint16)(ptr) = uint16(disc)
-	case 4:
-		*(*uint32)(ptr) = disc
-	case 8:
-		*(*uint64)(ptr) = uint64(disc)
-	default:
-		*(*uint32)(ptr) = disc
-	}
-	return nil
+	return storeCompiledUnsigned(ct, ptr, uint64(disc))
 }
 
 func (d *Decoder) decodeFlagsFromMemory(addr uint32, ct *CompiledType, ptr unsafe.Pointer, mem Memory) error {
 	numFlags := len(ct.Cases)
+	if err := validateFlagsCount(numFlags, errors.PhaseDecode, nil); err != nil {
+		return err
+	}
+	var value uint64
 
 	if numFlags <= 8 {
 		v, err := mem.ReadU8(addr)
 		if err != nil {
 			return err
 		}
-		*(*uint8)(ptr) = v
+		value = uint64(v)
 	} else if numFlags <= 16 {
 		v, err := mem.ReadU16(addr)
 		if err != nil {
 			return err
 		}
-		*(*uint16)(ptr) = v
-	} else if numFlags <= 32 {
+		value = uint64(v)
+	} else {
 		v, err := mem.ReadU32(addr)
 		if err != nil {
 			return err
 		}
-		*(*uint32)(ptr) = v
-	} else if numFlags <= 64 {
-		v, err := mem.ReadU64(addr)
-		if err != nil {
-			return err
-		}
-		*(*uint64)(ptr) = v
-	} else {
-		// >64 flags: multiple u32s per Canonical ABI spec
-		numU32s := (numFlags + 31) / 32
-		u32Ptr := (*uint32)(ptr)
-		for i := 0; i < numU32s; i++ {
-			word, err := mem.ReadU32(addr + uint32(i*4))
-			if err != nil {
-				return err
-			}
-			*(*uint32)(unsafe.Add(unsafe.Pointer(u32Ptr), i*4)) = word
-		}
+		value = uint64(v)
 	}
-	return nil
+	// Canonical flags are a bit-vector over the declared labels; ignored wire
+	// bits never become observable state in a wider Go scalar.
+	return storeCompiledUnsigned(ct, ptr, value&flagsMask(numFlags))
 }
 
 func (d *Decoder) liftValue(witType wit.Type, flat []uint64, mem Memory, path []string) (any, int, error) {
@@ -1085,13 +1074,16 @@ func (d *Decoder) liftEnum(e *wit.Enum, flat []uint64, path []string) (uint32, i
 }
 
 func (d *Decoder) liftFlags(f *wit.Flags, flat []uint64, path []string) (uint64, int, error) {
+	if err := validateFlagsCount(len(f.Flags), errors.PhaseDecode, path); err != nil {
+		return 0, 0, err
+	}
 	if len(flat) < 1 {
 		return 0, 0, errors.New(errors.PhaseDecode, errors.KindInvalidData).
 			Path(path...).
 			Detail("insufficient flat values for flags").
 			Build()
 	}
-	return flat[0], 1, nil
+	return flat[0] & flagsMask(len(f.Flags)), 1, nil
 }
 
 func (d *Decoder) liftResult(r *wit.Result, flat []uint64, mem Memory, path []string) (map[string]any, int, error) {

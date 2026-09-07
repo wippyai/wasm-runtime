@@ -1,147 +1,96 @@
 package handler
 
 import (
+	"fmt"
+
+	"github.com/wippyai/wasm-runtime/asyncify/internal/semantics"
 	"github.com/wippyai/wasm-runtime/wasm"
 )
 
-// LocalGetHandler reads a local variable and pushes it onto the simulated stack.
-//
-// In standard WebAssembly, local.get pushes a value directly onto the operand
-// stack. In asyncify's flattened representation, we instead copy the local's
-// value into a fresh temporary local, then record that temporary in our
-// simulated stack. This indirection is essential because the original local
-// might be modified before an async call site, and we need a snapshot of
-// the value at the point where local.get was executed.
-//
-// The emitted code does: local.get $original -> local.set $temp
-// The simulated stack then tracks $temp as holding the value.
-//
-// When saving state during unwind, values in the simulated stack get written
-// to the asyncify data buffer. When rewinding, they get restored. By using
-// temporaries, we ensure the correct values are saved even if the original
-// locals change between the local.get and the async call.
+// Local handlers share the same resolved effects as stack planning. The
+// emitter chooses bytecode for those effects; it does not define new stack or
+// snapshot semantics for each opcode.
 type LocalGetHandler struct{}
-
-func (h LocalGetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
-	imm := instr.Imm.(wasm.LocalImm)
-	localType := ctx.TypeOf(imm.LocalIdx)
-	tmp := ctx.AllocTemp(localType)
-
-	ctx.Emit.LocalGet(imm.LocalIdx).LocalSet(tmp)
-	ctx.Stack.Push(tmp, localType)
-
-	return nil
-}
-
-// LocalSetHandler writes a value from the simulated stack into a local variable.
-//
-// The simulated stack tracks which temporary local holds the value we want
-// to store. We pop that temporary's index, emit code to load from it, and
-// store into the target local. This maintains the invariant that all stack
-// operations go through our tracking system.
-//
-// Emitted code: local.get $temp -> local.set $target
-//
-// After this, the simulated stack no longer tracks the consumed value.
-// The target local now holds the value, which will be saved/restored through
-// the normal local save path during asyncify state transitions.
 type LocalSetHandler struct{}
-
-func (h LocalSetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
-	imm := instr.Imm.(wasm.LocalImm)
-	src := ctx.Stack.Pop()
-
-	ctx.Emit.LocalGet(src).LocalSet(imm.LocalIdx)
-
-	return nil
-}
-
-// LocalTeeHandler assigns a local and preserves the operand's value.
-//
-// The stack value must remain a snapshot: a later local.set must not change it.
-// Store the value in a temporary distinct from the mutable guest local, matching
-// the temporary allocated for local.tee by the transform's stack simulation.
 type LocalTeeHandler struct{}
 
-func (h LocalTeeHandler) Handle(ctx *Context, instr wasm.Instruction) error {
-	imm := instr.Imm.(wasm.LocalImm)
-	src := ctx.Stack.Pop()
-	localType := ctx.TypeOf(imm.LocalIdx)
-	tmp := ctx.AllocTemp(localType)
-
-	ctx.Emit.LocalGet(src).LocalTee(imm.LocalIdx).LocalSet(tmp)
-	ctx.Stack.Push(tmp, localType)
-
-	return nil
+func (LocalGetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
+	return emitLocalOperation(ctx, instr)
+}
+func (LocalSetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
+	return emitLocalOperation(ctx, instr)
+}
+func (LocalTeeHandler) Handle(ctx *Context, instr wasm.Instruction) error {
+	return emitLocalOperation(ctx, instr)
 }
 
-// GlobalGetHandler reads a global variable and pushes it onto the simulated stack.
-//
-// Globals work similarly to locals in the flattened model. We allocate a
-// temporary local to hold the global's value, emit the global.get and store,
-// then track the temporary in our simulated stack. This captures the global's
-// value at this point in execution.
-//
-// The handler looks up the global's type from module metadata, handling both
-// imported globals and module-defined globals. If the module is not available
-// in the context, it falls back to i32 (the most common case for asyncify
-// globals).
-type GlobalGetHandler struct{}
-
-func (h GlobalGetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
-	imm := instr.Imm.(wasm.GlobalImm)
-
-	globalType := h.lookupGlobalType(ctx, imm.GlobalIdx)
-	tmp := ctx.AllocTemp(globalType)
-
-	ctx.Emit.GlobalGet(imm.GlobalIdx).LocalSet(tmp)
-	ctx.Stack.Push(tmp, globalType)
-
-	return nil
-}
-
-func (h GlobalGetHandler) lookupGlobalType(ctx *Context, globalIdx uint32) wasm.ValType {
-	if ctx.Module == nil {
-		return wasm.ValI32
+func emitLocalOperation(ctx *Context, instr wasm.Instruction) error {
+	op, handled, err := semantics.ResolveLocal(instr, ctx.Locals.types)
+	if err != nil {
+		return err
 	}
-
-	// Count imported globals first
-	numImportedGlobals := uint32(0)
-	for _, imp := range ctx.Module.Imports {
-		if imp.Desc.Kind == wasm.KindGlobal {
-			if globalIdx == numImportedGlobals {
-				if imp.Desc.Global != nil {
-					return imp.Desc.Global.ValType
-				}
-				return wasm.ValI32
-			}
-			numImportedGlobals++
+	if !handled {
+		return fmt.Errorf("asyncify: non-local opcode %#x in local handler", instr.Opcode)
+	}
+	if op.Effects&semantics.AssignLocal != 0 {
+		ctx.Locals.InvalidateLocal(op.Index)
+	}
+	if op.Effects == semantics.ProduceSnapshot {
+		tmp, reuse := ctx.Locals.SnapshotLocal(op.Index, op.Type)
+		if !reuse {
+			ctx.Emit.LocalGet(op.Index).LocalSet(tmp)
 		}
+		ctx.Stack.Push(tmp, op.Type)
+		return nil
 	}
-
-	// Then check module-defined globals
-	localIdx := globalIdx - numImportedGlobals
-	if int(localIdx) < len(ctx.Module.Globals) {
-		return ctx.Module.Globals[localIdx].Type.ValType
+	src := ctx.Stack.Pop()
+	if op.Effects&semantics.ProduceSnapshot == 0 {
+		ctx.Emit.Operand(src).LocalSet(op.Index)
+		return nil
 	}
-
-	return wasm.ValI32
+	tmp := ctx.AllocTemp(op.Type)
+	forwarded, err := src.MaterializedAt(tmp)
+	if err != nil {
+		return err
+	}
+	ctx.Emit.Operand(src)
+	if op.Effects&semantics.AssignLocal != 0 {
+		ctx.Emit.LocalTee(op.Index)
+	}
+	ctx.Emit.LocalSet(tmp)
+	ctx.Stack.PushOperand(forwarded)
+	return nil
 }
 
-// GlobalSetHandler writes a value from the simulated stack into a global variable.
-//
-// We pop the source temporary from our simulated stack, load its value,
-// and store it into the target global. The global's new value will persist
-// across async operations since globals are module-level state that doesn't
-// need special asyncify handling.
+// Global handlers consume the same checked identity and type as planning.
+// Reads produce snapshots; writes modify the global cell.
+type GlobalGetHandler struct{}
 type GlobalSetHandler struct{}
 
-func (h GlobalSetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
-	imm := instr.Imm.(wasm.GlobalImm)
-	src := ctx.Stack.Pop()
+func (GlobalGetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
+	return emitGlobalOperation(ctx, instr)
+}
 
-	ctx.Emit.LocalGet(src).GlobalSet(imm.GlobalIdx)
+func (GlobalSetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
+	return emitGlobalOperation(ctx, instr)
+}
 
+func emitGlobalOperation(ctx *Context, instr wasm.Instruction) error {
+	op, handled, err := semantics.ResolveGlobal(instr, ctx.Module)
+	if err != nil {
+		return err
+	}
+	if !handled {
+		return fmt.Errorf("asyncify: non-global opcode %#x in global handler", instr.Opcode)
+	}
+	if op.Write {
+		src := ctx.Stack.Pop()
+		ctx.Emit.Operand(src).GlobalSet(op.Index)
+	} else {
+		tmp := ctx.AllocTemp(op.Type)
+		ctx.Emit.GlobalGet(op.Index).LocalSet(tmp)
+		ctx.Stack.Push(tmp, op.Type)
+	}
 	return nil
 }
 

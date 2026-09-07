@@ -18,7 +18,6 @@ func TestCanonicalHostInvalidBindingTraps(t *testing.T) {
 	for _, tc := range []struct{ name, source, want string }{
 		{"nil module", "", "module is nil"},
 		{"missing memory", `(module)`, "module has no memory"},
-		{"missing allocator", `(module (memory (export "memory") 1))`, "cabi_realloc not found"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()

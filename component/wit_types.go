@@ -1656,8 +1656,8 @@ func parseFlagsType(r io.Reader) (FlagsType, error) {
 		return FlagsType{}, err
 	}
 
-	if count > 1000 {
-		return FlagsType{}, fmt.Errorf("flags count %d exceeds maximum", count)
+	if count == 0 || count > 32 {
+		return FlagsType{}, fmt.Errorf("flags count must be 1 through 32, got %d", count)
 	}
 
 	names := make([]string, 0, count)

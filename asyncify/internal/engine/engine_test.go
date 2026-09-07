@@ -1,9 +1,12 @@
 package engine
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/wippyai/wasm-runtime/asyncify/internal/testutil"
 	"github.com/wippyai/wasm-runtime/wasm"
+	"github.com/wippyai/wasm-runtime/wat"
 )
 
 // exactMatcher matches exact "module.name" patterns
@@ -221,7 +224,7 @@ func TestEngine_Transform_TransitiveAsync(t *testing.T) {
 
 	// Original module had 2 user functions: $inner (idx 0) and "outer" (idx 1)
 	// Helper functions (asyncify_get_state, etc.) are added at indices 2+
-	// Only user functions should be transformed (have scratch locals)
+	// Only user functions should have continuation frames
 	numUserFuncs := 2
 	if len(m.Code) < numUserFuncs {
 		t.Fatalf("expected at least %d code sections, got %d", numUserFuncs, len(m.Code))
@@ -229,9 +232,7 @@ func TestEngine_Transform_TransitiveAsync(t *testing.T) {
 
 	for i := 0; i < numUserFuncs; i++ {
 		body := m.Code[i]
-		if len(body.Locals) < 10 {
-			t.Errorf("func %d: expected at least 10 scratch locals, got %d", i, len(body.Locals))
-		}
+		testutil.RequireContinuationFrame(t, m, body)
 	}
 }
 
@@ -548,261 +549,13 @@ func TestValTypeLoadStoreOps(t *testing.T) {
 }
 
 // watToWasm compiles WAT to WASM using wasm-tools (if available)
-func watToWasm(t *testing.T, wat string) []byte {
+func watToWasm(t *testing.T, source string) []byte {
 	t.Helper()
-
-	// Try to use wasm-tools
-	result, err := compileWat(wat)
+	result, err := wat.Compile(source)
 	if err != nil {
-		t.Skipf("wasm-tools not available: %v", err)
+		t.Fatalf("compile test WAT: %v", err)
 	}
 	return result
-}
-
-func compileWat(wat string) ([]byte, error) {
-	// Use a simple hand-coded module for tests that don't need wasm-tools
-	// This is a minimal valid WASM module structure
-
-	// For testing, we'll create minimal test modules programmatically
-	// rather than requiring wasm-tools
-
-	// Simple module with one function
-	if wat == `(module
-		(func (export "add") (param i32 i32) (result i32)
-			local.get 0
-			local.get 1
-			i32.add
-		)
-	)` {
-		return createAddModule(), nil
-	}
-
-	if wat == `(module
-		(func (export "foo") (result i32)
-			i32.const 42
-		)
-	)` {
-		return createSimpleModule(), nil
-	}
-
-	// For modules with imports, create them programmatically
-	return createTestModuleFromWat(wat)
-}
-
-func createAddModule() []byte {
-	m := &wasm.Module{
-		Types: []wasm.FuncType{
-			{Params: []wasm.ValType{wasm.ValI32, wasm.ValI32}, Results: []wasm.ValType{wasm.ValI32}},
-		},
-		Funcs: []uint32{0},
-		Exports: []wasm.Export{
-			{Name: "add", Kind: 0, Idx: 0},
-		},
-		Code: []wasm.FuncBody{
-			{
-				Code: encodeInstrs([]wasm.Instruction{
-					{Opcode: wasm.OpLocalGet, Imm: wasm.LocalImm{LocalIdx: 0}},
-					{Opcode: wasm.OpLocalGet, Imm: wasm.LocalImm{LocalIdx: 1}},
-					{Opcode: wasm.OpI32Add},
-					{Opcode: wasm.OpEnd},
-				}),
-			},
-		},
-	}
-	return m.Encode()
-}
-
-func createSimpleModule() []byte {
-	m := &wasm.Module{
-		Types: []wasm.FuncType{
-			{Results: []wasm.ValType{wasm.ValI32}},
-		},
-		Funcs: []uint32{0},
-		Exports: []wasm.Export{
-			{Name: "foo", Kind: 0, Idx: 0},
-		},
-		Code: []wasm.FuncBody{
-			{
-				Code: encodeInstrs([]wasm.Instruction{
-					{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 42}},
-					{Opcode: wasm.OpEnd},
-				}),
-			},
-		},
-	}
-	return m.Encode()
-}
-
-func createTestModuleFromWat(wat string) ([]byte, error) {
-	// Parse WAT-like strings and create modules
-	// This is a simplified parser for test purposes
-
-	m := &wasm.Module{}
-
-	// Check for common patterns
-	hasEnvSleep := containsPattern(wat, `(import "env" "sleep"`)
-	hasEnvRead := containsPattern(wat, `(import "env" "read"`)
-	hasMemory := containsPattern(wat, `(memory`)
-	hasGlobal := containsPattern(wat, `(global`)
-
-	if hasEnvSleep {
-		m.Types = append(m.Types, wasm.FuncType{Params: []wasm.ValType{wasm.ValI32}})
-		m.Imports = append(m.Imports, wasm.Import{
-			Module: "env",
-			Name:   "sleep",
-			Desc:   wasm.ImportDesc{Kind: 0, TypeIdx: 0},
-		})
-	}
-
-	if hasEnvRead {
-		m.Types = append(m.Types, wasm.FuncType{Results: []wasm.ValType{wasm.ValI32}})
-		m.Imports = append(m.Imports, wasm.Import{
-			Module: "env",
-			Name:   "read",
-			Desc:   wasm.ImportDesc{Kind: 0, TypeIdx: uint32(len(m.Types) - 1)},
-		})
-	}
-
-	if hasMemory {
-		m.Memories = append(m.Memories, wasm.MemoryType{
-			Limits: wasm.Limits{Min: 1},
-		})
-	}
-
-	if hasGlobal {
-		m.Globals = append(m.Globals, wasm.Global{
-			Type: wasm.GlobalType{ValType: wasm.ValI32, Mutable: true},
-			Init: wasm.EncodeInstructions([]wasm.Instruction{
-				{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 42}},
-				{Opcode: wasm.OpEnd},
-			}),
-		})
-	}
-
-	// Add test function type
-	voidType := uint32(len(m.Types))
-	m.Types = append(m.Types, wasm.FuncType{})
-
-	// Check for functions
-	if containsPattern(wat, `(func (export "test")`) {
-		m.Funcs = append(m.Funcs, voidType)
-		m.Exports = append(m.Exports, wasm.Export{
-			Name: "test",
-			Kind: 0,
-			Idx:  uint32(m.NumImportedFuncs()),
-		})
-
-		// Create code that calls the import
-		var code []wasm.Instruction
-		if hasEnvSleep {
-			code = append(code, wasm.Instruction{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 100}})
-			code = append(code, wasm.Instruction{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}})
-
-			// Check for multiple calls
-			if containsPattern(wat, "i32.const 200") {
-				code = append(code, wasm.Instruction{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 200}})
-				code = append(code, wasm.Instruction{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}})
-			}
-			if containsPattern(wat, "i32.const 300") {
-				code = append(code, wasm.Instruction{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 300}})
-				code = append(code, wasm.Instruction{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}})
-			}
-		}
-		if hasEnvRead {
-			code = append(code, wasm.Instruction{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}})
-		}
-		if hasMemory && containsPattern(wat, "i32.load") {
-			code = append(code, wasm.Instruction{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 0}})
-			code = append(code, wasm.Instruction{Opcode: wasm.OpI32Load, Imm: wasm.MemoryImm{Align: 2, Offset: 0}})
-			code = append(code, wasm.Instruction{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}})
-		}
-		code = append(code, wasm.Instruction{Opcode: wasm.OpEnd})
-
-		m.Code = append(m.Code, wasm.FuncBody{Code: encodeInstrs(code)})
-	}
-
-	// Handle (func (export "test") (result i32)
-	if containsPattern(wat, `(func (export "test") (result i32)`) {
-		i32Type := uint32(len(m.Types))
-		m.Types = append(m.Types, wasm.FuncType{Results: []wasm.ValType{wasm.ValI32}})
-		m.Funcs = append(m.Funcs, i32Type)
-		m.Exports = append(m.Exports, wasm.Export{
-			Name: "test",
-			Kind: 0,
-			Idx:  uint32(m.NumImportedFuncs()),
-		})
-
-		code := []wasm.Instruction{
-			{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}},
-			{Opcode: wasm.OpEnd},
-		}
-		m.Code = append(m.Code, wasm.FuncBody{Code: encodeInstrs(code)})
-	}
-
-	// Handle $inner and outer pattern
-	if containsPattern(wat, `(func $inner`) {
-		m.Funcs = append(m.Funcs, voidType)
-		code := []wasm.Instruction{
-			{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 50}},
-			{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}},
-			{Opcode: wasm.OpEnd},
-		}
-		m.Code = append(m.Code, wasm.FuncBody{Code: encodeInstrs(code)})
-	}
-
-	if containsPattern(wat, `(func (export "outer")`) {
-		m.Funcs = append(m.Funcs, voidType)
-		m.Exports = append(m.Exports, wasm.Export{
-			Name: "outer",
-			Kind: 0,
-			Idx:  uint32(m.NumImportedFuncs() + len(m.Code)),
-		})
-		code := []wasm.Instruction{
-			{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: uint32(m.NumImportedFuncs())}},
-			{Opcode: wasm.OpEnd},
-		}
-		m.Code = append(m.Code, wasm.FuncBody{Code: encodeInstrs(code)})
-	}
-
-	// Handle foo/bar pattern
-	if containsPattern(wat, `(func (export "foo") (result i32)`) && containsPattern(wat, `(func (export "bar")`) {
-		// foo returns i32
-		i32Type := uint32(len(m.Types))
-		m.Types = append(m.Types, wasm.FuncType{Results: []wasm.ValType{wasm.ValI32}})
-		m.Funcs = append(m.Funcs, i32Type)
-		m.Exports = append(m.Exports, wasm.Export{
-			Name: "foo",
-			Kind: 0,
-			Idx:  uint32(m.NumImportedFuncs()),
-		})
-		m.Code = append(m.Code, wasm.FuncBody{
-			Code: encodeInstrs([]wasm.Instruction{
-				{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 42}},
-				{Opcode: wasm.OpEnd},
-			}),
-		})
-
-		// bar is void and calls sleep
-		m.Funcs = append(m.Funcs, voidType)
-		m.Exports = append(m.Exports, wasm.Export{
-			Name: "bar",
-			Kind: 0,
-			Idx:  uint32(m.NumImportedFuncs() + 1),
-		})
-		m.Code = append(m.Code, wasm.FuncBody{
-			Code: encodeInstrs([]wasm.Instruction{
-				{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 100}},
-				{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}},
-				{Opcode: wasm.OpEnd},
-			}),
-		})
-	}
-
-	return m.Encode(), nil
-}
-
-func containsPattern(s, pattern string) bool {
-	return len(s) >= len(pattern) && (s == pattern || len(s) > len(pattern) && (s[:len(pattern)] == pattern || containsPattern(s[1:], pattern)))
 }
 
 func encodeInstrs(instrs []wasm.Instruction) []byte {
@@ -921,9 +674,7 @@ func TestEngine_Transform_AsyncInIf(t *testing.T) {
 	}
 
 	// Verify function was transformed
-	if len(out.Code[0].Locals) < 10 {
-		t.Errorf("expected at least 10 scratch locals, got %d", len(out.Code[0].Locals))
-	}
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
 
 	// Decode and verify structure contains proper control flow handling
 	instrs, err := wasm.DecodeInstructions(out.Code[0].Code)
@@ -983,9 +734,7 @@ func TestEngine_Transform_AsyncInLoop(t *testing.T) {
 		t.Fatalf("parse result: %v", err)
 	}
 
-	if len(out.Code[0].Locals) < 10 {
-		t.Errorf("expected at least 10 scratch locals, got %d", len(out.Code[0].Locals))
-	}
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
 }
 
 func TestEngine_Transform_AsyncInBlock(t *testing.T) {
@@ -1027,9 +776,7 @@ func TestEngine_Transform_AsyncInBlock(t *testing.T) {
 		t.Fatalf("parse result: %v", err)
 	}
 
-	if len(out.Code[0].Locals) < 10 {
-		t.Errorf("expected at least 10 scratch locals, got %d", len(out.Code[0].Locals))
-	}
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
 }
 
 func TestEngine_Transform_NestedControlFlow(t *testing.T) {
@@ -1075,9 +822,7 @@ func TestEngine_Transform_NestedControlFlow(t *testing.T) {
 		t.Fatalf("parse result: %v", err)
 	}
 
-	if len(out.Code[0].Locals) < 10 {
-		t.Errorf("expected at least 10 scratch locals, got %d", len(out.Code[0].Locals))
-	}
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
 }
 
 // Benchmark tests
@@ -1243,13 +988,11 @@ func TestEngine_Transform_CompareBinaryenStructure(t *testing.T) {
 		}
 	}
 
-	// 4. Transformed function should have scratch locals
+	// 4. Transformed function should access a continuation frame
 	if len(out.Code) == 0 {
 		t.Fatal("no code sections")
 	}
-	if len(out.Code[0].Locals) < 10 {
-		t.Errorf("expected at least 10 scratch locals, got %d", len(out.Code[0].Locals))
-	}
+	testutil.RequireContinuationFrame(t, out, out.Code[0])
 
 	// 5. Decode and verify key patterns
 	instrs, err := wasm.DecodeInstructions(out.Code[0].Code)
@@ -1324,7 +1067,7 @@ func TestEngine_RejectsAtomicOpcodes(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for atomic opcode in async function, got nil")
 	}
-	if err != nil && !containsPattern(err.Error(), "atomic") {
+	if err != nil && !strings.Contains(err.Error(), "atomic") {
 		t.Errorf("expected atomic error message, got: %v", err)
 	}
 }
@@ -1367,7 +1110,7 @@ func TestEngine_RejectsTailCalls(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for tail call in async function, got nil")
 	}
-	if err != nil && !containsPattern(err.Error(), "tail call") {
+	if err != nil && !strings.Contains(err.Error(), "tail call") {
 		t.Errorf("expected tail call error message, got: %v", err)
 	}
 }
