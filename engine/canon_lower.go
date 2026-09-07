@@ -490,10 +490,8 @@ func (w *LowerWrapper) callHandler(ctx context.Context, mod api.Module, stack []
 	mem := &WazeroMemory{mem: mod.Memory()}
 
 	allocFunc := mod.ExportedFunction(CabiRealloc)
-	if allocFunc == nil {
-		log.Error("callHandler: cabi_realloc not found", zap.String("func", w.def.Name))
-		return
-	}
+	// Fixed-size results use the caller's return area and need no allocator.
+	// moduleAllocator reports a missing allocator only if lowering allocates.
 	alloc := &moduleAllocator{ctx: ctx, allocFunc: allocFunc}
 
 	argsPtr := w.argsPool.Get().(*[]reflect.Value)
