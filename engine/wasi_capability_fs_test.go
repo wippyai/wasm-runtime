@@ -6,6 +6,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -83,9 +85,26 @@ func (f *directoryRecordingCapability) OpenDirectory(name string, noFollow bool)
 	f.name, f.noFollow = name, noFollow
 	f.mu.Unlock()
 	f.dirCalls.Add(1)
-	file, err := f.root.Open(name)
+	// The test provider implements the directory-only contract using the opened
+	// descriptor. Windows reports ERROR_PATH_NOT_FOUND for a regular file with
+	// a trailing slash, so let the provider enforce that final type explicitly.
+	// Preserve every interior component, including parent traversal.
+	openName := strings.TrimRight(name, "/")
+	if openName == "" {
+		openName = "."
+	}
+	file, err := f.root.Open(openName)
 	if err != nil {
 		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !info.IsDir() {
+		_ = file.Close()
+		return nil, &fs.PathError{Op: "open-directory", Path: name, Err: experimentalsys.ENOTDIR}
 	}
 	return &closeCountingFile{File: file, closes: &f.closes}, nil
 }
@@ -277,6 +296,9 @@ func TestCapabilityMountFS_PreservesTrailingSlashAndParentComponents(t *testing.
 	if openedPath != "link/../../file" {
 		t.Fatalf("symlink-expanded OpenFile path = %q, want original component path", openedPath)
 	}
+	if _, errno := mount.OpenFile("missing/", experimentalsys.O_RDONLY|experimentalsys.O_NOFOLLOW, 0); errno != experimentalsys.ENOENT {
+		t.Fatalf("missing-directory trailing-slash open = %v, want ENOENT", errno)
+	}
 }
 
 func TestCapabilityMountFS_DirectoryMutationDeniedBeforeOpen(t *testing.T) {
@@ -405,6 +427,12 @@ func TestCapabilityMountFS_DelegatesNoFollowOnlyToAtomicCapability(t *testing.T)
 }
 
 func TestCapabilityErrnoNormalizesNestedAndJoinedErrors(t *testing.T) {
+	syscallNotDirectory := experimentalsys.ENOTDIR
+	if runtime.GOOS == "windows" {
+		// Go aliases ENOTDIR to ERROR_PATH_NOT_FOUND on Windows. That error is
+		// also used for missing parents and must retain the ENOENT mapping.
+		syscallNotDirectory = experimentalsys.ENOENT
+	}
 	nestedNotExist := &fs.PathError{Op: "outer", Path: "missing", Err: &fs.PathError{Op: "inner", Path: "missing", Err: fs.ErrNotExist}}
 	for _, tc := range []struct {
 		err  error
@@ -419,7 +447,8 @@ func TestCapabilityErrnoNormalizesNestedAndJoinedErrors(t *testing.T) {
 		{name: "unsupported", err: errors.Join(errors.New("context"), errors.ErrUnsupported), want: experimentalsys.ENOSYS},
 		{name: "wazero-errno", err: errors.Join(errors.New("context"), experimentalsys.ELOOP), want: experimentalsys.ELOOP},
 		{name: "syscall-loop", err: errors.Join(errors.New("context"), syscall.ELOOP), want: experimentalsys.ELOOP},
-		{name: "syscall-not-directory", err: &fs.PathError{Op: "open", Path: "directory", Err: syscall.ENOTDIR}, want: experimentalsys.ENOTDIR},
+		{name: "syscall-not-directory", err: &fs.PathError{Op: "open", Path: "directory", Err: syscall.ENOTDIR}, want: syscallNotDirectory},
+		{name: "explicit-not-directory", err: &fs.PathError{Op: "open", Path: "directory", Err: experimentalsys.ENOTDIR}, want: experimentalsys.ENOTDIR},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := capabilityErrno(tc.err); got != tc.want {
