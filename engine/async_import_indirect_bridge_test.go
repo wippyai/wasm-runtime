@@ -2,12 +2,14 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/tetratelabs/wazero/api"
 )
 
-// indirectBridge3CoreWAT defines a 3-core component:
+// indirectBridge3CoreWAT defines a 3-core component outside the supported
+// Asyncify execution profile:
 // - Module A: provides a table containing async lowered host target.
 // - Module B: imports table from A (via table instance) and exports wrapper with ONLY call_indirect, no func imports.
 // - Module C: imports B wrapper and has direct caller with before/after effect counters.
@@ -84,7 +86,7 @@ const indirectBridge3CoreWAT = `(component
 )
 `
 
-func TestAsyncifyImportSoundness_IndirectBridge3Core(t *testing.T) {
+func TestAsyncifyImportSoundness_IndirectBridge3CoreRejected(t *testing.T) {
 	wasmBytes := componentFixture(t, indirectBridge3CoreWAT)
 
 	ctx := context.Background()
@@ -131,64 +133,10 @@ func TestAsyncifyImportSoundness_IndirectBridge3Core(t *testing.T) {
 	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{
 		EnableAsyncify: true,
 	})
-	if err != nil {
-		t.Fatalf("InstantiateWithConfig: %v", err)
+	if inst != nil {
+		defer inst.Close(ctx)
 	}
-	defer inst.Close(ctx)
-
-	cs, err := inst.StartCall(ctx, "run", uint32(42))
-	if err != nil {
-		t.Fatalf("StartCall: %v", err)
-	}
-
-	step1, err := cs.Step(ctx, nil)
-	if err != nil {
-		t.Fatalf("Step initial: %v", err)
-	}
-	if step1.Status != StepContinue {
-		t.Fatalf("status = %v, want StepContinue", step1.Status)
-	}
-	if step1.PendingOp == nil || step1.PendingOp.CmdID() != 777 {
-		t.Fatalf("expected PendingOp with CmdID 777, got %v", step1.PendingOp)
-	}
-
-	step2, err := cs.Step(ctx, &YieldResult{Value: 100})
-	if err != nil {
-		t.Fatalf("Step resume: %v", err)
-	}
-	if step2.Status != StepDone {
-		t.Fatalf("status = %v, want StepDone", step2.Status)
-	}
-
-	lifted, err := cs.LiftResult(ctx, step2.Results)
-	if err != nil {
-		t.Fatalf("LiftResult: %v", err)
-	}
-	if lifted.(uint32) != 100 {
-		t.Fatalf("LiftResult = %v, want 100", lifted)
-	}
-
-	beforeVal, err := inst.CallWithLift(ctx, "get-before")
-	if err != nil {
-		t.Fatalf("get-before: %v", err)
-	}
-	if beforeVal.(uint32) != 1 {
-		t.Fatalf("before_count = %v, want 1 (side effect replayed!)", beforeVal)
-	}
-
-	afterVal, err := inst.CallWithLift(ctx, "get-after")
-	if err != nil {
-		t.Fatalf("get-after: %v", err)
-	}
-	if afterVal.(uint32) != 1 {
-		t.Fatalf("after_count = %v, want 1", afterVal)
-	}
-
-	tokVal, err := inst.CallWithLift(ctx, "get-token")
-	if err != nil {
-		t.Fatalf("get-token: %v", err)
-	}
-	if tokVal.(uint32) != 100 {
-		t.Fatalf("token = %v, want 100", tokVal)
+	if err == nil || !strings.Contains(err.Error(), "unsupported cross-core continuation boundary") {
+		t.Fatalf("expected untracked indirect table boundary rejection, got %v", err)
 	}
 }

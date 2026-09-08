@@ -433,7 +433,47 @@ func (i *WazeroInstance) getOrCreateAsyncifyForModuleLocked(mod api.Module, modI
 		i.asyncifyCache = make(map[api.Module]*asyncifyCoreState)
 	}
 	i.asyncifyCache[mod] = &asyncifyCoreState{asyncify: a, scheduler: sched}
+	if i.linkerInst != nil {
+		i.linkerInst.RegisterAsyncifyController(mod, a)
+	}
 	return a, sched, nil
+}
+
+// clearAsyncifyHostArgs releases parked Canonical ABI stacks across every
+// configured core after an aborted session. A nested bridge can park args in a
+// child controller even though the session scheduler belongs to the root.
+func (i *WazeroInstance) clearAsyncifyHostArgs() {
+	i.bindingMu.RLock()
+	controllers := make([]*Asyncify, 0, len(i.asyncifyCache)+1)
+	if i.asyncify != nil {
+		controllers = append(controllers, i.asyncify)
+	}
+	for _, state := range i.asyncifyCache {
+		if state != nil && state.asyncify != nil {
+			controllers = append(controllers, state.asyncify)
+		}
+	}
+	i.bindingMu.RUnlock()
+	for _, controller := range controllers {
+		controller.ClearHostArgs()
+	}
+}
+
+// poisonAsyncify marks an instance unusable for further guest entries after an
+// async execution fails. Clearing parked host arguments prevents retained
+// Canonical ABI state, but it cannot restore every core in a nested component
+// call to a proven normal Asyncify state. Reuse would therefore be unsound.
+// Close is the recovery boundary: it tears down every core and its stack.
+func (i *WazeroInstance) poisonAsyncify(cause error) {
+	if cause == nil {
+		return
+	}
+	i.clearAsyncifyHostArgs()
+	i.bindingMu.Lock()
+	if i.asyncifyPoison == nil {
+		i.asyncifyPoison = cause
+	}
+	i.bindingMu.Unlock()
 }
 
 func (i *WazeroInstance) setSuspendedSession(cs *CallSession) {
@@ -452,8 +492,12 @@ func (i *WazeroInstance) clearSuspendedSession(cs *CallSession) {
 
 func (i *WazeroInstance) checkSuspended(target *exportBinding) error {
 	i.bindingMu.RLock()
+	poison := i.asyncifyPoison
 	active := i.activeSession
 	i.bindingMu.RUnlock()
+	if poison != nil {
+		return fmt.Errorf("asyncify execution previously failed: %w; close the instance before reuse", poison)
+	}
 
 	if active == nil || active.lifted {
 		return nil

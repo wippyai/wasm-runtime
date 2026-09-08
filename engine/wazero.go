@@ -1404,26 +1404,32 @@ func (m *WazeroModule) decoderForConfig(cfg *InstanceConfig) *transcoder.Decoder
 // Close is an exception: concurrent callers share one teardown owner and may
 // cancel their wait without reclaiming resources still owned by that teardown.
 type WazeroInstance struct {
-	closeErr                error
-	freeFn                  api.Function
-	allocFn                 api.Function
-	instance                api.Module
-	memory                  *WazeroMemory
-	asyncify                *Asyncify
-	admission               *linker.MemoryAdmission
-	closeAttempt            chan struct{}
-	lifetime                *executionLifetime
-	linkerInst              *linker.Instance
-	scheduler               *Scheduler
-	compiler                *transcoder.Compiler
-	resources               *resource.UnifiedTable
-	decoder                 *transcoder.Decoder
-	asyncifyReservations    map[api.Module]asyncifyStackReservation
-	alloc                   *wazeroAllocator
-	module                  *WazeroModule
-	exportBindings          map[string]*exportBinding
-	encoder                 *transcoder.Encoder
-	activeSession           *CallSession
+	closeErr             error
+	freeFn               api.Function
+	allocFn              api.Function
+	instance             api.Module
+	memory               *WazeroMemory
+	asyncify             *Asyncify
+	admission            *linker.MemoryAdmission
+	closeAttempt         chan struct{}
+	lifetime             *executionLifetime
+	linkerInst           *linker.Instance
+	scheduler            *Scheduler
+	compiler             *transcoder.Compiler
+	resources            *resource.UnifiedTable
+	decoder              *transcoder.Decoder
+	asyncifyReservations map[api.Module]asyncifyStackReservation
+	alloc                *wazeroAllocator
+	module               *WazeroModule
+	exportBindings       map[string]*exportBinding
+	encoder              *transcoder.Encoder
+	activeSession        *CallSession
+	// asyncifyPoison records a failed async execution whose complete core-state
+	// recovery cannot be proved. Asyncify can have parked frames in a child core
+	// reached through a component bridge, while the public CallSession only owns
+	// the root scheduler. Do not make a later call look safe by merely dropping
+	// that root session; callers must close the instance before reusing it.
+	asyncifyPoison          error
 	asyncifyCache           map[api.Module]*asyncifyCoreState
 	memoryCache             map[api.Memory]*WazeroMemory
 	allocatorCache          map[api.Function]*wazeroAllocator
@@ -1720,6 +1726,15 @@ func (i *WazeroInstance) enableAsyncify(ctx context.Context, config AsyncifyConf
 	i.scheduler = newSched
 	i.asyncifyCache = newCache
 	i.exportBindings = newBindings
+	if i.linkerInst != nil {
+		controllers := make(map[api.Module]asyncify.RuntimeController, len(newCache))
+		for mod, state := range newCache {
+			if mod != nil && state != nil && state.asyncify != nil {
+				controllers[mod] = state.asyncify
+			}
+		}
+		i.linkerInst.SetAsyncifyControllers(controllers)
+	}
 	return nil
 }
 
@@ -1764,7 +1779,11 @@ func (i *WazeroInstance) RunAsync(ctx context.Context, name string, args ...uint
 
 	ctx = WithAsyncify(ctx, async)
 	ctx = WithScheduler(ctx, sched)
-	return sched.Run(ctx, binding.fn, args...)
+	results, err := sched.Run(ctx, binding.fn, args...)
+	if err != nil {
+		i.poisonAsyncify(err)
+	}
+	return results, err
 }
 
 // CallWithLift calls a function using cached lift information from canon registry.
@@ -2321,8 +2340,17 @@ type engineCallContext struct {
 	scheduler *Scheduler
 }
 
+func (c *engineCallContext) AsyncifyRuntimeControllerState() asyncify.RuntimeControllerContext {
+	if c.asyncify == nil {
+		return asyncify.RuntimeControllerContext{}
+	}
+	return asyncify.RuntimeControllerContext{Controller: c.asyncify}
+}
+
 func (c *engineCallContext) Value(key any) any {
 	switch key {
+	case asyncify.RuntimeControllerContextKey{}:
+		return c
 	case ctxKeyAsyncify{}:
 		return c.asyncify
 	case ctxKeyScheduler{}:
@@ -2411,6 +2439,7 @@ func (cs *CallSession) Step(ctx context.Context, yr *YieldResult) (StepResult, e
 	}
 	ctx, lease, err := cs.enterStepExecution(ctx)
 	if err != nil {
+		cs.instance.poisonAsyncify(err)
 		cs.instance.clearSuspendedSession(cs)
 		cs.done = true
 		if cs.execution != nil {
@@ -2432,6 +2461,7 @@ func (cs *CallSession) Step(ctx context.Context, yr *YieldResult) (StepResult, e
 	}
 	res, err := sched.Step(ctx, yr)
 	if err != nil {
+		cs.instance.poisonAsyncify(err)
 		cs.instance.clearSuspendedSession(cs)
 		cs.done = true
 		if cs.execution != nil {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/wippyai/wasm-runtime/asyncify"
 	"github.com/wippyai/wasm-runtime/component"
 	"github.com/wippyai/wasm-runtime/linker/internal/bridge"
 	"github.com/wippyai/wasm-runtime/linker/internal/invoke"
@@ -146,6 +147,52 @@ func clearVirtualHostFns(inst *Instance) {
 	inst.virtualHostMu.Unlock()
 }
 
+// SetAsyncifyControllers publishes a complete per-core controller snapshot.
+// It is called only after engine configuration has committed every controller
+// and stack header, so a bridge never observes a partially configured graph.
+func (inst *Instance) SetAsyncifyControllers(controllers map[api.Module]asyncify.RuntimeController) {
+	inst.asyncifyMu.Lock()
+	defer inst.asyncifyMu.Unlock()
+	if len(controllers) == 0 {
+		inst.asyncifyControllers = nil
+		return
+	}
+	published := make(map[api.Module]asyncify.RuntimeController, len(controllers))
+	for mod, controller := range controllers {
+		if mod != nil && controller != nil {
+			published[mod] = controller
+		}
+	}
+	inst.asyncifyControllers = published
+}
+
+// RegisterAsyncifyController adds a controller discovered after initial
+// configuration. This exists for caller-managed configurations that resolve a
+// previously uncached exported core; owned-stack configuration publishes all
+// cores atomically through SetAsyncifyControllers.
+func (inst *Instance) RegisterAsyncifyController(mod api.Module, controller asyncify.RuntimeController) {
+	if mod == nil || controller == nil {
+		return
+	}
+	inst.asyncifyMu.Lock()
+	if inst.asyncifyControllers == nil {
+		inst.asyncifyControllers = make(map[api.Module]asyncify.RuntimeController)
+	}
+	inst.asyncifyControllers[mod] = controller
+	inst.asyncifyMu.Unlock()
+}
+
+// AsyncifyController returns the controller registered for a transformed core.
+func (inst *Instance) AsyncifyController(mod api.Module) asyncify.RuntimeController {
+	if inst == nil || mod == nil {
+		return nil
+	}
+	inst.asyncifyMu.RLock()
+	controller := inst.asyncifyControllers[mod]
+	inst.asyncifyMu.RUnlock()
+	return controller
+}
+
 // dispatchVirtualHostExport is the immutable thunk exported by a shared virtual
 // host module. It selects the active instance's original handler and never
 // stores or invokes another dispatcher.
@@ -215,25 +262,27 @@ type CanonExport struct {
 // Instance represents a live component instance.
 // NOT thread-safe: each goroutine should use its own Instance.
 type Instance struct {
-	cachedMemory    api.Memory
-	cachedAlloc     api.Function
-	bridgeBuilder   *bridge.Builder
-	bridgeCollector *bridge.Collector
-	resources       *ResourceStore
-	coreInstances   map[int]*coreInstance
-	bridgeModules   map[string]bool
-	virtualBridges  map[string]bool
-	virtualHostFns  map[virtualHostKey]api.GoModuleFunc
-	pre             *InstancePre
-	exports         map[string]Export
-	encoder         *transcoder.Encoder
-	decoder         *transcoder.Decoder
-	layoutCalc      *transcoder.LayoutCalculator
-	modules         []api.Module
-	valueSpace      []uint64
-	virtualHostMu   sync.RWMutex
-	instanceID      uint64
-	memResolved     bool
+	cachedMemory        api.Memory
+	cachedAlloc         api.Function
+	bridgeBuilder       *bridge.Builder
+	bridgeCollector     *bridge.Collector
+	resources           *ResourceStore
+	coreInstances       map[int]*coreInstance
+	bridgeModules       map[string]bool
+	virtualBridges      map[string]bool
+	virtualHostFns      map[virtualHostKey]api.GoModuleFunc
+	asyncifyControllers map[api.Module]asyncify.RuntimeController
+	pre                 *InstancePre
+	exports             map[string]Export
+	encoder             *transcoder.Encoder
+	decoder             *transcoder.Decoder
+	layoutCalc          *transcoder.LayoutCalculator
+	modules             []api.Module
+	valueSpace          []uint64
+	virtualHostMu       sync.RWMutex
+	asyncifyMu          sync.RWMutex
+	instanceID          uint64
+	memResolved         bool
 }
 
 // coreInstance wraps either a real wazero module or a virtual instance.
@@ -1224,7 +1273,9 @@ func (inst *Instance) createSynthBridgeFromModule(ctx context.Context, name stri
 		if fn == nil {
 			continue
 		}
-		wrapper := bridge.ForwardingWrapper(fn, len(def.ParamTypes()))
+		wrapper := bridge.ForwardingWrapperWithAsyncify(fn, len(def.ParamTypes()),
+			func() asyncify.RuntimeController { return inst.AsyncifyController(sourceMod) },
+			func() bool { return inst.IsModuleTransformed(sourceMod) })
 		if wrapper == nil {
 			continue
 		}
@@ -1636,7 +1687,9 @@ func (inst *Instance) collectVirtualExports(virt *VirtualInstance, namespace str
 			// Get function - may panic for re-exported imports with wazevo engine
 			fn := inst.safeGetExportedFunction(src.Module, src.ExportName)
 			if fn != nil {
-				wrapper := bridge.ForwardingWrapper(fn, len(def.ParamTypes()))
+				wrapper := bridge.ForwardingWrapperWithAsyncify(fn, len(def.ParamTypes()),
+					func() asyncify.RuntimeController { return inst.AsyncifyController(src.Module) },
+					func() bool { return inst.IsModuleTransformed(src.Module) })
 				if wrapper != nil {
 					exports = append(exports, bridge.Export{
 						Name:        entityName,
@@ -2700,6 +2753,8 @@ func (inst *Instance) Graph() *component.InstanceGraph {
 
 // Close releases all instance resources
 func (inst *Instance) Close(ctx context.Context) error {
+	// Stop bridge lookups before releasing the modules their controllers own.
+	inst.SetAsyncifyControllers(nil)
 	// Unregister from instance registry
 	instanceRegistry.Delete(inst.instanceID)
 	if inst.resources != nil {

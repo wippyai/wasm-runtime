@@ -812,10 +812,11 @@ const realisticAliasesChainWAT = `(component
 )
 `
 
-// TestAsyncifyImportIdentity_TableBeforeFunctionRegression verifies that table and memory
-// imports appearing before a function import in the import section do not cause parser
-// desynchronization, and the following function import is correctly recognized as async.
-func TestAsyncifyImportIdentity_TableBeforeFunctionRegression(t *testing.T) {
+// TestAsyncifyImportIdentity_TableBeforeFunctionProfileRejected verifies that
+// table and memory imports preceding a function import do not desynchronize
+// async import discovery. The executable imported-table topology is then
+// rejected before instantiation because it bypasses bridge continuations.
+func TestAsyncifyImportIdentity_TableBeforeFunctionProfileRejected(t *testing.T) {
 	wasmBytes := componentFixture(t, tableBeforeFunctionWAT)
 
 	ctx := context.Background()
@@ -860,31 +861,11 @@ func TestAsyncifyImportIdentity_TableBeforeFunctionRegression(t *testing.T) {
 	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{
 		EnableAsyncify: true,
 	})
-	if err != nil {
-		t.Fatalf("InstantiateWithConfig: %v", err)
+	if inst != nil {
+		defer inst.Close(ctx)
 	}
-	defer inst.Close(ctx)
-
-	cs, err := inst.StartCall(ctx, "run", uint32(5))
-	if err != nil {
-		t.Fatalf("StartCall: %v", err)
-	}
-	step1, err := cs.Step(ctx, nil)
-	if err != nil || step1.Status != StepContinue {
-		t.Fatalf("step1: %v, status: %v", err, step1.Status)
-	}
-	step2, err := cs.Step(ctx, &YieldResult{Value: 50})
-	if err != nil || step2.Status != StepDone {
-		t.Fatalf("step2: %v, status: %v", err, step2.Status)
-	}
-	res, _ := cs.LiftResult(ctx, step2.Results)
-	if res.(uint32) != 50 {
-		t.Fatalf("res = %v, want 50", res)
-	}
-
-	countVal, _ := inst.CallWithLift(ctx, "get-count")
-	if countVal.(uint32) != 1 {
-		t.Fatalf("count = %v, want 1", countVal)
+	if err == nil || !strings.Contains(err.Error(), "unsupported cross-core continuation boundary") {
+		t.Fatalf("expected executable imported-table profile rejection, got %v", err)
 	}
 }
 

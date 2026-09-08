@@ -80,6 +80,13 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 	if c == nil || c.Raw == nil {
 		return nil, instError("validate", -1, "", "nil component", nil)
 	}
+	// Reject unsupported continuation edges before compiling any module or
+	// instantiating guest code. Synchronous components retain their table support.
+	if l.options.AsyncifyTransform {
+		if err := validateAsyncifyBoundaryContract(c.Raw.CoreModules); err != nil {
+			return nil, err
+		}
+	}
 
 	pre := &InstancePre{
 		linker:              l,

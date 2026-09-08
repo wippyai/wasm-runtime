@@ -10,6 +10,8 @@ import (
 
 	"github.com/tetratelabs/wazero/api"
 	"go.uber.org/zap"
+
+	"github.com/wippyai/wasm-runtime/asyncify"
 )
 
 // ErrorKind categorizes errors for integration with external error handling.
@@ -447,6 +449,7 @@ type Scheduler struct {
 	args        []uint64
 	result      uint64
 	initialized bool
+	awaiting    bool // true after a yield until exactly one resume result is supplied
 }
 
 func NewScheduler(asyncify *Asyncify) *Scheduler {
@@ -487,6 +490,7 @@ func (s *Scheduler) Execute(ctx context.Context, fn api.Function, args ...uint64
 	s.fn = fn
 	s.args = args
 	s.initialized = true
+	s.awaiting = false
 	return nil
 }
 
@@ -506,17 +510,27 @@ func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, erro
 		return StepResult{Error: err, ErrorKind: KindInvalid}, err
 	}
 
+	if s.awaiting && yr == nil {
+		err := fmt.Errorf("scheduler: yielded operation requires a resume result")
+		return StepResult{Error: err, ErrorKind: KindInvalid}, err
+	}
+	if !s.awaiting && yr != nil {
+		err := fmt.Errorf("scheduler: resume result supplied without a yielded operation")
+		return StepResult{Error: err, ErrorKind: KindInvalid}, err
+	}
 	if yr != nil {
 		s.result = yr.Value
 		s.err = yr.Error
 		if s.err != nil {
 			s.asyncify.ClearHostArgs()
+			s.awaiting = false
 			return StepResult{Error: s.err, ErrorKind: ClassifyError(s.err)}, s.err
 		}
 		if err := s.asyncify.StartRewind(ctx); err != nil {
 			err = fmt.Errorf("scheduler: start rewind: %w", err)
 			return StepResult{Error: err, ErrorKind: KindInternal}, err
 		}
+		s.awaiting = false
 	}
 
 	results, callErr := s.fn.Call(ctx, s.args...)
@@ -536,6 +550,7 @@ func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, erro
 		}
 		op := s.pendingOp
 		s.pendingOp = nil
+		s.awaiting = true
 		return StepResult{Status: StepContinue, PendingOp: op}, nil
 	}
 
@@ -545,6 +560,7 @@ func (s *Scheduler) Step(ctx context.Context, yr *YieldResult) (StepResult, erro
 	}
 
 	s.initialized = false
+	s.awaiting = false
 	return StepResult{Status: StepDone, Results: results}, nil
 }
 
@@ -555,6 +571,7 @@ func (s *Scheduler) Reset() {
 	s.result = 0
 	s.err = nil
 	s.initialized = false
+	s.awaiting = false
 	if s.asyncify != nil {
 		s.asyncify.ClearHostArgs()
 	}
@@ -597,11 +614,17 @@ func GetScheduler(ctx context.Context) *Scheduler {
 	return nil
 }
 
+// WithAsyncify selects the root controller for direct callers and keeps the
+// legacy key for allocation-free engine call contexts.
 func WithAsyncify(ctx context.Context, a *Asyncify) context.Context {
-	return context.WithValue(ctx, ctxKeyAsyncify{}, a)
+	return asyncify.WithRuntimeController(context.WithValue(ctx, ctxKeyAsyncify{}, a), a)
 }
 
 func GetAsyncify(ctx context.Context) *Asyncify {
+	if state, present := asyncify.RuntimeControllerStateFromContext(ctx); present {
+		selected, _ := state.Controller.(*Asyncify)
+		return selected
+	}
 	if v := ctx.Value(ctxKeyAsyncify{}); v != nil {
 		return v.(*Asyncify)
 	}
@@ -616,12 +639,28 @@ func Suspend(ctx context.Context, op PendingOp) error {
 	if sched == nil || async == nil {
 		return fmt.Errorf("suspend: scheduler or asyncify not in context")
 	}
+	if op == nil {
+		return fmt.Errorf("suspend: nil pending operation")
+	}
+	if sched.pendingOp != nil || sched.awaiting {
+		return fmt.Errorf("suspend: scheduler already owns a pending operation")
+	}
+	// Publish only after the guest accepted the state transition. A failed
+	// start must not leave a later Step with a stale operation it could resume.
+	if err := async.StartUnwind(ctx); err != nil {
+		return err
+	}
 
 	sched.SetPending(op)
-	return async.StartUnwind(ctx)
+	return nil
 }
 
-// Resume gets the operation result and stops rewinding. Called during rewind.
+// Resume gets the operation result and completes rewind at the async host
+// boundary. Every active core has restored the frames above that boundary
+// before the lower calls this function, so the complete controller path must
+// become normal before Canonical ABI result encoding can synchronously call an
+// allocator through an ancestor bridge. Leaving an ancestor rewinding makes
+// that fresh allocator entry look like replay and can skip its body.
 func Resume(ctx context.Context) (uint64, error) {
 	sched := GetScheduler(ctx)
 	async := GetAsyncify(ctx)
@@ -629,14 +668,32 @@ func Resume(ctx context.Context) (uint64, error) {
 	if sched == nil || async == nil {
 		return 0, fmt.Errorf("resume: scheduler or asyncify not in context")
 	}
+	if !async.IsRewinding(ctx) {
+		return 0, fmt.Errorf("resume: selected controller is not rewinding")
+	}
 
 	result, err := sched.GetResult()
 	if err != nil {
 		return 0, err
 	}
 
-	if err := async.StopRewind(ctx); err != nil {
-		return 0, err
+	state, present := asyncify.RuntimeControllerStateFromContext(ctx)
+	if !present {
+		state = asyncify.RuntimeControllerContext{Controller: async}
+	}
+	for active := true; active; state, active = asyncify.ParentRuntimeController(state) {
+		controller := state.Controller
+		// Repeated activations share a controller. Stopping the innermost
+		// occurrence makes later occurrences normal, so no seen-set is needed.
+		if controller == nil || controller.IsNormal(ctx) {
+			continue
+		}
+		if !controller.IsRewinding(ctx) {
+			return 0, fmt.Errorf("resume: active controller is not rewinding")
+		}
+		if err := controller.StopRewind(ctx); err != nil {
+			return 0, err
+		}
 	}
 
 	sched.ClearPending()
@@ -648,13 +705,15 @@ func MakeAsyncHandler(createOp func(ctx context.Context, mod api.Module, stack [
 	return func(ctx context.Context, mod api.Module, stack []uint64) {
 		async := GetAsyncify(ctx)
 		if async == nil {
-			// No asyncify - can't suspend, just return
-			return
+			panic(fmt.Errorf("asyncify: async host handler invoked without a core controller"))
 		}
 
 		if async.IsRewinding(ctx) {
 			result, err := Resume(ctx)
-			if err == nil && len(stack) > 0 {
+			if err != nil {
+				panic(fmt.Errorf("asyncify: resume host handler: %w", err))
+			}
+			if len(stack) > 0 {
 				stack[0] = result
 			}
 			return
@@ -663,8 +722,7 @@ func MakeAsyncHandler(createOp func(ctx context.Context, mod api.Module, stack [
 		op := createOp(ctx, mod, stack)
 		if op != nil {
 			if err := Suspend(ctx, op); err != nil {
-				Logger().Warn("MakeAsyncHandler: failed to suspend for pending operation",
-					zap.Error(err))
+				panic(fmt.Errorf("asyncify: suspend host handler: %w", err))
 			}
 		}
 	}
