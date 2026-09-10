@@ -85,21 +85,16 @@
 //
 // # Asyncify Support
 //
-// For components compiled with asyncify, enable async operations using owned
-// suspension storage. The zero configuration selects 64 KiB per core module:
+// For components compiled with asyncify, enable async operations:
 //
-//	if err := inst.EnableAsyncify(engine.AsyncifyConfig{}); err != nil {
+//	if err := inst.EnableAsyncify(engine.AsyncifyConfig{
+//	    StackSize: 1024,
+//	    DataAddr:  65536,
+//	}); err != nil {
 //	    log.Fatal(err)
 //	}
 //
 //	// Now async host functions can suspend/resume the guest
-//
-// Storage is allocated through a proven allocator for each core's memory, or
-// reserved in memory introduced exclusively by the embedded transform. Missing
-// ownership proof rejects initialization. A positive DataAddr is an advanced
-// caller-owned reservation contract; it must cover the header and StackSize in
-// every affected memory. Standalone engine.NewAsyncify controllers require an
-// explicit SetDataAddr before Init. No automatic fixed-address fallback exists.
 //
 // # Thread Safety
 //
