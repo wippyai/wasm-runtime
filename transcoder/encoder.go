@@ -36,6 +36,100 @@ var (
 	coerceToInt64  = abi.CoerceToInt64
 )
 
+// checkedListLength validates the host representation before narrowing it to
+// the Canonical ABI's u32 length field. Keep this at every host boundary: a
+// zero-sized Go element can otherwise make a wrapped length appear empty.
+func checkedListLength(length int, path []string) (uint32, error) {
+	if uint64(length) > uint64(MaxListLength) {
+		return 0, errors.New(errors.PhaseEncode, errors.KindOverflow).
+			Path(path...).
+			Detail("list length %d exceeds maximum %d", length, MaxListLength).
+			Build()
+	}
+	return uint32(length), nil
+}
+
+// checkedStringLength does the analogous validation for Canonical ABI string
+// lengths. The limit is checked before conversion even on 64-bit hosts.
+func checkedStringLength(length int, path []string) (uint32, error) {
+	if uint64(length) > uint64(MaxStringSize) {
+		return 0, errors.New(errors.PhaseEncode, errors.KindOverflow).
+			Path(path...).
+			Detail("string size %d exceeds maximum %d", length, MaxStringSize).
+			Build()
+	}
+	return uint32(length), nil
+}
+
+// compiledUnsigned reads the exact Go scalar representation selected by the
+// compiler. It is deliberately independent of the Canonical ABI storage width:
+// a wider Go flags value must not be partially dereferenced.
+func compiledUnsigned(ct *CompiledType, ptr unsafe.Pointer) (uint64, error) {
+	if ct.GoType != nil {
+		rv := reflect.NewAt(ct.GoType, ptr).Elem()
+		if rv.CanUint() {
+			return rv.Uint(), nil
+		}
+		if rv.CanInt() {
+			value := rv.Int()
+			if value < 0 {
+				return 0, errors.New(errors.PhaseEncode, errors.KindInvalidData).
+					Detail("negative value cannot encode as an unsigned discriminant").
+					Build()
+			}
+			return uint64(value), nil
+		}
+	}
+	switch ct.GoSize {
+	case 1:
+		return uint64(*(*uint8)(ptr)), nil
+	case 2:
+		return uint64(*(*uint16)(ptr)), nil
+	case 4:
+		return uint64(*(*uint32)(ptr)), nil
+	case 8:
+		return *(*uint64)(ptr), nil
+	default:
+		return 0, errors.Unsupported(errors.PhaseEncode, "compiled scalar representation")
+	}
+}
+
+// storeCompiledUnsigned zero-extends a decoded canonical scalar into its full
+// Go representation. This clears stale high bits in a wider flags value.
+func storeCompiledUnsigned(ct *CompiledType, ptr unsafe.Pointer, value uint64) error {
+	if ct.GoType != nil {
+		rv := reflect.NewAt(ct.GoType, ptr).Elem()
+		if rv.CanUint() {
+			rv.SetUint(value)
+			return nil
+		}
+		if rv.CanInt() {
+			rv.SetInt(int64(value))
+			return nil
+		}
+	}
+	switch ct.GoSize {
+	case 1:
+		*(*uint8)(ptr) = uint8(value)
+	case 2:
+		*(*uint16)(ptr) = uint16(value)
+	case 4:
+		*(*uint32)(ptr) = uint32(value)
+	case 8:
+		*(*uint64)(ptr) = value
+	default:
+		return errors.Unsupported(errors.PhaseDecode, "compiled scalar representation")
+	}
+	return nil
+}
+
+func flagsMask(count int) uint64 {
+	if count >= 64 {
+		return ^uint64(0)
+	}
+	return (uint64(1) << count) - 1
+}
+
 type Encoder struct {
 	compiler *Compiler
 }
@@ -62,6 +156,10 @@ func (e *Encoder) EncodeParams(paramTypes []wit.Type, values []any, mem Memory, 
 	defer putBuf64(flat)
 
 	for i, paramType := range paramTypes {
+		paramPath := []string{"param[" + strconv.Itoa(i) + "]"}
+		if err := validateWITSchema(paramType, errors.PhaseEncode, paramPath); err != nil {
+			return nil, err
+		}
 		// Try compiled fast path for typed values
 		if e.tryFastEncode(paramType, values[i], flat, mem, alloc, allocList) {
 			continue
@@ -222,16 +320,12 @@ func (e *Encoder) encodeFieldToMemory(addr uint32, ct *CompiledType, ptr unsafe.
 }
 
 func (e *Encoder) encodeStringToMemory(addr uint32, s string, mem Memory, alloc Allocator, allocList *AllocationList, path []string) error {
+	dataLen, err := checkedStringLength(len(s), path)
+	if err != nil {
+		return err
+	}
 	if !utf8.ValidString(s) {
 		return errors.InvalidUTF8(errors.PhaseEncode, path, []byte(s))
-	}
-
-	dataLen := uint32(len(s))
-	if dataLen > MaxStringSize {
-		return errors.New(errors.PhaseEncode, errors.KindOverflow).
-			Path(path...).
-			Detail("string size %d exceeds maximum %d", dataLen, MaxStringSize).
-			Build()
 	}
 
 	if dataLen == 0 {
@@ -285,15 +379,24 @@ func (e *Encoder) encodeRecordToMemory(addr uint32, ct *CompiledType, ptr unsafe
 }
 
 func (e *Encoder) encodeListToMemory(addr uint32, ct *CompiledType, ptr unsafe.Pointer, mem Memory, alloc Allocator, allocList *AllocationList, path []string) error {
-	// Get slice info using reflect (avoids deprecated SliceHeader)
-	sliceVal := reflect.NewAt(reflect.SliceOf(ct.ElemType.GoType), ptr).Elem()
-	length := uint32(sliceVal.Len())
-
-	if length > MaxListLength {
-		return errors.New(errors.PhaseEncode, errors.KindOverflow).
-			Path(path...).
-			Detail("list length %d exceeds maximum %d", length, MaxListLength).
-			Build()
+	// ct.GoType owns the list representation. It must not be reconstructed from
+	// the element type because compiled elements can be shared by cached types.
+	if ct.GoType == nil || ct.GoType.Kind() != reflect.Slice {
+		return errors.Unsupported(errors.PhaseEncode, "list go type")
+	}
+	// The compiler already proved ct.GoType is the concrete slice type. Read
+	// that slice header directly so lowering avoids constructing reflect.Values
+	// and per-element reflect indexing. The header mirrors
+	// lowerListToStack; the data pointer is retained for the whole operation.
+	type sliceHeader struct {
+		Data unsafe.Pointer
+		Len  int
+		Cap  int
+	}
+	slice := (*sliceHeader)(ptr)
+	length, err := checkedListLength(slice.Len, path)
+	if err != nil {
+		return err
 	}
 
 	if length == 0 {
@@ -302,6 +405,13 @@ func (e *Encoder) encodeListToMemory(addr uint32, ct *CompiledType, ptr unsafe.P
 			return err
 		}
 		return mem.WriteU32(addr+4, 0)
+	}
+
+	if slice.Data == nil {
+		return errors.New(errors.PhaseEncode, errors.KindInvalidData).
+			Path(path...).
+			Detail("list has length %d but nil data pointer", length).
+			Build()
 	}
 
 	// Allocate space for list data
@@ -324,11 +434,13 @@ func (e *Encoder) encodeListToMemory(addr uint32, ct *CompiledType, ptr unsafe.P
 		allocList.Add(dataAddr, dataSize, ct.ElemType.WitAlign)
 	}
 
-	// Fast path for primitive types - direct memory copy
-	switch ct.ElemType.GoType.Kind() {
-	case reflect.Uint8:
+	// Layout and validation follow the WIT kind. Go kind controls only the
+	// representation used by a fast path; it must never turn char, enum, or
+	// flags into a raw numeric list.
+	switch ct.ElemType.Kind {
+	case KindU8:
 		// []byte - single bulk write
-		src := unsafe.Slice((*byte)(unsafe.Pointer(sliceVal.Index(0).UnsafeAddr())), length)
+		src := unsafe.Slice((*byte)(slice.Data), length)
 		if err := mem.Write(dataAddr, src); err != nil {
 			return err
 		}
@@ -336,8 +448,8 @@ func (e *Encoder) encodeListToMemory(addr uint32, ct *CompiledType, ptr unsafe.P
 			return err
 		}
 		return mem.WriteU32(addr+4, length)
-	case reflect.Int32, reflect.Uint32:
-		src := unsafe.Slice((*byte)(unsafe.Pointer(sliceVal.Index(0).UnsafeAddr())), length*4)
+	case KindU32, KindS32:
+		src := unsafe.Slice((*byte)(slice.Data), length*4)
 		if err := mem.Write(dataAddr, src); err != nil {
 			return err
 		}
@@ -345,8 +457,8 @@ func (e *Encoder) encodeListToMemory(addr uint32, ct *CompiledType, ptr unsafe.P
 			return err
 		}
 		return mem.WriteU32(addr+4, length)
-	case reflect.Int64, reflect.Uint64:
-		src := unsafe.Slice((*byte)(unsafe.Pointer(sliceVal.Index(0).UnsafeAddr())), length*8)
+	case KindU64, KindS64:
+		src := unsafe.Slice((*byte)(slice.Data), length*8)
 		if err := mem.Write(dataAddr, src); err != nil {
 			return err
 		}
@@ -354,10 +466,10 @@ func (e *Encoder) encodeListToMemory(addr uint32, ct *CompiledType, ptr unsafe.P
 			return err
 		}
 		return mem.WriteU32(addr+4, length)
-	case reflect.Float32:
+	case KindF32:
 		// Canonicalize NaN values per spec - cannot use fast path
 		for i := uint32(0); i < length; i++ {
-			bits := math.Float32bits(*(*float32)(unsafe.Pointer(sliceVal.Index(int(i)).UnsafeAddr())))
+			bits := math.Float32bits(*(*float32)(unsafe.Add(slice.Data, uintptr(i)*ct.ElemType.GoSize)))
 			if err := mem.WriteU32(dataAddr+i*4, abi.CanonicalizeF32(bits)); err != nil {
 				return err
 			}
@@ -366,10 +478,10 @@ func (e *Encoder) encodeListToMemory(addr uint32, ct *CompiledType, ptr unsafe.P
 			return err
 		}
 		return mem.WriteU32(addr+4, length)
-	case reflect.Float64:
+	case KindF64:
 		// Canonicalize NaN values per spec - cannot use fast path
 		for i := uint32(0); i < length; i++ {
-			bits := math.Float64bits(*(*float64)(unsafe.Pointer(sliceVal.Index(int(i)).UnsafeAddr())))
+			bits := math.Float64bits(*(*float64)(unsafe.Add(slice.Data, uintptr(i)*ct.ElemType.GoSize)))
 			if err := mem.WriteU64(dataAddr+i*8, abi.CanonicalizeF64(bits)); err != nil {
 				return err
 			}
@@ -382,7 +494,7 @@ func (e *Encoder) encodeListToMemory(addr uint32, ct *CompiledType, ptr unsafe.P
 
 	// Slow path for complex types - encode each element
 	for i := uint32(0); i < length; i++ {
-		elemPtr := unsafe.Pointer(sliceVal.Index(int(i)).UnsafeAddr())
+		elemPtr := unsafe.Add(slice.Data, uintptr(i)*ct.ElemType.GoSize)
 		var elemPath []string
 		if path != nil {
 			elemPath = append(append([]string{}, path...), "["+strconv.FormatUint(uint64(i), 10)+"]")
@@ -542,25 +654,16 @@ func (e *Encoder) encodeEnumToMemory(addr uint32, ct *CompiledType, ptr unsafe.P
 	// Enum is stored as an integer discriminant
 	discSize := abi.DiscriminantSize(len(ct.Cases))
 
-	// Read discriminant based on Go type size
-	var disc uint32
-	switch ct.GoSize {
-	case 1:
-		disc = uint32(*(*uint8)(ptr))
-	case 2:
-		disc = uint32(*(*uint16)(ptr))
-	case 4:
-		disc = *(*uint32)(ptr)
-	case 8:
-		disc = uint32(*(*uint64)(ptr))
-	default:
-		disc = *(*uint32)(ptr)
+	value, err := compiledUnsigned(ct, ptr)
+	if err != nil {
+		return err
 	}
 
 	// Validate discriminant is in bounds
-	if disc >= uint32(len(ct.Cases)) {
-		return errors.InvalidDiscriminant(errors.PhaseEncode, nil, disc, uint32(len(ct.Cases)-1))
+	if value >= uint64(len(ct.Cases)) {
+		return errors.InvalidDiscriminant(errors.PhaseEncode, nil, uint32(value), uint32(len(ct.Cases)-1))
 	}
+	disc := uint32(value)
 
 	switch discSize {
 	case 1:
@@ -574,27 +677,24 @@ func (e *Encoder) encodeEnumToMemory(addr uint32, ct *CompiledType, ptr unsafe.P
 
 func (e *Encoder) encodeFlagsToMemory(addr uint32, ct *CompiledType, ptr unsafe.Pointer, mem Memory) error {
 	numFlags := len(ct.Cases)
+	if err := validateFlagsCount(numFlags, errors.PhaseEncode, nil); err != nil {
+		return err
+	}
+	value, err := compiledUnsigned(ct, ptr)
+	if err != nil {
+		return err
+	}
+	// A Go scalar is only a representation of the declared flags. Canonical
+	// storage contains no semantic bits beyond the declaration.
+	value &= flagsMask(numFlags)
 
 	if numFlags <= 8 {
-		return mem.WriteU8(addr, *(*uint8)(ptr))
-	} else if numFlags <= 16 {
-		return mem.WriteU16(addr, *(*uint16)(ptr))
-	} else if numFlags <= 32 {
-		return mem.WriteU32(addr, *(*uint32)(ptr))
-	} else if numFlags <= 64 {
-		return mem.WriteU64(addr, *(*uint64)(ptr))
+		return mem.WriteU8(addr, uint8(value))
 	}
-
-	// >64 flags: multiple u32s per Canonical ABI spec
-	numU32s := (numFlags + 31) / 32
-	u32Ptr := (*uint32)(ptr)
-	for i := 0; i < numU32s; i++ {
-		word := *(*uint32)(unsafe.Add(unsafe.Pointer(u32Ptr), i*4))
-		if err := mem.WriteU32(addr+uint32(i*4), word); err != nil {
-			return err
-		}
+	if numFlags <= 16 {
+		return mem.WriteU16(addr, uint16(value))
 	}
-	return nil
+	return mem.WriteU32(addr, uint32(value))
 }
 
 func (e *Encoder) flattenValue(witType wit.Type, value any, mem Memory, alloc Allocator, allocList *AllocationList, flat *[]uint64, path []string) error {
@@ -779,16 +879,12 @@ func (e *Encoder) flattenString(value any, mem Memory, alloc Allocator, allocLis
 		return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "string")
 	}
 
+	dataLen, err := checkedStringLength(len(s), path)
+	if err != nil {
+		return err
+	}
 	if !utf8.ValidString(s) {
 		return errors.InvalidUTF8(errors.PhaseEncode, path, []byte(s))
-	}
-
-	dataLen := uint32(len(s))
-	if dataLen > MaxStringSize {
-		return errors.New(errors.PhaseEncode, errors.KindOverflow).
-			Path(path...).
-			Detail("string size %d exceeds maximum %d", dataLen, MaxStringSize).
-			Build()
 	}
 
 	if dataLen == 0 {
@@ -877,12 +973,9 @@ func (e *Encoder) flattenList(l *wit.List, value any, mem Memory, alloc Allocato
 		return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "slice")
 	}
 
-	length := uint32(rv.Len())
-	if length > MaxListLength {
-		return errors.New(errors.PhaseEncode, errors.KindOverflow).
-			Path(path...).
-			Detail("list length %d exceeds maximum %d", length, MaxListLength).
-			Build()
+	length, err := checkedListLength(rv.Len(), path)
+	if err != nil {
+		return err
 	}
 
 	if length == 0 {
@@ -1005,12 +1098,9 @@ func (e *Encoder) flattenList(l *wit.List, value any, mem Memory, alloc Allocato
 }
 
 func (e *Encoder) flattenByteString(s string, mem Memory, alloc Allocator, allocList *AllocationList, flat *[]uint64, path []string) error {
-	dataLen := uint32(len(s))
-	if dataLen > MaxListLength {
-		return errors.New(errors.PhaseEncode, errors.KindOverflow).
-			Path(path...).
-			Detail("list length %d exceeds maximum %d", dataLen, MaxListLength).
-			Build()
+	dataLen, err := checkedListLength(len(s), path)
+	if err != nil {
+		return err
 	}
 
 	if dataLen == 0 {
@@ -1125,11 +1215,14 @@ func (e *Encoder) flattenEnum(en *wit.Enum, value any, flat *[]uint64, path []st
 }
 
 func (e *Encoder) flattenFlags(f *wit.Flags, value any, flat *[]uint64, path []string) error {
+	if err := validateFlagsCount(len(f.Flags), errors.PhaseEncode, path); err != nil {
+		return err
+	}
 	rv := reflect.ValueOf(value)
 	if !rv.CanUint() {
 		return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "unsigned integer")
 	}
-	*flat = append(*flat, rv.Uint())
+	*flat = append(*flat, rv.Uint()&flagsMask(len(f.Flags)))
 	return nil
 }
 
@@ -1275,7 +1368,31 @@ func witFieldToGoName(witName string) string {
 // allocations). This is the memory-layout counterpart to LowerToStack and is the
 // correct primitive for retptr-style results.
 func (e *Encoder) StoreToMemory(witType wit.Type, value any, addr uint32, mem Memory, alloc Allocator, allocList *AllocationList) error {
+	if err := validateWITSchema(witType, errors.PhaseEncode, nil); err != nil {
+		return err
+	}
 	return e.storeValue(witType, value, addr, mem, alloc, allocList, nil)
+}
+
+// StoreCompiledToMemory writes a value at ptr using its compiled type ct to guest
+// linear memory at addr using Canonical ABI memory layout.
+// Both ct and ptr must be non-nil. The caller must ensure that the memory layout
+// at ptr matches the Go type that ct was compiled against.
+func (e *Encoder) StoreCompiledToMemory(addr uint32, ct *CompiledType, ptr unsafe.Pointer, mem Memory, alloc Allocator, allocList *AllocationList) error {
+	if ct == nil {
+		return errors.New(errors.PhaseEncode, errors.KindNilPointer).
+			Detail("compiled type cannot be nil").
+			Build()
+	}
+	if ptr == nil {
+		return errors.New(errors.PhaseEncode, errors.KindNilPointer).
+			Detail("data pointer cannot be nil").
+			Build()
+	}
+	if _, err := mem.Read(addr, ct.WitSize); err != nil {
+		return err
+	}
+	return e.encodeFieldToMemory(addr, ct, ptr, mem, alloc, allocList, nil)
 }
 
 func (e *Encoder) storeValue(witType wit.Type, value any, addr uint32, mem Memory, alloc Allocator, allocList *AllocationList, path []string) error {
@@ -1382,11 +1499,14 @@ func (e *Encoder) storeValue(witType wit.Type, value any, addr uint32, mem Memor
 		if !ok {
 			return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "string")
 		}
+		dataLen, err := checkedStringLength(len(s), path)
+		if err != nil {
+			return err
+		}
 		if !utf8.ValidString(s) {
 			return errors.InvalidUTF8(errors.PhaseEncode, path, []byte(s))
 		}
 		// Store string as ptr+len
-		dataLen := uint32(len(s))
 		if dataLen == 0 {
 			if err := mem.WriteU32(addr, 0); err != nil {
 				return err
@@ -1480,12 +1600,9 @@ func (e *Encoder) storeTypeDef(t *wit.TypeDef, value any, addr uint32, mem Memor
 			return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "slice")
 		}
 
-		length := uint32(rv.Len())
-		if length > MaxListLength {
-			return errors.New(errors.PhaseEncode, errors.KindOverflow).
-				Path(path...).
-				Detail("list length %d exceeds maximum %d", length, MaxListLength).
-				Build()
+		length, err := checkedListLength(rv.Len(), path)
+		if err != nil {
+			return err
 		}
 
 		if length == 0 {
@@ -1700,6 +1817,9 @@ func (e *Encoder) storeTypeDef(t *wit.TypeDef, value any, addr uint32, mem Memor
 			return errors.TypeMismatch(errors.PhaseEncode, path, typeName(value), "map[string]bool")
 		}
 		numFlags := len(kind.Flags)
+		if err := validateFlagsCount(numFlags, errors.PhaseEncode, path); err != nil {
+			return err
+		}
 		var bits uint64
 		for i, flag := range kind.Flags {
 			if m[flag.Name] {
@@ -1708,23 +1828,11 @@ func (e *Encoder) storeTypeDef(t *wit.TypeDef, value any, addr uint32, mem Memor
 		}
 		if numFlags <= 8 {
 			return mem.WriteU8(addr, uint8(bits))
-		} else if numFlags <= 16 {
+		}
+		if numFlags <= 16 {
 			return mem.WriteU16(addr, uint16(bits))
-		} else if numFlags <= 32 {
-			return mem.WriteU32(addr, uint32(bits))
-		} else if numFlags <= 64 {
-			return mem.WriteU64(addr, bits)
 		}
-
-		// >64 flags: multiple u32s per Canonical ABI spec
-		numU32s := (numFlags + 31) / 32
-		for i := 0; i < numU32s; i++ {
-			word := uint32((bits >> (i * 32)) & 0xFFFFFFFF)
-			if err := mem.WriteU32(addr+uint32(i*4), word); err != nil {
-				return err
-			}
-		}
-		return nil
+		return mem.WriteU32(addr, uint32(bits))
 
 	case *wit.Own:
 		h, ok := coerceToUint32(value)

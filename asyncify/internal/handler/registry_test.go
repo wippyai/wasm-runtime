@@ -7,6 +7,14 @@ import (
 	"github.com/wippyai/wasm-runtime/wasm"
 )
 
+func requireStoredOperand(t *testing.T, operand StackEntry, wantIndex uint32, wantType wasm.ValType) {
+	t.Helper()
+	gotIndex, stored := operand.LocalIndex()
+	if !stored || gotIndex != wantIndex || operand.Type() != wantType {
+		t.Errorf("operand = {%d, stored=%t, %#x}, want {%d, stored=true, %#x}", gotIndex, stored, operand.Type(), wantIndex, wantType)
+	}
+}
+
 func TestRegistry_RegisterAndGet(t *testing.T) {
 	r := NewRegistry()
 
@@ -139,20 +147,12 @@ func TestStack_PushPop(t *testing.T) {
 	}
 
 	// Pop in LIFO order
-	if got := s.Pop(); got != 30 {
-		t.Errorf("Pop = %d, want 30", got)
-	}
-	if got := s.Pop(); got != 20 {
-		t.Errorf("Pop = %d, want 20", got)
-	}
-	if got := s.Pop(); got != 10 {
-		t.Errorf("Pop = %d, want 10", got)
-	}
+	requireStoredOperand(t, s.Pop(), 30, wasm.ValF32)
+	requireStoredOperand(t, s.Pop(), 20, wasm.ValI64)
+	requireStoredOperand(t, s.Pop(), 10, wasm.ValI32)
 
 	// Pop from empty returns fallback
-	if got := s.Pop(); got != 99 {
-		t.Errorf("Pop from empty = %d, want 99", got)
-	}
+	requireStoredOperand(t, s.Pop(), 99, wasm.ValI32)
 }
 
 func TestStack_PopTyped(t *testing.T) {
@@ -161,21 +161,15 @@ func TestStack_PopTyped(t *testing.T) {
 	s.Push(10, wasm.ValI32)
 	s.Push(20, wasm.ValI64)
 
-	e := s.PopTyped()
-	if e.LocalIdx != 20 || e.Type != wasm.ValI64 {
-		t.Errorf("PopTyped = {%d, %#x}, want {20, i64}", e.LocalIdx, e.Type)
-	}
+	e := s.Pop()
+	requireStoredOperand(t, e, 20, wasm.ValI64)
 
-	e = s.PopTyped()
-	if e.LocalIdx != 10 || e.Type != wasm.ValI32 {
-		t.Errorf("PopTyped = {%d, %#x}, want {10, i32}", e.LocalIdx, e.Type)
-	}
+	e = s.Pop()
+	requireStoredOperand(t, e, 10, wasm.ValI32)
 
 	// From empty
-	e = s.PopTyped()
-	if e.LocalIdx != 99 || e.Type != wasm.ValI32 {
-		t.Errorf("PopTyped from empty = {%d, %#x}, want {99, i32}", e.LocalIdx, e.Type)
-	}
+	e = s.Pop()
+	requireStoredOperand(t, e, 99, wasm.ValI32)
 }
 
 func TestStack_Peek(t *testing.T) {
@@ -183,15 +177,11 @@ func TestStack_Peek(t *testing.T) {
 
 	// Peek on empty
 	e := s.Peek()
-	if e.LocalIdx != 99 {
-		t.Errorf("Peek empty = %d, want 99", e.LocalIdx)
-	}
+	requireStoredOperand(t, e, 99, wasm.ValI32)
 
 	s.Push(42, wasm.ValF64)
 	e = s.Peek()
-	if e.LocalIdx != 42 || e.Type != wasm.ValF64 {
-		t.Errorf("Peek = {%d, %#x}, want {42, f64}", e.LocalIdx, e.Type)
-	}
+	requireStoredOperand(t, e, 42, wasm.ValF64)
 
 	// Peek doesn't remove
 	if s.Len() != 1 {
@@ -217,10 +207,8 @@ func TestStack_PushI32(t *testing.T) {
 	s := NewStack(0)
 	s.PushI32(42)
 
-	e := s.PopTyped()
-	if e.LocalIdx != 42 || e.Type != wasm.ValI32 {
-		t.Errorf("PushI32 result = {%d, %#x}, want {42, i32}", e.LocalIdx, e.Type)
-	}
+	e := s.Pop()
+	requireStoredOperand(t, e, 42, wasm.ValI32)
 }
 
 func TestLocals_Alloc(t *testing.T) {
@@ -354,10 +342,7 @@ func TestContext_PushPopResult(t *testing.T) {
 		t.Errorf("stack Len = %d, want 1", stack.Len())
 	}
 
-	arg := ctx.PopArg()
-	if arg != 42 {
-		t.Errorf("PopArg = %d, want 42", arg)
-	}
+	requireStoredOperand(t, ctx.PopArg(), 42, wasm.ValF32)
 }
 
 func TestFunc_Nil(t *testing.T) {

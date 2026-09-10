@@ -21,7 +21,7 @@ func (h TableGetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	}
 
 	tmp := ctx.AllocTemp(elemType)
-	ctx.Emit.LocalGet(idx).EmitInstr(wasm.Instruction{
+	ctx.Emit.Operand(idx).EmitInstr(wasm.Instruction{
 		Opcode: wasm.OpTableGet,
 		Imm:    imm,
 	}).LocalSet(tmp)
@@ -39,7 +39,7 @@ func (h TableSetHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	val := ctx.Stack.Pop()
 	idx := ctx.Stack.Pop()
 
-	ctx.Emit.LocalGet(idx).LocalGet(val).EmitInstr(wasm.Instruction{
+	ctx.Emit.Operand(idx).Operand(val).EmitInstr(wasm.Instruction{
 		Opcode: wasm.OpTableSet,
 		Imm:    imm,
 	})
@@ -75,7 +75,7 @@ func (h RefIsNullHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	ref := ctx.Stack.Pop()
 	tmp := ctx.AllocTemp(wasm.ValI32)
 
-	ctx.Emit.LocalGet(ref).EmitInstr(wasm.Instruction{Opcode: wasm.OpRefIsNull}).LocalSet(tmp)
+	ctx.Emit.Operand(ref).EmitInstr(wasm.Instruction{Opcode: wasm.OpRefIsNull}).LocalSet(tmp)
 	ctx.Stack.Push(tmp, wasm.ValI32)
 
 	return nil
@@ -98,10 +98,14 @@ func (h RefFuncHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 type RefAsNonNullHandler struct{}
 
 func (h RefAsNonNullHandler) Handle(ctx *Context, instr wasm.Instruction) error {
-	entry := ctx.Stack.PopTyped()
-	tmp := ctx.AllocTemp(entry.Type)
-	ctx.Emit.LocalGet(entry.LocalIdx).EmitInstr(wasm.Instruction{Opcode: wasm.OpRefAsNonNull}).LocalSet(tmp)
-	ctx.Stack.Push(tmp, entry.Type)
+	entry := ctx.Stack.Pop()
+	tmp := ctx.AllocTemp(entry.Type())
+	forwarded, err := entry.MaterializedAt(tmp)
+	if err != nil {
+		return err
+	}
+	ctx.Emit.Operand(entry).EmitInstr(wasm.Instruction{Opcode: wasm.OpRefAsNonNull}).LocalSet(tmp)
+	ctx.Stack.PushOperand(forwarded)
 	return nil
 }
 
@@ -113,7 +117,7 @@ func (h RefEqHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	ref2 := ctx.Stack.Pop()
 	ref1 := ctx.Stack.Pop()
 	tmp := ctx.AllocTemp(wasm.ValI32)
-	ctx.Emit.LocalGet(ref1).LocalGet(ref2).EmitInstr(wasm.Instruction{Opcode: wasm.OpRefEq}).LocalSet(tmp)
+	ctx.Emit.Operand(ref1).Operand(ref2).EmitInstr(wasm.Instruction{Opcode: wasm.OpRefEq}).LocalSet(tmp)
 	ctx.Stack.Push(tmp, wasm.ValI32)
 	return nil
 }

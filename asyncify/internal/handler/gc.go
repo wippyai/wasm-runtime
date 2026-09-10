@@ -131,27 +131,27 @@ func (h GCHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	case wasm.GCStructGet, wasm.GCStructGetS, wasm.GCStructGetU:
 		ref := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI32) // type unknown, use i32
-		ctx.Emit.LocalGet(ref).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(ref).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI32)
 
 	// struct.set: pop value, pop structref
 	case wasm.GCStructSet:
 		val := ctx.Stack.Pop()
 		ref := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(ref).LocalGet(val).EmitInstr(instr)
+		ctx.Emit.Operand(ref).Operand(val).EmitInstr(instr)
 
 	// array.new: pop init, pop length, push arrayref
 	case wasm.GCArrayNew:
 		length := ctx.Stack.Pop()
 		init := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValFuncRef)
-		ctx.Emit.LocalGet(init).LocalGet(length).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(init).Operand(length).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValFuncRef)
 
 	case wasm.GCArrayNewDefault:
 		length := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValFuncRef)
-		ctx.Emit.LocalGet(length).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(length).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValFuncRef)
 
 	case wasm.GCArrayNewFixed:
@@ -163,7 +163,7 @@ func (h GCHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		length := ctx.Stack.Pop()
 		offset := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValFuncRef)
-		ctx.Emit.LocalGet(offset).LocalGet(length).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(offset).Operand(length).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValFuncRef)
 
 	// array.get: pop index, pop arrayref, push element
@@ -171,7 +171,7 @@ func (h GCHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		idx := ctx.Stack.Pop()
 		arr := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI32)
-		ctx.Emit.LocalGet(arr).LocalGet(idx).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(arr).Operand(idx).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI32)
 
 	// array.set: pop value, pop index, pop arrayref
@@ -179,13 +179,13 @@ func (h GCHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		val := ctx.Stack.Pop()
 		idx := ctx.Stack.Pop()
 		arr := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(arr).LocalGet(idx).LocalGet(val).EmitInstr(instr)
+		ctx.Emit.Operand(arr).Operand(idx).Operand(val).EmitInstr(instr)
 
 	// array.len: pop arrayref, push i32
 	case wasm.GCArrayLen:
 		arr := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI32)
-		ctx.Emit.LocalGet(arr).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(arr).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI32)
 
 	// array.fill: pop n, pop value, pop offset, pop arrayref
@@ -194,7 +194,7 @@ func (h GCHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		val := ctx.Stack.Pop()
 		offset := ctx.Stack.Pop()
 		arr := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(arr).LocalGet(offset).LocalGet(val).LocalGet(n).EmitInstr(instr)
+		ctx.Emit.Operand(arr).Operand(offset).Operand(val).Operand(n).EmitInstr(instr)
 
 	// array.copy: pop n, pop src_offset, pop src, pop dst_offset, pop dst
 	case wasm.GCArrayCopy:
@@ -203,7 +203,7 @@ func (h GCHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		src := ctx.Stack.Pop()
 		dstOff := ctx.Stack.Pop()
 		dst := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(dst).LocalGet(dstOff).LocalGet(src).LocalGet(srcOff).LocalGet(n).EmitInstr(instr)
+		ctx.Emit.Operand(dst).Operand(dstOff).Operand(src).Operand(srcOff).Operand(n).EmitInstr(instr)
 
 	// array.init_data/elem: pop n, pop src_offset, pop dst_offset, pop arrayref
 	case wasm.GCArrayInitData, wasm.GCArrayInitElem:
@@ -211,48 +211,48 @@ func (h GCHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		srcOff := ctx.Stack.Pop()
 		dstOff := ctx.Stack.Pop()
 		arr := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(arr).LocalGet(dstOff).LocalGet(srcOff).LocalGet(n).EmitInstr(instr)
+		ctx.Emit.Operand(arr).Operand(dstOff).Operand(srcOff).Operand(n).EmitInstr(instr)
 
 	// ref.test: pop ref, push i32
 	case wasm.GCRefTest, wasm.GCRefTestNull:
 		ref := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI32)
-		ctx.Emit.LocalGet(ref).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(ref).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI32)
 
 	// ref.cast: pop ref, push ref
 	case wasm.GCRefCast, wasm.GCRefCastNull:
 		ref := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValFuncRef)
-		ctx.Emit.LocalGet(ref).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(ref).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValFuncRef)
 
 	// br_on_cast variants: control flow with ref on stack
 	case wasm.GCBrOnCast, wasm.GCBrOnCastFail:
-		entry := ctx.Stack.PopTyped()
-		tmp := ctx.AllocTemp(entry.Type)
-		ctx.Emit.LocalGet(entry.LocalIdx).EmitInstr(instr).LocalSet(tmp)
-		ctx.Stack.Push(tmp, entry.Type)
+		entry := ctx.Stack.Pop()
+		tmp := ctx.AllocTemp(entry.Type())
+		ctx.Emit.Operand(entry).EmitInstr(instr).LocalSet(tmp)
+		ctx.Stack.Push(tmp, entry.Type())
 
 	// any.convert_extern, extern.convert_any: ref -> ref
 	case wasm.GCAnyConvertExtern, wasm.GCExternConvertAny:
 		ref := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValFuncRef)
-		ctx.Emit.LocalGet(ref).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(ref).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValFuncRef)
 
 	// ref.i31: i32 -> i31ref
 	case wasm.GCRefI31:
 		val := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValFuncRef)
-		ctx.Emit.LocalGet(val).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(val).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValFuncRef)
 
 	// i31.get_s/u: i31ref -> i32
 	case wasm.GCI31GetS, wasm.GCI31GetU:
 		ref := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI32)
-		ctx.Emit.LocalGet(ref).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(ref).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI32)
 
 	default:

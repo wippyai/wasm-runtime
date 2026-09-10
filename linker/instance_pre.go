@@ -2,12 +2,15 @@ package linker
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/wippyai/wasm-runtime/asyncify"
 	"github.com/wippyai/wasm-runtime/component"
 	"github.com/wippyai/wasm-runtime/linker/internal/graph"
+	"github.com/wippyai/wasm-runtime/wasm"
 	"go.uber.org/zap"
 )
 
@@ -17,31 +20,47 @@ import (
 // It is thread-safe: NewInstance can be called concurrently from multiple goroutines.
 // Each call creates an independent Instance with its own module instances.
 type InstancePre struct {
+	closeErr            error
+	depGraph            *graph.Graph
+	canonLifts          map[uint32]*canonLiftInfo
 	hostModuleBindings  map[string][]resolvedBinding
 	component           *component.ValidatedComponent
 	expectedGlobalTypes map[string]map[string]GlobalImport
 	linker              *Linker
 	graph               *component.InstanceGraph
-	depGraph            *graph.Graph
-	expectedFuncTypes   map[string]map[string]importSig
-	compFuncSources     map[uint32]compFuncSource
-	canonLifts          map[uint32]*canonLiftInfo
 	typeResolver        *component.TypeResolver
+	compFuncSources     map[uint32]compFuncSource
+	expectedFuncTypes   map[string]map[string]importSig
+	transformedModules  []bool
+	asyncifyAddedMemory []bool // exact transform provenance for memoryless source cores
 	bindings            []resolvedBinding
 	topoOrder           []int
 	compiled            []wazero.CompiledModule
+	ownedMemoryTypes    [][]wasm.MemoryType
 	numExports          int
 	numInstances        int
+	closeOnce           sync.Once
+	closed              atomic.Bool
+}
+
+// isCoreModuleTransformed reports whether the core module at index i was transformed
+// by the embedded asyncify transformer in this load.
+func (pre *InstancePre) isCoreModuleTransformed(i int) bool {
+	if pre == nil || i < 0 || i >= len(pre.transformedModules) {
+		return false
+	}
+	return pre.transformedModules[i]
 }
 
 // canonLiftInfo holds pre-parsed canonical lift information
 type canonLiftInfo struct {
 	CoreFuncIndex   uint32 // core function being lifted
 	TypeIndex       uint32 // component type index
-	MemoryIndex     uint32 // memory index (0 = default)
+	MemoryIndex     uint32 // memory index when HasMemory is true
 	ReallocIndex    int32  // realloc core func index (-1 = not specified)
 	PostReturnIndex int32  // post-return core func index (-1 = not specified)
 	Encoding        byte   // string encoding
+	HasMemory       bool   // distinguishes omitted memory from memory index zero
 }
 
 // resolvedBinding describes a resolved import binding
@@ -61,21 +80,37 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 	if c == nil || c.Raw == nil {
 		return nil, instError("validate", -1, "", "nil component", nil)
 	}
+	// Reject unsupported continuation edges before compiling any module or
+	// instantiating guest code. Synchronous components retain their table support.
+	if l.options.AsyncifyTransform {
+		if err := validateAsyncifyBoundaryContract(c.Raw.CoreModules); err != nil {
+			return nil, err
+		}
+	}
 
 	pre := &InstancePre{
-		linker:    l,
-		component: c,
+		linker:              l,
+		component:           c,
+		transformedModules:  make([]bool, len(c.Raw.CoreModules)),
+		asyncifyAddedMemory: make([]bool, len(c.Raw.CoreModules)),
 	}
 
 	// Compile all core modules (CoreModules is [][]byte)
 	for i, modBytes := range c.Raw.CoreModules {
 		// Rewrite empty module names in imports (wazero doesn't allow them)
 		modBytes = rewriteEmptyModuleNames(modBytes)
+		// Retain the source memory shape before transformation. This is used
+		// later to prove an Asyncify-created memory has no guest owner.
+		originalMetadata, err := wasm.ParseModuleMetadata(modBytes)
+		if err != nil {
+			return nil, instError("compile", i, "", "parse source module metadata", err)
+		}
 
 		// Apply asyncify transform if enabled and module isn't already asyncified
 		if l.options.AsyncifyTransform && !asyncify.IsAsyncified(modBytes) {
 			transformed, err := asyncify.Transform(modBytes, asyncify.Config{
-				AsyncImports: l.options.AsyncifyImports,
+				AsyncImports:  l.options.AsyncifyImports,
+				ExportGlobals: true,
 			})
 			if err != nil {
 				for j, cm := range pre.compiled {
@@ -88,9 +123,22 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 				return nil, instError("compile", i, "", "asyncify transform failed", err)
 			}
 			modBytes = transformed
+			pre.transformedModules[i] = true
 		}
 
-		compiled, err := l.runtime.CompileModule(ctx, modBytes)
+		// Inspect the final transformed binary, not the original component:
+		// Asyncify may introduce a memory even when the input had none.
+		metadata, err := wasm.ParseModuleMetadata(modBytes)
+		if err == nil && pre.transformedModules[i] && len(originalMetadata.Memories) == 0 && originalMetadata.NumImportedMemories() == 0 && len(metadata.Memories) == 1 && metadata.NumImportedMemories() == 0 {
+			// The source module was memoryless, so it could not own active data.
+			// The sole final memory was introduced by our transformer and is
+			// reserved exclusively for Asyncify runtime state.
+			pre.asyncifyAddedMemory[i] = true
+		}
+		var compiled wazero.CompiledModule
+		if err == nil {
+			compiled, err = l.runtime.CompileModule(ctx, modBytes)
+		}
 		if err != nil {
 			// Clean up already-compiled modules before returning error
 			for j, cm := range pre.compiled {
@@ -103,6 +151,7 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 			return nil, instError("compile", i, "", "module compilation failed", err)
 		}
 		pre.compiled = append(pre.compiled, compiled)
+		pre.ownedMemoryTypes = append(pre.ownedMemoryTypes, metadata.Memories)
 	}
 
 	// Build instance graph if we have core instances
@@ -379,11 +428,13 @@ func (pre *InstancePre) buildCanonLifts() map[uint32]*canonLiftInfo {
 						PostReturnIndex: -1,
 						Encoding:        canon.Parsed.GetStringEncoding(),
 					}
-					// Check for post-return option
+					// Preserve options on this exact lift; multiple lifts may share a core function and type.
 					for _, opt := range canon.Parsed.Options {
-						if opt.Kind == component.CanonOptPostReturn {
+						switch opt.Kind {
+						case component.CanonOptMemory:
+							info.HasMemory = true
+						case component.CanonOptPostReturn:
 							info.PostReturnIndex = int32(opt.Index)
-							break
 						}
 					}
 					lifts[funcIdx] = info
@@ -486,16 +537,18 @@ func (pre *InstancePre) Component() *component.ValidatedComponent {
 	return pre.component
 }
 
-// Close releases compiled module resources
+// Close releases this template's compiled handles exactly once. The descriptor
+// slice remains immutable for existing instances and concurrent readers.
 func (pre *InstancePre) Close(ctx context.Context) error {
-	var firstErr error
-	for _, cm := range pre.compiled {
-		if err := cm.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
+	pre.closeOnce.Do(func() {
+		pre.closed.Store(true)
+		for _, cm := range pre.compiled {
+			if err := cm.Close(ctx); err != nil && pre.closeErr == nil {
+				pre.closeErr = err
+			}
 		}
-	}
-	pre.compiled = nil
-	return firstErr
+	})
+	return pre.closeErr
 }
 
 // IsRequiredFromHost checks if a function must be provided by the host.

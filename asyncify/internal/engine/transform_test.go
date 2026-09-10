@@ -5,8 +5,13 @@
 package engine
 
 import (
+	"context"
+	"strings"
 	"testing"
 
+	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/experimental"
 	"github.com/wippyai/wasm-runtime/asyncify/internal/handler"
 	"github.com/wippyai/wasm-runtime/wasm"
 )
@@ -307,7 +312,7 @@ func TestFunctionTransformer_Transform_NonAsyncCallRef(t *testing.T) {
 		Tables: []wasm.TableType{
 			{ElemType: byte(wasm.ValFuncRef), Limits: wasm.Limits{Min: 1}},
 		},
-		Funcs:    []uint32{0},
+		Funcs:    []uint32{1},
 		Memories: []wasm.MemoryType{{Limits: wasm.Limits{Min: 1}}},
 		Code: []wasm.FuncBody{
 			{
@@ -374,28 +379,8 @@ func TestFunctionTransformer_Transform_IndirectCall(t *testing.T) {
 	}
 }
 
-// TestCallSite tests CallSite struct.
-func TestCallSite(t *testing.T) {
-	ft := wasm.FuncType{Params: []wasm.ValType{wasm.ValI32}, Results: []wasm.ValType{wasm.ValI32}}
-	cs := CallSite{
-		InstrIdx:   5,
-		CalleeType: &ft,
-		LiveLocals: []uint32{0, 2, 3},
-	}
-
-	if cs.InstrIdx != 5 {
-		t.Error("InstrIdx not set correctly")
-	}
-	if cs.CalleeType == nil {
-		t.Error("CalleeType not set correctly")
-	}
-	if len(cs.LiveLocals) != 3 {
-		t.Error("LiveLocals not set correctly")
-	}
-}
-
-// TestComputeLiveUnion tests live local union computation.
-func TestComputeLiveUnion(t *testing.T) {
+// TestContinuationStorageLiveUnion tests live local union computation.
+func TestContinuationStorageLiveUnion(t *testing.T) {
 	tests := []struct {
 		name      string
 		callSites []CallSite
@@ -433,9 +418,27 @@ func TestComputeLiveUnion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := computeLiveUnion(tt.callSites)
+			for i := range tt.callSites {
+				tt.callSites[i].ActionIndex = i
+			}
+			plan, err := newContinuationStorage(tt.callSites)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range tt.callSites {
+				if err := plan.capture(i, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := plan.seal(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := plan.savedLocals()
+			if err != nil {
+				t.Fatal(err)
+			}
 			if len(got) != tt.wantLen {
-				t.Errorf("computeLiveUnion() len = %d, want %d", len(got), tt.wantLen)
+				t.Errorf("savedLocals() len = %d, want %d", len(got), tt.wantLen)
 			}
 		})
 	}
@@ -861,47 +864,62 @@ func TestSimulateInstrStack_ControlFlow(t *testing.T) {
 	}
 }
 
-func TestSimulateInstrStack_RefTypeOps(t *testing.T) {
-	// Test ref.as_non_null, br_on_null, br_on_non_null
-	m := &wasm.Module{
-		Types: []wasm.FuncType{
-			{Results: []wasm.ValType{wasm.ValI32}},
+func TestFunctionTransformerRejectsUnmodeledReferenceBranchControl(t *testing.T) {
+	// Reference branch instructions have source stack simulation, but their
+	// taken control edges are not represented by the source value plan yet.
+	// Parsing transformed bytes was a false success condition: result-bearing
+	// scopes can otherwise be silently corrupted.
+	for _, tc := range []struct {
+		name   string
+		body   []wasm.Instruction
+		result int32
+		branch byte
+	}{
+		{
+			name:   "br_on_null",
+			result: -64,
+			branch: wasm.OpBrOnNull,
+			body:   []wasm.Instruction{{Opcode: wasm.OpDrop}},
 		},
-		Imports: []wasm.Import{
-			{Module: "env", Name: "async", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}},
+		{
+			name:   "br_on_non_null",
+			branch: wasm.OpBrOnNonNull,
+			result: -16,
+			body:   []wasm.Instruction{{Opcode: wasm.OpRefNull, Imm: wasm.RefNullImm{HeapType: -16}}},
 		},
-		Funcs: []uint32{0},
-		Code: []wasm.FuncBody{
-			{
-				Code: wasm.EncodeInstructions([]wasm.Instruction{
-					{Opcode: wasm.OpBlock, Imm: wasm.BlockImm{Type: -64}},
-					// ref.null + ref.as_non_null (HeapType -16 = funcref)
-					{Opcode: wasm.OpRefNull, Imm: wasm.RefNullImm{HeapType: -16}},
-					{Opcode: wasm.OpRefAsNonNull},
-					{Opcode: wasm.OpDrop},
-					// br_on_null
-					{Opcode: wasm.OpRefNull, Imm: wasm.RefNullImm{HeapType: -16}},
-					{Opcode: wasm.OpBrOnNull, Imm: wasm.BranchImm{LabelIdx: 0}},
-					{Opcode: wasm.OpDrop},
-					// br_on_non_null
-					{Opcode: wasm.OpRefNull, Imm: wasm.RefNullImm{HeapType: -16}},
-					{Opcode: wasm.OpBrOnNonNull, Imm: wasm.BranchImm{LabelIdx: 0}},
-					{Opcode: wasm.OpEnd},
-					{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}},
-					{Opcode: wasm.OpEnd},
-				}),
-			},
-		},
-	}
-
-	eng := New(Config{Matcher: newExactMatcher([]string{"env.async"})})
-	result, err := eng.Transform(m.Encode())
-	if err != nil {
-		t.Fatalf("Transform() error = %v", err)
-	}
-
-	_, err = wasm.ParseModule(result)
-	if err != nil {
-		t.Fatalf("result invalid: %v", err)
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code := []wasm.Instruction{
+				{Opcode: wasm.OpBlock, Imm: wasm.BlockImm{Type: tc.result}},
+				{Opcode: wasm.OpRefNull, Imm: wasm.RefNullImm{HeapType: -16}},
+				{Opcode: tc.branch, Imm: wasm.BranchImm{LabelIdx: 0}},
+			}
+			code = append(code, tc.body...)
+			code = append(code, wasm.Instruction{Opcode: wasm.OpEnd})
+			if tc.result != -64 {
+				code = append(code, wasm.Instruction{Opcode: wasm.OpDrop})
+			}
+			code = append(code,
+				wasm.Instruction{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}},
+				wasm.Instruction{Opcode: wasm.OpEnd},
+			)
+			m := &wasm.Module{
+				Types:   []wasm.FuncType{{}},
+				Imports: []wasm.Import{{Module: "env", Name: "async", Desc: wasm.ImportDesc{Kind: 0, TypeIdx: 0}}},
+				Funcs:   []uint32{0},
+				Code:    []wasm.FuncBody{{Code: wasm.EncodeInstructions(code)}},
+			}
+			raw := m.Encode()
+			ctx := context.Background()
+			runtime := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCoreFeatures(api.CoreFeaturesV2|experimental.CoreFeaturesTypedFunctionReferences))
+			defer runtime.Close(ctx)
+			if _, err := runtime.CompileModule(ctx, raw); err != nil {
+				t.Fatalf("rejection fixture must be valid source Wasm: %v", err)
+			}
+			result, err := New(Config{Matcher: newExactMatcher([]string{"env.async"})}).Transform(raw)
+			if result != nil || err == nil || !strings.Contains(err.Error(), "unsupported unmodeled control transfer") {
+				t.Fatalf("Transform() = (%d bytes, %v), want no output and unsupported-control error", len(result), err)
+			}
+		})
 	}
 }

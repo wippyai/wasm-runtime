@@ -1,8 +1,10 @@
 package asyncify
 
 import (
+	"context"
 	"testing"
 
+	"github.com/tetratelabs/wazero"
 	"github.com/wippyai/wasm-runtime/wasm"
 	"github.com/wippyai/wasm-runtime/wat"
 )
@@ -357,31 +359,37 @@ func TestEdge_BrIfFallthroughUsesValue(t *testing.T) {
 		t.Fatalf("Validation failed: %v", err)
 	}
 
-	out, err := wasm.ParseModule(transformed)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	instrs, err := wasm.DecodeInstructions(out.Code[0].Code)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-
-	hasBrIf := false
-	hasAdd := false
-	for _, instr := range instrs {
-		if instr.Opcode == wasm.OpBrIf {
-			hasBrIf = true
+	// The lowering may express br_if with an if plus selected-edge stores.
+	// Check the source behavior instead of requiring one opcode spelling.
+	for _, backend := range []string{"compiler", "interpreter"} {
+		for _, variant := range []struct {
+			name string
+			code []byte
+		}{{"source", wasmData}, {"transformed", transformed}} {
+			t.Run(backend+"/"+variant.name, func(t *testing.T) {
+				ctx := context.Background()
+				cfg := wazero.NewRuntimeConfigCompiler()
+				if backend == "interpreter" {
+					cfg = wazero.NewRuntimeConfigInterpreter()
+				}
+				rt := wazero.NewRuntimeWithConfig(ctx, cfg)
+				defer rt.Close(ctx)
+				_, err := rt.NewHostModuleBuilder("env").NewFunctionBuilder().WithFunc(func() uint32 { return 41 }).Export("async").Instantiate(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				mod, err := rt.Instantiate(ctx, variant.code)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, test := range []struct{ cond, want uint64 }{{0, 42}, {2, 41}} {
+					got, err := mod.ExportedFunction("test").Call(ctx, test.cond)
+					if err != nil || len(got) != 1 || got[0] != test.want {
+						t.Fatalf("cond=%d got=%v err=%v want=%d", test.cond, got, err, test.want)
+					}
+				}
+			})
 		}
-		if instr.Opcode == wasm.OpI32Add {
-			hasAdd = true
-		}
-	}
-
-	if !hasBrIf {
-		t.Error("Expected br_if in output")
-	}
-	if !hasAdd {
-		t.Error("Expected i32.add in output")
 	}
 }
 

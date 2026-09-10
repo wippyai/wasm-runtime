@@ -262,8 +262,6 @@ func TestGetStackEffect_Unknown(t *testing.T) {
 		wasm.OpReturn, // control flow
 		wasm.OpCall,   // dynamic
 		wasm.OpSelect, // handled by registry
-		wasm.OpI32Add, // handled by BinaryOpHandler
-		wasm.OpI32Eqz, // handled by UnaryOpHandler
 	}
 	for _, op := range nilOps {
 		eff := GetStackEffect(op, wasm.Instruction{Opcode: op}, nil)

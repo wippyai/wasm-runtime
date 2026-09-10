@@ -2,6 +2,7 @@ package sockets
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -161,6 +162,48 @@ func (h *TCPHost) MethodTCPSocketStartConnect(ctx context.Context, self uint32, 
 	return nil
 }
 
+func streamSetupNetworkError(err error) *NetworkError {
+	if errors.Is(err, preview2.ErrHostBufferLimit) {
+		return &NetworkError{Code: NetworkErrorOutOfMemory}
+	}
+	if errors.Is(err, preview2.ErrResourceLimit) || errors.Is(err, preview2.ErrSocketLimit) {
+		return &NetworkError{Code: NetworkErrorNewSocketLimit}
+	}
+	return &NetworkError{Code: NetworkErrorUnknown}
+}
+
+// publishInitializedTCPStreams publishes a previously admitted duplex pair.
+// On failure it closes the owning socket, which joins both pumps and releases
+// the socket-owned host-buffer charge. The caller removes any already-published
+// socket handle when this is part of accepted-connection publication.
+func (h *TCPHost) publishInitializedTCPStreams(socket *preview2.TCPSocketResource, input *preview2.TCPInputStreamResource, output *preview2.TCPOutputStreamResource) (uint32, uint32, *NetworkError) {
+	inputHandle, err := h.resources.TryAdd(input)
+	if err != nil {
+		socket.Drop()
+		return 0, 0, streamSetupNetworkError(err)
+	}
+	outputHandle, err := h.resources.TryAdd(output)
+	if err != nil {
+		h.resources.Remove(inputHandle)
+		socket.Drop()
+		return 0, 0, streamSetupNetworkError(err)
+	}
+	socket.SetStreamHandles(inputHandle, outputHandle)
+	return inputHandle, outputHandle, nil
+}
+
+// publishTCPStreams admits both fixed rings before either stream handle is
+// visible. Any failure closes the socket, joining pumps before the caller can
+// observe a partially initialized connection.
+func (h *TCPHost) publishTCPStreams(socket *preview2.TCPSocketResource) (uint32, uint32, *NetworkError) {
+	input, output, err := h.resources.NewTCPDuplexStreams(socket)
+	if err != nil {
+		socket.Drop()
+		return 0, 0, streamSetupNetworkError(err)
+	}
+	return h.publishInitializedTCPStreams(socket, input, output)
+}
+
 // [method]tcp-socket.finish-connect
 func (h *TCPHost) MethodTCPSocketFinishConnect(_ context.Context, self uint32) (uint32, uint32, *NetworkError) {
 	h.mu.Lock()
@@ -192,16 +235,7 @@ func (h *TCPHost) MethodTCPSocketFinishConnect(_ context.Context, self uint32) (
 
 	socket.SetState(preview2.TCPStateConnected)
 
-	// Create input and output streams
-	inputStream := preview2.NewTCPInputStreamResource(socket)
-	outputStream := preview2.NewTCPOutputStreamResource(socket)
-
-	inputHandle := h.resources.Add(inputStream)
-	outputHandle := h.resources.Add(outputStream)
-
-	socket.SetStreamHandles(inputHandle, outputHandle)
-
-	return inputHandle, outputHandle, nil
+	return h.publishTCPStreams(socket)
 }
 
 // [method]tcp-socket.start-listen
@@ -332,17 +366,25 @@ func (h *TCPHost) MethodTCPSocketAccept(_ context.Context, self uint32) (uint32,
 		newSocket.SetRemoteAddr(tcpAddr.IP.String(), uint16(tcpAddr.Port))
 	}
 
-	socketHandle := h.resources.Add(newSocket)
+	// Admit the complete duplex before publishing the accepted socket. This
+	// prevents a concurrent table reader from observing a child socket whose
+	// fixed host-buffer capacity was denied or only partly initialized.
+	input, output, streamErr := h.resources.NewTCPDuplexStreams(newSocket)
+	if streamErr != nil {
+		newSocket.Drop()
+		return 0, 0, 0, streamSetupNetworkError(streamErr)
+	}
 
-	// Create streams for the new socket
-	inputStream := preview2.NewTCPInputStreamResource(newSocket)
-	outputStream := preview2.NewTCPOutputStreamResource(newSocket)
-
-	inputHandle := h.resources.Add(inputStream)
-	outputHandle := h.resources.Add(outputStream)
-
-	newSocket.SetStreamHandles(inputHandle, outputHandle)
-
+	socketHandle, addErr := h.resources.TryAdd(newSocket)
+	if addErr != nil {
+		newSocket.Drop()
+		return 0, 0, 0, streamSetupNetworkError(addErr)
+	}
+	inputHandle, outputHandle, publishErr := h.publishInitializedTCPStreams(newSocket, input, output)
+	if publishErr != nil {
+		h.resources.Remove(socketHandle)
+		return 0, 0, 0, publishErr
+	}
 	return socketHandle, inputHandle, outputHandle, nil
 }
 

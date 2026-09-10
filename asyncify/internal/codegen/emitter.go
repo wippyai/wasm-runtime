@@ -57,6 +57,7 @@ const (
 // Emitter is not safe for concurrent use. Create separate instances for
 // concurrent code generation.
 type Emitter struct {
+	err error
 	buf bytes.Buffer
 }
 
@@ -84,6 +85,7 @@ func NewEmitterWithCapacity(capacity int) *Emitter {
 func GetEmitter() *Emitter {
 	e := emitterPool.Get().(*Emitter)
 	e.buf.Reset()
+	e.err = nil
 	return e
 }
 
@@ -92,6 +94,7 @@ func GetEmitter() *Emitter {
 func GetEmitterWithCapacity(capacity int) *Emitter {
 	e := emitterPool.Get().(*Emitter)
 	e.buf.Reset()
+	e.err = nil
 	if e.buf.Cap() < capacity {
 		e.buf.Grow(capacity - e.buf.Len())
 	}
@@ -105,6 +108,7 @@ func PutEmitter(e *Emitter) {
 		return
 	}
 	e.buf.Reset()
+	e.err = nil
 	emitterPool.Put(e)
 }
 
@@ -139,6 +143,7 @@ func (e *Emitter) Len() int {
 // multiple independent bytecode sequences.
 func (e *Emitter) Reset() *Emitter {
 	e.buf.Reset()
+	e.err = nil
 	return e
 }
 

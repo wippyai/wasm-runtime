@@ -317,3 +317,66 @@ func TestTransitiveCallees_Isolated(t *testing.T) {
 		t.Error("unreachable func 4 should NOT be in result")
 	}
 }
+
+// TestCallGraph_GroupNode_TransitiveCallersAndCallees tests that synthetic group nodes
+// (>= GroupNodeBase) allow reachability to flow across callers and callees, but are
+// strictly excluded from returned result sets.
+func TestCallGraph_GroupNode_TransitiveCallersAndCallees(t *testing.T) {
+	groupNode := GroupNodeBase + 42
+
+	// Topology:
+	// Caller 10 calls groupNode
+	// Caller 11 calls groupNode
+	// groupNode calls Target 1, Target 2, Target 3
+	// Caller 20 calls Caller 10 (transitive caller)
+	cg := CallGraph{
+		20:        {10},
+		10:        {groupNode},
+		11:        {groupNode},
+		groupNode: {1, 2, 3},
+	}
+
+	// 1. Backward reachability from Target 2 (e.g. an async import or target)
+	targets := map[uint32]bool{2: true}
+	callers := cg.TransitiveCallers(targets)
+
+	expectedCallers := map[uint32]bool{
+		2:  true,
+		10: true,
+		11: true,
+		20: true,
+	}
+
+	for k := range expectedCallers {
+		if !callers[k] {
+			t.Errorf("expected caller %d in TransitiveCallers result, got %v", k, callers)
+		}
+	}
+
+	// Intermediate groupNode must NEVER be returned in the function caller set
+	if callers[groupNode] {
+		t.Errorf("synthetic groupNode %d should not be present in TransitiveCallers result", groupNode)
+	}
+
+	// 2. Forward reachability from Caller 20
+	sources := map[uint32]bool{20: true}
+	callees := cg.TransitiveCallees(sources)
+
+	expectedCallees := map[uint32]bool{
+		20: true,
+		10: true,
+		1:  true,
+		2:  true,
+		3:  true,
+	}
+
+	for k := range expectedCallees {
+		if !callees[k] {
+			t.Errorf("expected callee %d in TransitiveCallees result, got %v", k, callees)
+		}
+	}
+
+	if callees[groupNode] {
+		t.Errorf("synthetic groupNode %d should not be present in TransitiveCallees result", groupNode)
+	}
+}

@@ -80,9 +80,16 @@ func TestPollHost_MethodPollableBlock(t *testing.T) {
 	p := &preview2.PollableResource{}
 	handle := resources.Add(p)
 
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	host.MethodPollableBlock(canceled, handle)
+	if p.Ready() {
+		t.Fatal("canceled block fabricated readiness")
+	}
+	p.SetReady(true)
 	host.MethodPollableBlock(ctx, handle)
 	if !p.Ready() {
-		t.Error("expected pollable to be ready after block")
+		t.Fatal("ready block lost readiness")
 	}
 }
 

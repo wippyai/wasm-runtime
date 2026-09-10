@@ -76,15 +76,19 @@ func TestVariableHandlers(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI64 {
-			t.Errorf("pushed type = %#x, want i64", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI64 {
+			t.Errorf("pushed type = %#x, want i64", e.Type())
 		}
 	})
 
 	t.Run("local.set", func(t *testing.T) {
 		ctx := newTestContext()
-		ctx.Stack.Push(10, wasm.ValI32)
+		ctx.Locals = NewLocals(6, &wasm.FuncBody{}, []wasm.ValType{
+			wasm.ValI32, wasm.ValI32, wasm.ValI32,
+			wasm.ValI32, wasm.ValI32, wasm.ValI32,
+		})
+		ctx.Stack.Push(ctx.AllocTemp(wasm.ValI32), wasm.ValI32)
 
 		h := r.Get(wasm.OpLocalSet)
 		instr := wasm.Instruction{Opcode: wasm.OpLocalSet, Imm: wasm.LocalImm{LocalIdx: 5}}
@@ -103,7 +107,7 @@ func TestVariableHandlers(t *testing.T) {
 			wasm.ValI32, wasm.ValI32, wasm.ValI32,
 			wasm.ValI32, wasm.ValI32, wasm.ValF32,
 		})
-		ctx.Stack.Push(10, wasm.ValI32)
+		ctx.Stack.Push(ctx.AllocTemp(wasm.ValF32), wasm.ValF32)
 
 		h := r.Get(wasm.OpLocalTee)
 		instr := wasm.Instruction{Opcode: wasm.OpLocalTee, Imm: wasm.LocalImm{LocalIdx: 5}}
@@ -168,9 +172,9 @@ func TestConstantHandlers(t *testing.T) {
 			if ctx.Stack.Len() != 1 {
 				t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 			}
-			e := ctx.Stack.PopTyped()
-			if e.Type != tt.wantType {
-				t.Errorf("type = %#x, want %#x", e.Type, tt.wantType)
+			e := ctx.Stack.Pop()
+			if e.Type() != tt.wantType {
+				t.Errorf("type = %#x, want %#x", e.Type(), tt.wantType)
 			}
 		})
 	}
@@ -193,9 +197,9 @@ func TestArithmeticHandlers(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("result type = %#x, want i32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("result type = %#x, want i32", e.Type())
 		}
 	})
 
@@ -223,9 +227,9 @@ func TestArithmeticHandlers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("i64.eq result type = %#x, want i32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("i64.eq result type = %#x, want i32", e.Type())
 		}
 	})
 
@@ -243,9 +247,9 @@ func TestArithmeticHandlers(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI64 {
-			t.Errorf("select result type = %#x, want i64", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI64 {
+			t.Errorf("select result type = %#x, want i64", e.Type())
 		}
 	})
 }
@@ -280,9 +284,9 @@ func TestConversionHandlers(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			e := ctx.Stack.PopTyped()
-			if e.Type != tt.outputType {
-				t.Errorf("result type = %#x, want %#x", e.Type, tt.outputType)
+			e := ctx.Stack.Pop()
+			if e.Type() != tt.outputType {
+				t.Errorf("result type = %#x, want %#x", e.Type(), tt.outputType)
 			}
 		})
 	}
@@ -308,9 +312,9 @@ func TestMemoryHandlers(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("load result type = %#x, want i32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("load result type = %#x, want i32", e.Type())
 		}
 	})
 
@@ -327,9 +331,9 @@ func TestMemoryHandlers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI64 {
-			t.Errorf("load result type = %#x, want i64", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI64 {
+			t.Errorf("load result type = %#x, want i64", e.Type())
 		}
 	})
 
@@ -399,9 +403,9 @@ func TestGlobalGetHandler_TypeLookup(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("expected i32 type, got %#x", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("expected i32 type, got %#x", e.Type())
 		}
 	})
 
@@ -419,9 +423,9 @@ func TestGlobalGetHandler_TypeLookup(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI64 {
-			t.Errorf("expected i64 type, got %#x", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI64 {
+			t.Errorf("expected i64 type, got %#x", e.Type())
 		}
 	})
 
@@ -439,9 +443,9 @@ func TestGlobalGetHandler_TypeLookup(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValF64 {
-			t.Errorf("expected f64 type, got %#x", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValF64 {
+			t.Errorf("expected f64 type, got %#x", e.Type())
 		}
 	})
 
@@ -463,9 +467,9 @@ func TestGlobalGetHandler_TypeLookup(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI64 {
-			t.Errorf("expected i64 type for imported global, got %#x", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI64 {
+			t.Errorf("expected i64 type for imported global, got %#x", e.Type())
 		}
 	})
 }
@@ -473,85 +477,45 @@ func TestGlobalGetHandler_TypeLookup(t *testing.T) {
 func TestGlobalSetHandler(t *testing.T) {
 	r := NewRegistry()
 	RegisterVariableHandlers(r)
-
 	ctx := newTestContext()
+	ctx.Module = &wasm.Module{Globals: []wasm.Global{{Type: wasm.GlobalType{ValType: wasm.ValI32, Mutable: true}}}}
 	ctx.Stack.Push(42, wasm.ValI32)
-
-	h := r.Get(wasm.OpGlobalSet)
-	instr := wasm.Instruction{Opcode: wasm.OpGlobalSet, Imm: wasm.GlobalImm{GlobalIdx: 0}}
-	if err := h.Handle(ctx, instr); err != nil {
+	if err := r.Get(wasm.OpGlobalSet).Handle(ctx, wasm.Instruction{Opcode: wasm.OpGlobalSet, Imm: wasm.GlobalImm{GlobalIdx: 0}}); err != nil {
 		t.Fatal(err)
 	}
-
 	if !ctx.Stack.IsEmpty() {
 		t.Error("global.set should pop from stack")
 	}
 }
 
-func TestGlobalGetHandler_NilModule(t *testing.T) {
+func TestGlobalHandlerRejectsInvalidMetadata(t *testing.T) {
 	r := NewRegistry()
 	RegisterVariableHandlers(r)
-
+	for _, module := range []*wasm.Module{
+		nil,
+		{},
+		{Imports: []wasm.Import{{Desc: wasm.ImportDesc{Kind: wasm.KindGlobal}}}},
+	} {
+		for _, opcode := range []byte{wasm.OpGlobalGet, wasm.OpGlobalSet} {
+			ctx := newTestContext()
+			ctx.Module = module
+			ctx.Stack.Push(42, wasm.ValI32)
+			if err := r.Get(opcode).Handle(ctx, wasm.Instruction{Opcode: opcode, Imm: wasm.GlobalImm{GlobalIdx: 0}}); err == nil {
+				t.Fatal("invalid global metadata accepted")
+			}
+			if ctx.Stack.Len() != 1 || ctx.Emit.Len() != 0 {
+				t.Fatal("rejection mutated stack or emitted code")
+			}
+		}
+	}
 	ctx := newTestContext()
-	ctx.Module = nil // no module metadata
-
-	h := r.Get(wasm.OpGlobalGet)
-	instr := wasm.Instruction{Opcode: wasm.OpGlobalGet, Imm: wasm.GlobalImm{GlobalIdx: 0}}
-	if err := h.Handle(ctx, instr); err != nil {
-		t.Fatal(err)
+	ctx.Module = &wasm.Module{Globals: []wasm.Global{{Type: wasm.GlobalType{ValType: wasm.ValI32}}}}
+	ctx.Stack.Push(42, wasm.ValI32)
+	if err := r.Get(wasm.OpGlobalSet).Handle(ctx, wasm.Instruction{Opcode: wasm.OpGlobalSet, Imm: wasm.GlobalImm{GlobalIdx: 0}}); err == nil {
+		t.Fatal("immutable write accepted")
 	}
-
-	// Should default to i32 when module is nil
-	e := ctx.Stack.PopTyped()
-	if e.Type != wasm.ValI32 {
-		t.Errorf("expected i32 default type when module is nil, got %#x", e.Type)
-	}
-}
-
-func TestGlobalGetHandler_NilGlobalDescriptor(t *testing.T) {
-	r := NewRegistry()
-	RegisterVariableHandlers(r)
-
-	ctx := newTestContext()
-	ctx.Module = &wasm.Module{
-		Imports: []wasm.Import{
-			{Module: "env", Name: "g", Desc: wasm.ImportDesc{Kind: 3, Global: nil}}, // nil Global descriptor
-		},
-	}
-
-	h := r.Get(wasm.OpGlobalGet)
-	instr := wasm.Instruction{Opcode: wasm.OpGlobalGet, Imm: wasm.GlobalImm{GlobalIdx: 0}}
-	if err := h.Handle(ctx, instr); err != nil {
-		t.Fatal(err)
-	}
-
-	// Should default to i32 when Global descriptor is nil
-	e := ctx.Stack.PopTyped()
-	if e.Type != wasm.ValI32 {
-		t.Errorf("expected i32 default type when Global is nil, got %#x", e.Type)
-	}
-}
-
-func TestGlobalGetHandler_OutOfRange(t *testing.T) {
-	r := NewRegistry()
-	RegisterVariableHandlers(r)
-
-	ctx := newTestContext()
-	ctx.Module = &wasm.Module{
-		Imports: []wasm.Import{},
-		Globals: []wasm.Global{},
-	}
-
-	h := r.Get(wasm.OpGlobalGet)
-	instr := wasm.Instruction{Opcode: wasm.OpGlobalGet, Imm: wasm.GlobalImm{GlobalIdx: 999}} // out of range
-	if err := h.Handle(ctx, instr); err != nil {
-		t.Fatal(err)
-	}
-
-	// Should default to i32 when global index is out of range
-	e := ctx.Stack.PopTyped()
-	if e.Type != wasm.ValI32 {
-		t.Errorf("expected i32 default type for out-of-range global, got %#x", e.Type)
+	if ctx.Stack.Len() != 1 || ctx.Emit.Len() != 0 {
+		t.Fatal("immutable rejection mutated state")
 	}
 }
 
@@ -596,9 +560,9 @@ func TestSelectTypeHandler(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValF64 {
-			t.Errorf("select_t result type = %#x, want f64", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValF64 {
+			t.Errorf("select_t result type = %#x, want f64", e.Type())
 		}
 	})
 }
@@ -644,9 +608,9 @@ func TestSaturatingTruncationHandlers(t *testing.T) {
 			if ctx.Stack.Len() != 1 {
 				t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 			}
-			e := ctx.Stack.PopTyped()
-			if e.Type != tt.outputType {
-				t.Errorf("result type = %#x, want %#x", e.Type, tt.outputType)
+			e := ctx.Stack.Pop()
+			if e.Type() != tt.outputType {
+				t.Errorf("result type = %#x, want %#x", e.Type(), tt.outputType)
 			}
 		})
 	}
@@ -799,9 +763,9 @@ func TestBulkMemoryHandler(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("type = %#x, want i32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("type = %#x, want i32", e.Type())
 		}
 	})
 
@@ -881,9 +845,9 @@ func TestReferenceHandlers(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValFuncRef {
-			t.Errorf("result type = %#x, want funcref", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValFuncRef {
+			t.Errorf("result type = %#x, want funcref", e.Type())
 		}
 	})
 
@@ -903,9 +867,9 @@ func TestReferenceHandlers(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValExtern {
-			t.Errorf("result type = %#x, want externref", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValExtern {
+			t.Errorf("result type = %#x, want externref", e.Type())
 		}
 	})
 
@@ -937,9 +901,9 @@ func TestReferenceHandlers(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValFuncRef {
-			t.Errorf("ref.null funcref type = %#x, want funcref", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValFuncRef {
+			t.Errorf("ref.null funcref type = %#x, want funcref", e.Type())
 		}
 	})
 
@@ -952,9 +916,9 @@ func TestReferenceHandlers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValExtern {
-			t.Errorf("ref.null externref type = %#x, want externref", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValExtern {
+			t.Errorf("ref.null externref type = %#x, want externref", e.Type())
 		}
 	})
 
@@ -968,9 +932,9 @@ func TestReferenceHandlers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("ref.is_null result = %#x, want i32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("ref.is_null result = %#x, want i32", e.Type())
 		}
 	})
 
@@ -983,9 +947,9 @@ func TestReferenceHandlers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValFuncRef {
-			t.Errorf("ref.func type = %#x, want funcref", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValFuncRef {
+			t.Errorf("ref.func type = %#x, want funcref", e.Type())
 		}
 	})
 
@@ -999,9 +963,9 @@ func TestReferenceHandlers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValFuncRef {
-			t.Errorf("ref.as_non_null preserves type, got %#x", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValFuncRef {
+			t.Errorf("ref.as_non_null preserves type, got %#x", e.Type())
 		}
 	})
 
@@ -1016,9 +980,9 @@ func TestReferenceHandlers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("ref.eq result = %#x, want i32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("ref.eq result = %#x, want i32", e.Type())
 		}
 	})
 }
@@ -1049,9 +1013,9 @@ func TestSIMDHandler(t *testing.T) {
 		if ctx.Stack.Len() != 1 {
 			t.Errorf("stack len = %d, want 1", ctx.Stack.Len())
 		}
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("v128.const type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("v128.const type = %#x, want v128", e.Type())
 		}
 	})
 
@@ -1068,9 +1032,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("v128.load type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("v128.load type = %#x, want v128", e.Type())
 		}
 	})
 
@@ -1106,9 +1070,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("i8x16.splat type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("i8x16.splat type = %#x, want v128", e.Type())
 		}
 	})
 
@@ -1125,9 +1089,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("i32x4.extract_lane type = %#x, want i32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("i32x4.extract_lane type = %#x, want i32", e.Type())
 		}
 	})
 
@@ -1144,9 +1108,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValF64 {
-			t.Errorf("f64x2.extract_lane type = %#x, want f64", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValF64 {
+			t.Errorf("f64x2.extract_lane type = %#x, want f64", e.Type())
 		}
 	})
 
@@ -1164,9 +1128,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("i8x16.shuffle type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("i8x16.shuffle type = %#x, want v128", e.Type())
 		}
 	})
 
@@ -1183,9 +1147,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("v128.any_true type = %#x, want i32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("v128.any_true type = %#x, want i32", e.Type())
 		}
 	})
 
@@ -1204,9 +1168,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("v128.bitselect type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("v128.bitselect type = %#x, want v128", e.Type())
 		}
 	})
 
@@ -1224,9 +1188,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("i32x4.replace_lane type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("i32x4.replace_lane type = %#x, want v128", e.Type())
 		}
 	})
 
@@ -1243,9 +1207,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI64 {
-			t.Errorf("i64x2.extract_lane type = %#x, want i64", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI64 {
+			t.Errorf("i64x2.extract_lane type = %#x, want i64", e.Type())
 		}
 	})
 
@@ -1262,9 +1226,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValF32 {
-			t.Errorf("f32x4.extract_lane type = %#x, want f32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValF32 {
+			t.Errorf("f32x4.extract_lane type = %#x, want f32", e.Type())
 		}
 	})
 
@@ -1282,9 +1246,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("i8x16.swizzle type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("i8x16.swizzle type = %#x, want v128", e.Type())
 		}
 	})
 
@@ -1301,9 +1265,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValI32 {
-			t.Errorf("i8x16.bitmask type = %#x, want i32", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValI32 {
+			t.Errorf("i8x16.bitmask type = %#x, want i32", e.Type())
 		}
 	})
 
@@ -1321,9 +1285,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("i8x16.add type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("i8x16.add type = %#x, want v128", e.Type())
 		}
 	})
 
@@ -1340,9 +1304,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("i8x16.neg type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("i8x16.neg type = %#x, want v128", e.Type())
 		}
 	})
 
@@ -1360,9 +1324,9 @@ func TestSIMDHandler(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		e := ctx.Stack.PopTyped()
-		if e.Type != wasm.ValV128 {
-			t.Errorf("v128.load8_lane type = %#x, want v128", e.Type)
+		e := ctx.Stack.Pop()
+		if e.Type() != wasm.ValV128 {
+			t.Errorf("v128.load8_lane type = %#x, want v128", e.Type())
 		}
 	})
 

@@ -179,17 +179,21 @@ func createMediumModule(numFuncs int) *wasm.Module {
 
 	for i := 0; i < numFuncs; i++ {
 		m.Funcs[i] = uint32(i % 3)
+		instructions := []wasm.Instruction{
+			{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: int32(i)}},
+			{Opcode: wasm.OpLocalSet, Imm: wasm.LocalImm{LocalIdx: 0}},
+			{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}},
+			{Opcode: wasm.OpLocalGet, Imm: wasm.LocalImm{LocalIdx: 0}},
+			{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
+			{Opcode: wasm.OpI32Add},
+		}
+		if m.Funcs[i] == 0 {
+			instructions = append(instructions, wasm.Instruction{Opcode: wasm.OpDrop})
+		}
+		instructions = append(instructions, wasm.Instruction{Opcode: wasm.OpEnd})
 		m.Code[i] = wasm.FuncBody{
 			Locals: []wasm.LocalEntry{{Count: 3, ValType: wasm.ValI32}},
-			Code: wasm.EncodeInstructions([]wasm.Instruction{
-				{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: int32(i)}},
-				{Opcode: wasm.OpLocalSet, Imm: wasm.LocalImm{LocalIdx: 0}},
-				{Opcode: wasm.OpCall, Imm: wasm.CallImm{FuncIdx: 0}}, // async call
-				{Opcode: wasm.OpLocalGet, Imm: wasm.LocalImm{LocalIdx: 0}},
-				{Opcode: wasm.OpI32Const, Imm: wasm.I32Imm{Value: 1}},
-				{Opcode: wasm.OpI32Add},
-				{Opcode: wasm.OpEnd},
-			}),
+			Code:   wasm.EncodeInstructions(instructions),
 		}
 	}
 

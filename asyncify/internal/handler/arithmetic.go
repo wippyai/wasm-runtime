@@ -31,11 +31,14 @@ type BinaryOpHandler struct {
 }
 
 func (h BinaryOpHandler) Handle(ctx *Context, instr wasm.Instruction) error {
+	if err := checkScalarBinding(instr, h.Opcode, h.ResultType, 2); err != nil {
+		return err
+	}
 	rhs := ctx.Stack.Pop()
 	lhs := ctx.Stack.Pop()
 	tmp := ctx.AllocTemp(h.ResultType)
 
-	ctx.Emit.LocalGet(lhs).LocalGet(rhs).EmitRawOpcode(h.Opcode).LocalSet(tmp)
+	ctx.Emit.Operand(lhs).Operand(rhs).EmitRawOpcode(h.Opcode).LocalSet(tmp)
 	ctx.Stack.Push(tmp, h.ResultType)
 
 	return nil
@@ -43,7 +46,7 @@ func (h BinaryOpHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 
 // StackEffect implements StackEffecter.
 func (h BinaryOpHandler) StackEffect() StackEffect {
-	return StackEffect{Pops: 2, Pushes: []wasm.ValType{h.ResultType}}
+	return scalarStackEffect(h.Opcode)
 }
 
 // UnaryOpHandler processes operations that consume one value and produce one.
@@ -64,10 +67,13 @@ type UnaryOpHandler struct {
 }
 
 func (h UnaryOpHandler) Handle(ctx *Context, instr wasm.Instruction) error {
+	if err := checkScalarBinding(instr, h.Opcode, h.ResultType, 1); err != nil {
+		return err
+	}
 	operand := ctx.Stack.Pop()
 	tmp := ctx.AllocTemp(h.ResultType)
 
-	ctx.Emit.LocalGet(operand).EmitRawOpcode(h.Opcode).LocalSet(tmp)
+	ctx.Emit.Operand(operand).EmitRawOpcode(h.Opcode).LocalSet(tmp)
 	ctx.Stack.Push(tmp, h.ResultType)
 
 	return nil
@@ -75,7 +81,7 @@ func (h UnaryOpHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 
 // StackEffect implements StackEffecter.
 func (h UnaryOpHandler) StackEffect() StackEffect {
-	return StackEffect{Pops: 1, Pushes: []wasm.ValType{h.ResultType}}
+	return scalarStackEffect(h.Opcode)
 }
 
 // SelectHandler implements WebAssembly's conditional select operation.
@@ -94,13 +100,13 @@ type SelectHandler struct{}
 
 func (h SelectHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	cond := ctx.Stack.Pop()
-	falseVal := ctx.Stack.PopTyped()
+	falseVal := ctx.Stack.Pop()
 	trueVal := ctx.Stack.Pop()
 
-	tmp := ctx.AllocTemp(falseVal.Type)
+	tmp := ctx.AllocTemp(falseVal.Type())
 
-	ctx.Emit.LocalGet(trueVal).LocalGet(falseVal.LocalIdx).LocalGet(cond).Select().LocalSet(tmp)
-	ctx.Stack.Push(tmp, falseVal.Type)
+	ctx.Emit.Operand(trueVal).Operand(falseVal).Operand(cond).Select().LocalSet(tmp)
+	ctx.Stack.Push(tmp, falseVal.Type())
 
 	return nil
 }
@@ -114,18 +120,18 @@ type SelectTypeHandler struct{}
 
 func (h SelectTypeHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	cond := ctx.Stack.Pop()
-	falseVal := ctx.Stack.PopTyped()
+	falseVal := ctx.Stack.Pop()
 	trueVal := ctx.Stack.Pop()
 
 	// Use the type from the immediate if available, otherwise use stack type
-	resultType := falseVal.Type
+	resultType := falseVal.Type()
 	if imm, ok := instr.Imm.(wasm.SelectTypeImm); ok && len(imm.Types) > 0 {
 		resultType = imm.Types[0]
 	}
 
 	tmp := ctx.AllocTemp(resultType)
 
-	ctx.Emit.LocalGet(trueVal).LocalGet(falseVal.LocalIdx).LocalGet(cond).EmitInstr(instr).LocalSet(tmp)
+	ctx.Emit.Operand(trueVal).Operand(falseVal).Operand(cond).EmitInstr(instr).LocalSet(tmp)
 	ctx.Stack.Push(tmp, resultType)
 
 	return nil

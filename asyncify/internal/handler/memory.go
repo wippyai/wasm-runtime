@@ -32,7 +32,7 @@ func (h LoadHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	addr := ctx.Stack.Pop()
 	tmp := ctx.AllocTemp(h.ResultType)
 
-	ctx.Emit.LocalGet(addr).EmitInstr(wasm.Instruction{
+	ctx.Emit.Operand(addr).EmitInstr(wasm.Instruction{
 		Opcode: h.Opcode,
 		Imm:    imm,
 	}).LocalSet(tmp)
@@ -61,7 +61,7 @@ func (h StoreHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	value := ctx.Stack.Pop()
 	addr := ctx.Stack.Pop()
 
-	ctx.Emit.LocalGet(addr).LocalGet(value).EmitInstr(wasm.Instruction{
+	ctx.Emit.Operand(addr).Operand(value).EmitInstr(wasm.Instruction{
 		Opcode: h.Opcode,
 		Imm:    imm,
 	})
@@ -104,7 +104,7 @@ func (h MemoryGrowHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 	delta := ctx.Stack.Pop()
 	tmp := ctx.AllocTemp(wasm.ValI32)
 
-	ctx.Emit.LocalGet(delta).MemoryGrow().LocalSet(tmp)
+	ctx.Emit.Operand(delta).MemoryGrow().LocalSet(tmp)
 	ctx.Stack.Push(tmp, wasm.ValI32)
 
 	return nil
@@ -215,21 +215,21 @@ func (h BulkMemoryHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		n := ctx.Stack.Pop()
 		s := ctx.Stack.Pop()
 		d := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(d).LocalGet(s).LocalGet(n).EmitInstr(instr)
+		ctx.Emit.Operand(d).Operand(s).Operand(n).EmitInstr(instr)
 
 	case wasm.MiscMemoryFill:
 		// memory.fill: (d, v, n) -> ()
 		n := ctx.Stack.Pop()
 		v := ctx.Stack.Pop()
 		d := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(d).LocalGet(v).LocalGet(n).EmitInstr(instr)
+		ctx.Emit.Operand(d).Operand(v).Operand(n).EmitInstr(instr)
 
 	case wasm.MiscMemoryInit:
 		// memory.init: (d, s, n) -> ()
 		n := ctx.Stack.Pop()
 		s := ctx.Stack.Pop()
 		d := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(d).LocalGet(s).LocalGet(n).EmitInstr(instr)
+		ctx.Emit.Operand(d).Operand(s).Operand(n).EmitInstr(instr)
 
 	case wasm.MiscDataDrop:
 		// data.drop: () -> ()
@@ -240,7 +240,7 @@ func (h BulkMemoryHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		n := ctx.Stack.Pop()
 		s := ctx.Stack.Pop()
 		d := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(d).LocalGet(s).LocalGet(n).EmitInstr(instr)
+		ctx.Emit.Operand(d).Operand(s).Operand(n).EmitInstr(instr)
 
 	case wasm.MiscElemDrop:
 		// elem.drop: () -> ()
@@ -251,14 +251,14 @@ func (h BulkMemoryHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		n := ctx.Stack.Pop()
 		s := ctx.Stack.Pop()
 		d := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(d).LocalGet(s).LocalGet(n).EmitInstr(instr)
+		ctx.Emit.Operand(d).Operand(s).Operand(n).EmitInstr(instr)
 
 	case wasm.MiscTableGrow:
 		// table.grow: (init, n) -> (i32)
 		n := ctx.Stack.Pop()
 		init := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI32)
-		ctx.Emit.LocalGet(init).LocalGet(n).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(init).Operand(n).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI32)
 
 	case wasm.MiscTableSize:
@@ -272,21 +272,21 @@ func (h BulkMemoryHandler) Handle(ctx *Context, instr wasm.Instruction) error {
 		n := ctx.Stack.Pop()
 		v := ctx.Stack.Pop()
 		d := ctx.Stack.Pop()
-		ctx.Emit.LocalGet(d).LocalGet(v).LocalGet(n).EmitInstr(instr)
+		ctx.Emit.Operand(d).Operand(v).Operand(n).EmitInstr(instr)
 
 	// Saturating truncation operations: (f32/f64) -> (i32/i64)
 	case wasm.MiscI32TruncSatF32S, wasm.MiscI32TruncSatF32U,
 		wasm.MiscI32TruncSatF64S, wasm.MiscI32TruncSatF64U:
 		operand := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI32)
-		ctx.Emit.LocalGet(operand).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(operand).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI32)
 
 	case wasm.MiscI64TruncSatF32S, wasm.MiscI64TruncSatF32U,
 		wasm.MiscI64TruncSatF64S, wasm.MiscI64TruncSatF64U:
 		operand := ctx.Stack.Pop()
 		tmp := ctx.AllocTemp(wasm.ValI64)
-		ctx.Emit.LocalGet(operand).EmitInstr(instr).LocalSet(tmp)
+		ctx.Emit.Operand(operand).EmitInstr(instr).LocalSet(tmp)
 		ctx.Stack.Push(tmp, wasm.ValI64)
 
 	default:

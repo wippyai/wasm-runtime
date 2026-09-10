@@ -378,62 +378,84 @@ func (m *Module) GetFuncType(funcIdx uint32) *FuncType {
 		for i, imp := range m.Imports {
 			if imp.Desc.Kind == KindFunc {
 				if funcIdx == 0 {
-					return m.getFuncTypeByIdx(m.Imports[i].Desc.TypeIdx)
+					return m.GetFuncTypeByTypeIndex(m.Imports[i].Desc.TypeIdx)
 				}
 				funcIdx--
 			}
 		}
 	}
 	localIdx := funcIdx - numImported
-	if int(localIdx) >= len(m.Funcs) {
+	if uint64(localIdx) >= uint64(len(m.Funcs)) {
 		return nil
 	}
-	return m.getFuncTypeByIdx(m.Funcs[localIdx])
+	return m.GetFuncTypeByTypeIndex(m.Funcs[localIdx])
 }
 
-// getFuncTypeByIdx returns the function type at the given type index.
-// For GC modules with TypeDefs, it extracts the func type from the typedef.
-// Note: rec groups expand into multiple type indices in the flat space.
-func (m *Module) getFuncTypeByIdx(typeIdx uint32) *FuncType {
-	// GC modules: look up in TypeDefs with flat index expansion
-	if len(m.TypeDefs) > 0 {
-		flatIdx := uint32(0)
-		for i := range m.TypeDefs {
-			td := &m.TypeDefs[i]
-			switch td.Kind {
-			case TypeDefKindFunc:
-				if flatIdx == typeIdx {
-					return td.Func
-				}
-				flatIdx++
-			case TypeDefKindSub:
-				if flatIdx == typeIdx {
-					if td.Sub.CompType.Kind == CompKindFunc {
-						return td.Sub.CompType.Func
-					}
-					return nil
-				}
-				flatIdx++
-			case TypeDefKindRec:
+// GetFuncTypeByTypeIndex returns a function signature from the flat type index
+// space, or nil for a missing or non-function type. Returned metadata is borrowed.
+func (m *Module) GetFuncTypeByTypeIndex(typeIdx uint32) *FuncType {
+	if len(m.TypeDefs) == 0 {
+		if uint64(typeIdx) >= uint64(len(m.Types)) {
+			return nil
+		}
+		return &m.Types[typeIdx]
+	}
+	var result *FuncType
+	m.RangeFunctionTypes(func(index uint32, signature *FuncType) bool {
+		if index != typeIdx {
+			return true
+		}
+		result = signature
+		return false
+	})
+	return result
+}
+
+// RangeFunctionTypes visits the flat type index space in order. Non-function
+// types yield nil signatures, preserving their indices. Returning false stops
+// traversal. Signatures are borrowed; consumers needing a snapshot must copy.
+// A single traversal is linear even when recursive type groups are present.
+func (m *Module) RangeFunctionTypes(yield func(uint32, *FuncType) bool) {
+	if len(m.TypeDefs) == 0 {
+		for i := range m.Types {
+			if !yield(uint32(i), &m.Types[i]) {
+				return
+			}
+		}
+		return
+	}
+	var index uint32
+	visitSub := func(sub *SubType) bool {
+		var signature *FuncType
+		if sub != nil && sub.CompType.Kind == CompKindFunc {
+			signature = sub.CompType.Func
+		}
+		more := yield(index, signature)
+		index++
+		return more
+	}
+	for i := range m.TypeDefs {
+		td := &m.TypeDefs[i]
+		switch td.Kind {
+		case TypeDefKindFunc:
+			if !yield(index, td.Func) {
+				return
+			}
+			index++
+		case TypeDefKindSub:
+			if !visitSub(td.Sub) {
+				return
+			}
+		case TypeDefKindRec:
+			if td.Rec != nil {
 				for j := range td.Rec.Types {
-					if flatIdx == typeIdx {
-						if td.Rec.Types[j].CompType.Kind == CompKindFunc {
-							return td.Rec.Types[j].CompType.Func
-						}
-						return nil
+					if !visitSub(&td.Rec.Types[j]) {
+						return
 					}
-					flatIdx++
 				}
 			}
 		}
-		return nil
 	}
-
-	// Simple module: direct lookup
-	if int(typeIdx) >= len(m.Types) {
-		return nil
-	}
-	return &m.Types[typeIdx]
 }
 
 // AddType adds a function type and returns its index, reusing existing if equal

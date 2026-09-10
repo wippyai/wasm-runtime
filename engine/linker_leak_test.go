@@ -2,19 +2,111 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
+
+	"go.bytecodealliance.org/wit"
 )
 
-// TestBridgeModuleCleanup verifies that bridge modules are properly closed
-// when all instances using them are closed, by measuring memory.
+// instanceCleanupViolations inspects a WazeroInstance and the parent WazeroEngine
+// to deterministically verify that all resources associated with the instance were
+// properly cleaned up.
+//
+// If expectBridgeAlive is true (e.g. when surviving instances still share the bridge),
+// the bridge module is expected to remain registered in Wazero runtime.
+// If expectBridgeAlive is false (final instance closed), the bridge module must be
+// deregistered and closed in Wazero runtime.
+func instanceCleanupViolations(
+	engine *WazeroEngine,
+	inst *WazeroInstance,
+	coreModNames []string,
+	bridgeNames []string,
+	expectBridgeAlive bool,
+) []string {
+	var violations []string
+
+	// 1. Core modules must be closed and deregistered from Wazero runtime
+	for _, name := range coreModNames {
+		if engine.runtime.Module(name) != nil {
+			violations = append(violations, fmt.Sprintf("core module %q still registered in runtime", name))
+		}
+	}
+
+	// 2. Bridge modules check in Wazero runtime
+	for _, name := range bridgeNames {
+		mod := engine.runtime.Module(name)
+		if expectBridgeAlive {
+			if mod == nil {
+				violations = append(violations, fmt.Sprintf("bridge module %q was prematurely closed in runtime while surviving instances exist", name))
+			}
+		} else {
+			if mod != nil {
+				violations = append(violations, fmt.Sprintf("bridge module %q still registered in runtime after final close", name))
+			}
+		}
+	}
+
+	// 3. Instance struct reference clearing
+	if inst.linkerInst != nil {
+		violations = append(violations, "inst.linkerInst is not nil")
+	}
+	if inst.instance != nil {
+		violations = append(violations, "inst.instance is not nil")
+	}
+	if inst.memory != nil {
+		violations = append(violations, "inst.memory is not nil")
+	}
+	if inst.allocFn != nil {
+		violations = append(violations, "inst.allocFn is not nil")
+	}
+	if inst.freeFn != nil {
+		violations = append(violations, "inst.freeFn is not nil")
+	}
+	if inst.alloc != nil {
+		violations = append(violations, "inst.alloc is not nil")
+	}
+	if inst.resources != nil {
+		violations = append(violations, "inst.resources is not nil")
+	}
+	if inst.exportBindings != nil {
+		violations = append(violations, "inst.exportBindings is not nil")
+	}
+	if inst.allocatorCache != nil {
+		violations = append(violations, "inst.allocatorCache is not nil")
+	}
+	if inst.memoryCache != nil {
+		violations = append(violations, "inst.memoryCache is not nil")
+	}
+	if inst.asyncifyCache != nil {
+		violations = append(violations, "inst.asyncifyCache is not nil")
+	}
+	if inst.activeSession != nil {
+		violations = append(violations, "inst.activeSession is not nil")
+	}
+
+	// 4. Memory reporting state
+	if inst.HasMemory() {
+		violations = append(violations, "inst.HasMemory() is true")
+	}
+	if sz := inst.MemorySize(); sz != 0 {
+		violations = append(violations, fmt.Sprintf("inst.MemorySize() = %d, want 0", sz))
+	}
+
+	return violations
+}
+
+// TestBridgeModuleCleanup checks registration, shared bridge lifetime, and
+// detachment of instance-owned references. Process-wide heap deltas cannot
+// establish this contract: stock Wazero 1.12 may retain closed compiler buffers
+// in its sorted-module slice until overwritten or runtime close. Memory trends
+// belong in isolated, repeated load measurements, not a fixed heap-delta gate.
 func TestBridgeModuleCleanup(t *testing.T) {
 	ctx := context.Background()
-
 	wasmBytes := getCalculatorComponent(t)
 
-	// Create engine with fresh runtime
 	engine, err := NewWazeroEngine(ctx)
 	if err != nil {
 		t.Fatalf("create engine: %v", err)
@@ -25,129 +117,304 @@ func TestBridgeModuleCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load module: %v", err)
 	}
-
-	// Warm up to stabilize allocations
-	for i := 0; i < 3; i++ {
-		inst, _ := mod.Instantiate(ctx)
-		if inst != nil {
-			inst.Close(ctx)
-		}
+	if err := mod.RegisterHostFuncTyped("wisma:calculator/host@0.1.0", "log", func(string) {}); err != nil {
+		t.Fatalf("register log host func: %v", err)
 	}
-	runtime.GC()
+	if err := mod.RegisterHostFuncTyped("wisma:calculator/host@0.1.0", "compute", func(a, b uint32) uint32 { return a + b }); err != nil {
+		t.Fatalf("register compute host func: %v", err)
+	}
 
-	var mBefore runtime.MemStats
-	runtime.ReadMemStats(&mBefore)
+	hostBridge := "wisma:calculator/host@0.1.0"
 
-	// Create instance - this creates core modules and potentially bridges
+	t.Run("SingleInstanceLifecycleAndTeardown", func(t *testing.T) {
+		inst, err := mod.Instantiate(ctx)
+		if err != nil {
+			t.Fatalf("instantiate: %v", err)
+		}
+		if inst.linkerInst == nil {
+			t.Fatal("expected non-nil linkerInst on multi-module component")
+		}
+		if !inst.HasMemory() || inst.MemorySize() == 0 {
+			t.Fatalf("expected active memory before close, got HasMemory=%v size=%d", inst.HasMemory(), inst.MemorySize())
+		}
+
+		// Collect core module names
+		coreMods := inst.linkerInst.Modules()
+		if len(coreMods) == 0 {
+			t.Fatal("expected core modules instantiated for calculator component")
+		}
+		coreNames := make([]string, len(coreMods))
+		for i, m := range coreMods {
+			coreNames[i] = m.Name()
+			if engine.runtime.Module(m.Name()) == nil {
+				t.Fatalf("core module %q not registered in runtime during instance lifetime", m.Name())
+			}
+		}
+
+		// Verify bridge module is registered in runtime
+		if engine.runtime.Module(hostBridge) == nil {
+			t.Fatalf("bridge module %q not registered in runtime during instance lifetime", hostBridge)
+		}
+
+		// Verify functional execution
+		got, err := inst.CallWithTypes(ctx, "process", []wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, uint32(5), uint32(3))
+		if err != nil || got != uint32(15) {
+			t.Fatalf("process call result = %v, err = %v, want 15", got, err)
+		}
+
+		// Close instance
+		if err := inst.Close(ctx); err != nil {
+			t.Fatalf("close instance: %v", err)
+		}
+
+		// Assert deterministic cleanup
+		violations := instanceCleanupViolations(engine, inst, coreNames, []string{hostBridge}, false)
+		if len(violations) > 0 {
+			t.Errorf("cleanup violations after single instance close: %v", violations)
+		}
+
+		// Assert post-close call fails
+		_, callErr := inst.CallWithTypes(ctx, "process", []wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, uint32(5), uint32(3))
+		if callErr == nil {
+			t.Error("expected error calling process on closed instance, got nil")
+		}
+	})
+
+	t.Run("MultiInstanceSurvivorBridgeRetentionAndTeardown", func(t *testing.T) {
+		first, err := mod.Instantiate(ctx)
+		if err != nil {
+			t.Fatalf("instantiate first: %v", err)
+		}
+		survivor, err := mod.Instantiate(ctx)
+		if err != nil {
+			t.Fatalf("instantiate survivor: %v", err)
+		}
+
+		firstMods := make([]string, len(first.linkerInst.Modules()))
+		for i, m := range first.linkerInst.Modules() {
+			firstMods[i] = m.Name()
+		}
+		survivorMods := make([]string, len(survivor.linkerInst.Modules()))
+		for i, m := range survivor.linkerInst.Modules() {
+			survivorMods[i] = m.Name()
+		}
+
+		// Both instances execute successfully
+		for _, inst := range []*WazeroInstance{first, survivor} {
+			got, err := inst.CallWithTypes(ctx, "process", []wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, uint32(5), uint32(3))
+			if err != nil || got != uint32(15) {
+				t.Fatalf("call on open instance: %v, err=%v", got, err)
+			}
+		}
+
+		// Close first instance
+		if err := first.Close(ctx); err != nil {
+			t.Fatalf("close first: %v", err)
+		}
+
+		// First instance must be cleaned up, but bridge must SURVIVE for survivor
+		violationsFirst := instanceCleanupViolations(engine, first, firstMods, []string{hostBridge}, true)
+		if len(violationsFirst) > 0 {
+			t.Errorf("first instance cleanup violations (expecting bridge alive): %v", violationsFirst)
+		}
+
+		// Bridge module must still be registered in Wazero runtime
+		if engine.runtime.Module(hostBridge) == nil {
+			t.Fatalf("bridge module %q was prematurely closed while survivor is alive", hostBridge)
+		}
+
+		// Survivor must remain fully functional
+		got, err := survivor.CallWithTypes(ctx, "process", []wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, uint32(5), uint32(3))
+		if err != nil || got != uint32(15) {
+			t.Fatalf("call on survivor after first close: %v, err=%v", got, err)
+		}
+
+		// Close survivor instance (final reference)
+		if err := survivor.Close(ctx); err != nil {
+			t.Fatalf("close survivor: %v", err)
+		}
+
+		// Survivor instance must be cleaned up AND bridge must be closed
+		violationsSurvivor := instanceCleanupViolations(engine, survivor, survivorMods, []string{hostBridge}, false)
+		if len(violationsSurvivor) > 0 {
+			t.Errorf("survivor instance cleanup violations (expecting bridge closed): %v", violationsSurvivor)
+		}
+
+		// Bridge module must now be completely gone from runtime
+		if mod := engine.runtime.Module(hostBridge); mod != nil {
+			t.Fatalf("bridge module %q still registered in runtime after all instances closed", hostBridge)
+		}
+	})
+
+	t.Run("ReinstantiationAfterAllClosed", func(t *testing.T) {
+		fresh, err := mod.Instantiate(ctx)
+		if err != nil {
+			t.Fatalf("instantiate fresh: %v", err)
+		}
+		freshMods := make([]string, len(fresh.linkerInst.Modules()))
+		for i, m := range fresh.linkerInst.Modules() {
+			freshMods[i] = m.Name()
+		}
+
+		// Bridge module is recreated
+		if engine.runtime.Module(hostBridge) == nil {
+			t.Fatalf("bridge module %q not created for fresh instance", hostBridge)
+		}
+
+		got, err := fresh.CallWithTypes(ctx, "process", []wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, uint32(5), uint32(3))
+		if err != nil || got != uint32(15) {
+			t.Fatalf("fresh process call: %v, err=%v", got, err)
+		}
+
+		if err := fresh.Close(ctx); err != nil {
+			t.Fatalf("close fresh: %v", err)
+		}
+
+		violations := instanceCleanupViolations(engine, fresh, freshMods, []string{hostBridge}, false)
+		if len(violations) > 0 {
+			t.Errorf("cleanup violations after fresh instance close: %v", violations)
+		}
+	})
+}
+
+// TestBridgeCleanup_FailsOnMissingCleanup verifies that instanceCleanupViolations
+// correctly fails and pinpoints missing cleanup if an instance or its modules
+// are left unclosed, ensuring the test suite guards against real Wippy lifecycle bugs.
+func TestBridgeCleanup_FailsOnMissingCleanup(t *testing.T) {
+	ctx := context.Background()
+	wasmBytes := getCalculatorComponent(t)
+
+	engine, err := NewWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	mod, err := engine.LoadModule(ctx, wasmBytes)
+	if err != nil {
+		t.Fatalf("load module: %v", err)
+	}
+	if err := mod.RegisterHostFuncTyped("wisma:calculator/host@0.1.0", "log", func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mod.RegisterHostFuncTyped("wisma:calculator/host@0.1.0", "compute", func(a, b uint32) uint32 { return a + b }); err != nil {
+		t.Fatal(err)
+	}
+
+	hostBridge := "wisma:calculator/host@0.1.0"
 	inst, err := mod.Instantiate(ctx)
 	if err != nil {
 		t.Fatalf("instantiate: %v", err)
 	}
+	defer inst.Close(ctx)
 
-	var mDuring runtime.MemStats
-	runtime.ReadMemStats(&mDuring)
-	instanceMemory := int64(mDuring.HeapAlloc) - int64(mBefore.HeapAlloc)
-	t.Logf("Memory used by instance: %d KB", instanceMemory/1024)
-
-	// Close the instance
-	if err := inst.Close(ctx); err != nil {
-		t.Fatalf("close instance: %v", err)
+	coreMods := make([]string, len(inst.linkerInst.Modules()))
+	for i, m := range inst.linkerInst.Modules() {
+		coreMods[i] = m.Name()
 	}
 
-	// Force GC to clean up
-	runtime.GC()
-	runtime.GC()
+	// 1. Evaluate cleanup verification on the active (unclosed) instance.
+	// This represents a real Wippy bug where cleanup was omitted.
+	violations := instanceCleanupViolations(engine, inst, coreMods, []string{hostBridge}, false)
+	if len(violations) == 0 {
+		t.Fatal("expected cleanup verification to detect violations on unclosed instance, but got 0")
+	}
 
-	var mAfter runtime.MemStats
-	runtime.ReadMemStats(&mAfter)
+	// Ensure all key lifecycle violations are detected
+	hasCoreReg := false
+	hasBridgeReg := false
+	hasLinkerInst := false
+	hasActiveMemory := false
+	for _, v := range violations {
+		if strings.Contains(v, "core module") && strings.Contains(v, "still registered") {
+			hasCoreReg = true
+		}
+		if strings.Contains(v, "bridge module") && strings.Contains(v, "still registered") {
+			hasBridgeReg = true
+		}
+		if strings.Contains(v, "linkerInst is not nil") {
+			hasLinkerInst = true
+		}
+		if strings.Contains(v, "HasMemory() is true") {
+			hasActiveMemory = true
+		}
+	}
 
-	retained := int64(mAfter.HeapAlloc) - int64(mBefore.HeapAlloc)
-	t.Logf("Memory retained after close: %d KB", retained/1024)
+	if !hasCoreReg {
+		t.Error("expected violation for core module still registered in runtime")
+	}
+	if !hasBridgeReg {
+		t.Error("expected violation for bridge module still registered in runtime")
+	}
+	if !hasLinkerInst {
+		t.Error("expected violation for linkerInst retained")
+	}
+	if !hasActiveMemory {
+		t.Error("expected violation for active memory retained")
+	}
 
-	// After closing the only instance, most memory should be released
-	// Allow 64KB for internal caches, but flag if we retain most of instance memory
-	if retained > 64*1024 && retained > instanceMemory/2 {
-		t.Errorf("Memory not properly released: instance used %d KB, retained %d KB after close",
-			instanceMemory/1024, retained/1024)
+	// 2. Now perform proper close and verify all violations are resolved
+	if err := inst.Close(ctx); err != nil {
+		t.Fatalf("proper close: %v", err)
+	}
+
+	cleanViolations := instanceCleanupViolations(engine, inst, coreMods, []string{hostBridge}, false)
+	if len(cleanViolations) > 0 {
+		t.Fatalf("expected 0 violations after proper Close, got %d: %v", len(cleanViolations), cleanViolations)
 	}
 }
 
-// TestBridgeModuleRefCounting verifies that shared bridge modules are only
-// released when all instances using them are closed.
+// TestBridgeModuleRefCounting verifies deterministic bridge lifecycle and survivor behavior:
+// when multiple instances share bridge modules, closing one instance must leave surviving
+// instances fully functional. Shared bridge modules and resources must only be released when
+// all instances using them are closed.
 func TestBridgeModuleRefCounting(t *testing.T) {
 	ctx := context.Background()
-
-	wasmBytes := getCalculatorComponent(t)
-
 	engine, err := NewWazeroEngine(ctx)
 	if err != nil {
-		t.Fatalf("create engine: %v", err)
+		t.Fatal(err)
 	}
 	defer engine.Close(ctx)
-
-	mod, err := engine.LoadModule(ctx, wasmBytes)
+	mod, err := engine.LoadModule(ctx, getCalculatorComponent(t))
 	if err != nil {
-		t.Fatalf("load module: %v", err)
+		t.Fatal(err)
 	}
-
-	// Warm up
-	for i := 0; i < 3; i++ {
-		inst, _ := mod.Instantiate(ctx)
-		if inst != nil {
-			inst.Close(ctx)
+	if err = mod.RegisterHostFuncTyped("wisma:calculator/host@0.1.0", "log", func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err = mod.RegisterHostFuncTyped("wisma:calculator/host@0.1.0", "compute", func(a, b uint32) uint32 { return a + b }); err != nil {
+		t.Fatal(err)
+	}
+	first, err := mod.Instantiate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close(ctx)
+	survivor, err := mod.Instantiate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer survivor.Close(ctx)
+	if err = first.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for n := 0; n < 2; n++ {
+		got, callErr := survivor.CallWithTypes(ctx, "process", []wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, uint32(5), uint32(3))
+		if callErr != nil || got != uint32(15) {
+			t.Fatalf("surviving process: result=%v err=%v", got, callErr)
 		}
 	}
-	runtime.GC()
-
-	var mBefore runtime.MemStats
-	runtime.ReadMemStats(&mBefore)
-
-	// Create two instances from same module - they should share bridges
-	inst1, err := mod.Instantiate(ctx)
+	if err = survivor.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := mod.Instantiate(ctx)
 	if err != nil {
-		t.Fatalf("instantiate 1: %v", err)
+		t.Fatal(err)
 	}
-
-	inst2, err := mod.Instantiate(ctx)
-	if err != nil {
-		t.Fatalf("instantiate 2: %v", err)
-	}
-
-	var mWithTwo runtime.MemStats
-	runtime.ReadMemStats(&mWithTwo)
-	twoInstanceMem := int64(mWithTwo.HeapAlloc) - int64(mBefore.HeapAlloc)
-	t.Logf("Memory with two instances: %d KB", twoInstanceMem/1024)
-
-	// Close first instance
-	if err := inst1.Close(ctx); err != nil {
-		t.Fatalf("close instance 1: %v", err)
-	}
-	runtime.GC()
-
-	var mAfterFirst runtime.MemStats
-	runtime.ReadMemStats(&mAfterFirst)
-	afterFirstClose := int64(mAfterFirst.HeapAlloc) - int64(mBefore.HeapAlloc)
-	t.Logf("Memory after closing first: %d KB", afterFirstClose/1024)
-
-	// Should have released roughly half the memory (one instance worth)
-	// But shared bridges should remain for inst2
-
-	// Close second instance
-	if err := inst2.Close(ctx); err != nil {
-		t.Fatalf("close instance 2: %v", err)
-	}
-	runtime.GC()
-	runtime.GC()
-
-	var mAfterBoth runtime.MemStats
-	runtime.ReadMemStats(&mAfterBoth)
-	afterBothClose := int64(mAfterBoth.HeapAlloc) - int64(mBefore.HeapAlloc)
-	t.Logf("Memory after closing both: %d KB", afterBothClose/1024)
-
-	// Now all memory should be released
-	if afterBothClose > 64*1024 && afterBothClose > twoInstanceMem/4 {
-		t.Errorf("Memory not released after both closed: started with %d KB, retained %d KB",
-			twoInstanceMem/1024, afterBothClose/1024)
+	defer fresh.Close(ctx)
+	got, err := fresh.CallWithTypes(ctx, "process", []wit.Type{wit.U32{}, wit.U32{}}, []wit.Type{wit.U32{}}, uint32(5), uint32(3))
+	if err != nil || got != uint32(15) {
+		t.Fatalf("fresh process after all close: result=%v err=%v", got, err)
 	}
 }
 
@@ -274,10 +541,23 @@ func TestLinearMemoryRelease(t *testing.T) {
 	runtime.ReadMemStats(&mDuring)
 	sysDuring := mDuring.Sys
 	sysGrowth := int64(sysDuring) - int64(sysBefore)
-	t.Logf("System memory growth during instance: %d KB", sysGrowth/1024)
+	if !inst.HasMemory() || inst.MemorySize() == 0 {
+		t.Fatalf("expected active memory before close, got HasMemory=%v size=%d", inst.HasMemory(), inst.MemorySize())
+	}
 
 	// Close and GC
-	inst.Close(ctx)
+	if err := inst.Close(ctx); err != nil {
+		t.Fatalf("close instance: %v", err)
+	}
+	if inst.HasMemory() {
+		t.Error("expected inst.HasMemory() == false after close")
+	}
+	if sz := inst.MemorySize(); sz != 0 {
+		t.Errorf("expected inst.MemorySize() == 0 after close, got %d", sz)
+	}
+	if inst.memory != nil {
+		t.Error("expected inst.memory == nil after close")
+	}
 	runtime.GC()
 	runtime.GC()
 

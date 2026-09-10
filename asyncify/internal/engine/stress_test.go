@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
+	"github.com/tetratelabs/wazero"
 	"github.com/wippyai/wasm-runtime/wasm"
 	"github.com/wippyai/wasm-runtime/wat"
 )
@@ -152,6 +155,7 @@ var stressTests = []stressTestCase{
 			(func (export "test") (param $x i32) (result i32)
 				(block $out (result i32)
 					(br_if $out (call $async) (local.get $x))
+                    (drop)
 					(i32.const 99)))
 			(memory 1))`,
 		async: []string{"env.async"},
@@ -365,6 +369,7 @@ var stressTests = []stressTestCase{
 					(block $inner (result i32)
 						(call $async)
 						(br $outer))
+                    (drop)
 					(i32.const 99)))
 			(memory 1))`,
 		async: []string{"env.async"},
@@ -380,6 +385,7 @@ var stressTests = []stressTestCase{
 						(br_if $outer (local.get $cond))
 						(drop)
 						(i32.const 42))
+                    (drop)
 					(i32.const 99)))
 			(memory 1))`,
 		async: []string{"env.async"},
@@ -511,6 +517,7 @@ var stressTests = []stressTestCase{
 					(call $async)
 					(local.tee $i)
 					(br_if $L (i32.eqz (local.get $i)))
+                    (drop)
 					(local.get $i)))
 			(memory 1))`,
 		async: []string{"env.async"},
@@ -830,7 +837,7 @@ var stressTests = []stressTestCase{
 					(loop $continue
 						(local.set $i (i32.add (local.get $i) (i32.const 1)))
 						(local.set $sum (i32.add (local.get $sum) (call $async)))
-						(br_if $break (i32.ge_u (local.get $i) (local.get $n)))
+						(br_if $break (local.get $sum) (i32.ge_u (local.get $i) (local.get $n)))
 						(br $continue))
 					(local.get $sum)))
 			(memory 1))`,
@@ -953,10 +960,16 @@ func TestStress_AllCases(t *testing.T) {
 
 // TestStress_CompareBinaryen compares output structure with Binaryen.
 func TestStress_CompareBinaryen(t *testing.T) {
-	if _, err := exec.LookPath("wasm-opt"); err != nil {
-		if _, err := os.Stat("/tmp/binaryen-version_121/bin/wasm-opt"); err != nil {
-			t.Skip("wasm-opt not found")
+	wasmOpt := os.Getenv("WASM_OPT")
+	if wasmOpt == "" {
+		wasmOpt = "wasm-opt"
+	}
+	wasmOpt, err := exec.LookPath(wasmOpt)
+	if err != nil {
+		if os.Getenv("WASM_OPT") != "" {
+			t.Fatalf("configured WASM_OPT is unavailable: %v", err)
 		}
+		t.Skip("wasm-opt not found; install it or set WASM_OPT")
 	}
 
 	for _, tc := range stressTests[:5] { // Test first 5 for speed
@@ -972,10 +985,9 @@ func TestStress_CompareBinaryen(t *testing.T) {
 				t.Fatalf("our Transform() error = %v", err)
 			}
 
-			binResult, err := binaryenTransform(wasmBytes)
+			binResult, err := binaryenTransform(t, wasmOpt, wasmBytes)
 			if err != nil {
-				t.Logf("Binaryen transform failed (may be expected): %v", err)
-				return
+				t.Fatalf("Binaryen transform failed: %v", err)
 			}
 
 			if err := validateWasm(ourResult); err != nil {
@@ -985,11 +997,21 @@ func TestStress_CompareBinaryen(t *testing.T) {
 				t.Errorf("Binaryen output invalid: %v", err)
 			}
 
-			ourExports := countExports(ourResult)
-			binExports := countExports(binResult)
-
-			if ourExports != binExports {
-				t.Logf("export count differs: ours=%d, binaryen=%d", ourExports, binExports)
+			for label, data := range map[string][]byte{"candidate": ourResult, "binaryen": binResult} {
+				parsed, err := wasm.ParseModule(data)
+				if err != nil {
+					t.Fatalf("%s metadata: %v", label, err)
+				}
+				exports := make(map[string]byte)
+				for _, export := range parsed.Exports {
+					exports[export.Name] = export.Kind
+				}
+				for _, name := range []string{"test", "asyncify_start_unwind", "asyncify_stop_unwind", "asyncify_start_rewind", "asyncify_stop_rewind", "asyncify_get_state"} {
+					kind, ok := exports[name]
+					if !ok || kind != wasm.KindFunc {
+						t.Errorf("%s missing function export %s", label, name)
+					}
+				}
 			}
 		})
 	}
@@ -1000,42 +1022,27 @@ func parseWAT(watSrc string) ([]byte, error) {
 }
 
 func validateWasm(data []byte) error {
-	_, err := wasm.ParseModule(data)
+	ctx := context.Background()
+	runtime := wazero.NewRuntime(ctx)
+	defer runtime.Close(ctx)
+	_, err := runtime.CompileModule(ctx, data)
 	return err
 }
 
-func binaryenTransform(data []byte) ([]byte, error) {
-	// Write to temp file
-	tmpIn := "/tmp/stress_in.wasm"
-	tmpOut := "/tmp/stress_out.wasm"
-	if err := os.WriteFile(tmpIn, data, 0644); err != nil {
+func binaryenTransform(t *testing.T, wasmOpt string, data []byte) ([]byte, error) {
+	t.Helper()
+	dir := t.TempDir()
+	tmpIn, tmpOut := filepath.Join(dir, "in.wasm"), filepath.Join(dir, "out.wasm")
+	if err := os.WriteFile(tmpIn, data, 0600); err != nil {
 		return nil, err
 	}
-
-	// Try system wasm-opt first, then known location
-	wasmOpt := "wasm-opt"
-	if _, err := exec.LookPath(wasmOpt); err != nil {
-		wasmOpt = "/tmp/binaryen-version_121/bin/wasm-opt"
-	}
-
-	cmd := exec.CommandContext(context.TODO(), wasmOpt, tmpIn, "--asyncify", "-o", tmpOut)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, wasmOpt, tmpIn, "--asyncify", "-o", tmpOut)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("%s", output)
+		return nil, fmt.Errorf("wasm-opt: %w: %s", err, output)
 	}
-
 	return os.ReadFile(tmpOut)
-}
-
-func countExports(data []byte) int {
-	// Simple heuristic: count export section entries
-	// Real implementation would parse properly
-	count := 0
-	for i := 0; i < len(data)-1; i++ {
-		if data[i] == 0x07 { // export section
-			count++
-		}
-	}
-	return count
 }
 
 func dumpWasm(t *testing.T, data []byte, name string) {

@@ -233,9 +233,9 @@ func TestCalculateFlags(t *testing.T) {
 		{"16_flags", 16, 2, 2},
 		{"17_flags", 17, 4, 4},
 		{"32_flags", 32, 4, 4},
-		{"33_flags", 33, 8, 8},
-		{"64_flags", 64, 8, 8},
-		{"65_flags", 65, 12, 4},
+		{"33_flags_invalid", 33, 0, 1},
+		{"64_flags_invalid", 64, 0, 1},
+		{"65_flags_invalid", 65, 0, 1},
 	}
 
 	for _, tc := range tests {

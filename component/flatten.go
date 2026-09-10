@@ -148,9 +148,6 @@ func flattenArenaType(t interface{}) []CoreValType {
 		return append(discrim, payload...)
 
 	case arena.Flags:
-		if v.Count > 32 {
-			return []CoreValType{api.ValueTypeI64}
-		}
 		return []CoreValType{api.ValueTypeI32}
 
 	case arena.Enum:
@@ -292,11 +289,9 @@ func flattenResult(r *wit.Result) []CoreValType {
 	return append(discrim, payload...)
 }
 
-// flattenFlags flattens to i32 (<=32 flags) or i64 (>32 flags)
+// flattenFlags flattens canonical flags to i32. Component schema validation
+// admits only declarations with one through 32 labels.
 func flattenFlags(f *wit.Flags) []CoreValType {
-	if len(f.Flags) > 32 {
-		return []CoreValType{api.ValueTypeI64}
-	}
 	return []CoreValType{api.ValueTypeI32}
 }
 

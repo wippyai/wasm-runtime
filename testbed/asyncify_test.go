@@ -125,9 +125,8 @@ func TestAsyncify_ProcessLines(t *testing.T) {
 	memory = mod.Memory()
 
 	// Initialize asyncify
-	err = asyncify.Init(mod)
-	if err != nil {
-		t.Fatalf("init asyncify: %v", err)
+	if err := initDemoAsyncify(wasmBytes, asyncify, mod); err != nil {
+		t.Fatal(err)
 	}
 
 	// Get process_lines function
@@ -209,9 +208,8 @@ func TestAsyncify_SumNumbers(t *testing.T) {
 
 	memory = mod.Memory()
 
-	err = asyncify.Init(mod)
-	if err != nil {
-		t.Fatalf("init asyncify: %v", err)
+	if err := initDemoAsyncify(wasmBytes, asyncify, mod); err != nil {
+		t.Fatal(err)
 	}
 
 	sumNumbers := mod.ExportedFunction("sum_numbers")
@@ -304,7 +302,7 @@ func TestAsyncify_MultipleInstances(t *testing.T) {
 
 			memory = mod.Memory()
 
-			if err := asyncify.Init(mod); err != nil {
+			if err := initDemoAsyncify(wasmBytes, asyncify, mod); err != nil {
 				results <- result{id: id, err: err}
 				return
 			}

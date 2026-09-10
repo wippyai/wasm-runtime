@@ -28,7 +28,6 @@ func TestFlattenType_Primitives(t *testing.T) {
 		{"f64", wit.F64{}, []CoreValType{api.ValueTypeF64}},
 		{"string", wit.String{}, []CoreValType{api.ValueTypeI32, api.ValueTypeI32}},
 	}
-
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			result := FlattenType(tc.typ)
@@ -300,20 +299,12 @@ func TestFlattenType_Flags(t *testing.T) {
 }
 
 func TestFlattenType_FlagsLarge(t *testing.T) {
-	// > 32 flags should use i64
-	var flagsList []wit.Flag
+	var names []string
 	for i := 0; i < 40; i++ {
-		flagsList = append(flagsList, wit.Flag{Name: string(rune('a' + i))})
+		names = append(names, string(rune('a'+i)))
 	}
-
-	flags := &wit.TypeDef{
-		Kind: &wit.Flags{Flags: flagsList},
-	}
-
-	result := FlattenType(flags)
-	expected := []CoreValType{api.ValueTypeI64}
-	if len(result) != 1 || result[0] != expected[0] {
-		t.Errorf("expected [i64] for >32 flags, got %v", result)
+	if _, err := NewTypeResolverWithInstances(nil, nil).Resolve(FlagsType{Names: names}); err == nil {
+		t.Fatal("expected resolver to reject flags with more than 32 labels")
 	}
 }
 
@@ -555,13 +546,6 @@ func TestFlattenArenaType_Flags(t *testing.T) {
 	result := flattenArenaType(flags)
 	if len(result) != 1 || result[0] != api.ValueTypeI32 {
 		t.Errorf("expected [i32], got %v", result)
-	}
-
-	// > 32 flags
-	flags = arena.Flags{Count: 64}
-	result = flattenArenaType(flags)
-	if len(result) != 1 || result[0] != api.ValueTypeI64 {
-		t.Errorf("expected [i64] for >32 flags, got %v", result)
 	}
 }
 

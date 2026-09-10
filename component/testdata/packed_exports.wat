@@ -1,0 +1,15 @@
+(component
+  (core module $m
+    (func (export "f") (result i32) i32.const 0)
+  )
+  (core instance $ci (instantiate $m))
+  (alias core export $ci "f" (core func $f))
+  (type $ty (func (result u32)))
+  (func $lifted (type $ty) (canon lift (core func $f)))
+  (instance $inst (export "x" (func $lifted)))
+  (export "lib" (core module $m))
+  (export "call-peek" (func $lifted))
+  (export "the-type" (type $ty))
+  (export "host" (instance $inst))
+  (export "wasi:cli/run@0.2.0" (func $lifted))
+)

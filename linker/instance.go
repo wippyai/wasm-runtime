@@ -8,9 +8,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/wippyai/wasm-runtime/asyncify"
 	"github.com/wippyai/wasm-runtime/component"
 	"github.com/wippyai/wasm-runtime/linker/internal/bridge"
 	"github.com/wippyai/wasm-runtime/linker/internal/invoke"
@@ -28,6 +30,46 @@ var instanceRegistry sync.Map // map[uint64]*Instance
 // instanceContextKey is the context key for the active instance.
 // Used by host handlers when the caller module lacks an instanceID suffix.
 type instanceContextKey struct{}
+
+// InstanceContext carries an optional active Instance through a context chain.
+//
+// It is a value type so callers that already allocate a context wrapper can
+// embed it and retain the private-key lookup contract without a second
+// context.WithValue allocation. A nil instance delegates to the parent, which
+// preserves the existing behavior of callers that have no owned instance.
+// Use WithInstance when an explicit nil value must shadow an instance in the
+// parent chain.
+type InstanceContext struct {
+	parent   context.Context
+	instance *Instance
+}
+
+// NewInstanceContext constructs an immutable context carrier for inst. parent
+// must not be nil. A nil inst deliberately delegates instance lookup to parent.
+func NewInstanceContext(parent context.Context, inst *Instance) InstanceContext {
+	if parent == nil {
+		panic("cannot create context from nil parent")
+	}
+	return InstanceContext{parent: parent, instance: inst}
+}
+
+// Deadline delegates to the parent context.
+func (c InstanceContext) Deadline() (time.Time, bool) { return c.parent.Deadline() }
+
+// Done delegates to the parent context.
+func (c InstanceContext) Done() <-chan struct{} { return c.parent.Done() }
+
+// Err delegates to the parent context.
+func (c InstanceContext) Err() error { return c.parent.Err() }
+
+// Value returns the owned instance for the linker's private lookup key and
+// delegates every other lookup to the parent context.
+func (c InstanceContext) Value(key any) any {
+	if _, ok := key.(instanceContextKey); ok && c.instance != nil {
+		return c.instance
+	}
+	return c.parent.Value(key)
+}
 
 // InstanceFromContext extracts the instance from context, or nil if not present.
 func InstanceFromContext(ctx context.Context) *Instance {
@@ -74,6 +116,107 @@ func lookupInstanceFromCaller(caller api.Module) *Instance {
 	return nil
 }
 
+// virtualHostKey identifies a function-only virtual host export by import
+// namespace and export name so distinct component layouts can share an interface.
+type virtualHostKey struct {
+	namespace string
+	name      string
+}
+
+func (inst *Instance) registerVirtualHostFn(namespace, name string, fn api.GoModuleFunc) {
+	inst.virtualHostMu.Lock()
+	defer inst.virtualHostMu.Unlock()
+	if inst.virtualHostFns == nil {
+		inst.virtualHostFns = make(map[virtualHostKey]api.GoModuleFunc)
+	}
+	inst.virtualHostFns[virtualHostKey{namespace: namespace, name: name}] = fn
+}
+
+func (inst *Instance) lookupVirtualHostFn(namespace, name string) api.GoModuleFunc {
+	inst.virtualHostMu.RLock()
+	defer inst.virtualHostMu.RUnlock()
+	if inst.virtualHostFns == nil {
+		return nil
+	}
+	return inst.virtualHostFns[virtualHostKey{namespace: namespace, name: name}]
+}
+
+func clearVirtualHostFns(inst *Instance) {
+	inst.virtualHostMu.Lock()
+	inst.virtualHostFns = nil
+	inst.virtualHostMu.Unlock()
+}
+
+// SetAsyncifyControllers publishes a complete per-core controller snapshot.
+// It is called only after engine configuration has committed every controller
+// and stack header, so a bridge never observes a partially configured graph.
+func (inst *Instance) SetAsyncifyControllers(controllers map[api.Module]asyncify.RuntimeController) {
+	inst.asyncifyMu.Lock()
+	defer inst.asyncifyMu.Unlock()
+	if len(controllers) == 0 {
+		inst.asyncifyControllers = nil
+		return
+	}
+	published := make(map[api.Module]asyncify.RuntimeController, len(controllers))
+	for mod, controller := range controllers {
+		if mod != nil && controller != nil {
+			published[mod] = controller
+		}
+	}
+	inst.asyncifyControllers = published
+}
+
+// RegisterAsyncifyController adds a controller discovered after initial
+// configuration. This exists for caller-managed configurations that resolve a
+// previously uncached exported core; owned-stack configuration publishes all
+// cores atomically through SetAsyncifyControllers.
+func (inst *Instance) RegisterAsyncifyController(mod api.Module, controller asyncify.RuntimeController) {
+	if mod == nil || controller == nil {
+		return
+	}
+	inst.asyncifyMu.Lock()
+	if inst.asyncifyControllers == nil {
+		inst.asyncifyControllers = make(map[api.Module]asyncify.RuntimeController)
+	}
+	inst.asyncifyControllers[mod] = controller
+	inst.asyncifyMu.Unlock()
+}
+
+// AsyncifyController returns the controller registered for a transformed core.
+func (inst *Instance) AsyncifyController(mod api.Module) asyncify.RuntimeController {
+	if inst == nil || mod == nil {
+		return nil
+	}
+	inst.asyncifyMu.RLock()
+	controller := inst.asyncifyControllers[mod]
+	inst.asyncifyMu.RUnlock()
+	return controller
+}
+
+// dispatchVirtualHostExport is the immutable thunk exported by a shared virtual
+// host module. It selects the active instance's original handler and never
+// stores or invokes another dispatcher.
+func dispatchVirtualHostExport(owner *Instance, namespace, name string, original api.GoModuleFunc) api.GoModuleFunc {
+	return func(ctx context.Context, caller api.Module, stack []uint64) {
+		var active *Instance
+		if caller != nil {
+			active = lookupInstanceFromCaller(caller)
+		}
+		if active == nil {
+			active = InstanceFromContext(ctx)
+		}
+		if active == nil || active == owner {
+			original(ctx, caller, stack)
+			return
+		}
+		handler := active.lookupVirtualHostFn(namespace, name)
+		if handler == nil {
+			panic(fmt.Sprintf("virtual host binding missing for %s#%s", namespace, name))
+		}
+		handler(ctx, caller, stack)
+	}
+}
+
 // resolveMemory returns cached memory and allocator, resolving on first call.
 // Not thread-safe.
 func (inst *Instance) resolveMemory() (api.Memory, api.Function) {
@@ -81,7 +224,7 @@ func (inst *Instance) resolveMemory() (api.Memory, api.Function) {
 		return inst.cachedMemory, inst.cachedAlloc
 	}
 	for _, mod := range inst.modules {
-		if m := mod.Memory(); isValidMemory(m) {
+		if m := mod.Memory(); isValidMemory(m) && mod.ExportedFunction("cabi_realloc") != nil {
 			inst.cachedMemory = m
 			inst.cachedAlloc = mod.ExportedFunction("cabi_realloc")
 			break
@@ -110,6 +253,7 @@ type CanonExport struct {
 	Memory      api.Memory   // linear memory for data
 	Realloc     api.Function // allocation function
 	PostReturn  api.Function // cleanup function (may be nil)
+	ReallocMod  api.Module   // owning module instance of realloc function from provenance
 	ParamTypes  []wit.Type   // WIT types for parameters
 	ResultTypes []wit.Type   // WIT types for results (usually 0-1)
 	Encoding    byte         // string encoding: 0=UTF8, 1=UTF16, 2=CompactUTF16
@@ -118,29 +262,35 @@ type CanonExport struct {
 // Instance represents a live component instance.
 // NOT thread-safe: each goroutine should use its own Instance.
 type Instance struct {
-	cachedMemory    api.Memory
-	cachedAlloc     api.Function
-	bridgeBuilder   *bridge.Builder
-	bridgeCollector *bridge.Collector
-	resources       *ResourceStore
-	coreInstances   map[int]*coreInstance
-	bridgeModules   map[string]bool
-	virtualBridges  map[string]bool
-	pre             *InstancePre
-	exports         map[string]Export
-	encoder         *transcoder.Encoder
-	decoder         *transcoder.Decoder
-	layoutCalc      *transcoder.LayoutCalculator
-	modules         []api.Module
-	valueSpace      []uint64
-	instanceID      uint64
-	memResolved     bool
+	cachedMemory        api.Memory
+	cachedAlloc         api.Function
+	bridgeBuilder       *bridge.Builder
+	bridgeCollector     *bridge.Collector
+	resources           *ResourceStore
+	coreInstances       map[int]*coreInstance
+	bridgeModules       map[string]bool
+	virtualBridges      map[string]bool
+	virtualHostFns      map[virtualHostKey]api.GoModuleFunc
+	asyncifyControllers map[api.Module]asyncify.RuntimeController
+	pre                 *InstancePre
+	exports             map[string]Export
+	encoder             *transcoder.Encoder
+	decoder             *transcoder.Decoder
+	layoutCalc          *transcoder.LayoutCalculator
+	modules             []api.Module
+	valueSpace          []uint64
+	virtualHostMu       sync.RWMutex
+	asyncifyMu          sync.RWMutex
+	instanceID          uint64
+	memResolved         bool
 }
 
 // coreInstance wraps either a real wazero module or a virtual instance.
 type coreInstance struct {
-	module  api.Module
-	virtual *VirtualInstance
+	module              api.Module
+	virtual             *VirtualInstance
+	transformed         bool
+	asyncifyAddedMemory bool
 }
 
 // moduleName returns a unique module name for this instance.
@@ -189,6 +339,68 @@ func (w *boundModuleWrapper) ExportedFunction(name string) api.Function {
 	return w.Module.ExportedFunction(name)
 }
 
+// canonicalBoundModuleCache retains at most one immutable wrapper for a
+// canonical-lower binding. Its memory and allocator are fixed when canonical
+// resolution completes. Wazero modules are pointer-backed. Reusing a wrapper
+// for that exact caller is therefore safe. A different or non-pointer caller
+// receives a fresh wrapper, so a host that retains an earlier module cannot
+// observe a later call's identity.
+//
+// The cache is captured by one binding closure and is released with that
+// binding. It is deliberately neither shared across bindings nor pooled.
+type canonicalBoundModuleCache struct {
+	boundMem   api.Memory
+	boundAlloc api.Function
+	wrapper    atomic.Pointer[boundModuleWrapper]
+}
+
+func newCanonicalBoundModuleCache(boundMem api.Memory, boundAlloc api.Function) *canonicalBoundModuleCache {
+	return &canonicalBoundModuleCache{boundMem: boundMem, boundAlloc: boundAlloc}
+}
+
+func (c *canonicalBoundModuleCache) wrap(caller api.Module) *boundModuleWrapper {
+	newWrapper := func() *boundModuleWrapper {
+		return &boundModuleWrapper{
+			Module:     caller,
+			boundMem:   c.boundMem,
+			boundAlloc: c.boundAlloc,
+			allocName:  "cabi_realloc",
+		}
+	}
+	if !isPointerModule(caller) {
+		return newWrapper()
+	}
+
+	if cached := c.wrapper.Load(); cached != nil {
+		if samePointerModule(cached.Module, caller) {
+			return cached
+		}
+		return newWrapper()
+	}
+	candidate := newWrapper()
+	if c.wrapper.CompareAndSwap(nil, candidate) {
+		return candidate
+	}
+	cached := c.wrapper.Load()
+	if samePointerModule(cached.Module, caller) {
+		return cached
+	}
+	return newWrapper()
+}
+
+// isPointerModule accepts only the concrete representation used by wazero.
+// api.Module can technically be wrapped in an arbitrary non-comparable value,
+// so equality is never attempted unless both values are known pointers.
+func isPointerModule(module api.Module) bool {
+	t := reflect.TypeOf(module)
+	return t != nil && t.Kind() == reflect.Pointer
+}
+
+func samePointerModule(a, b api.Module) bool {
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	return ta != nil && ta == tb && ta.Kind() == reflect.Pointer && a == b
+}
+
 // createBoundHandlerFromDef creates a handler with an explicit memory/realloc binding.
 func createBoundHandlerFromDef(def resolve.HostFuncDef, boundMem api.Memory, boundAlloc api.Function) api.GoModuleFunc {
 	handler := def.GetHandler()
@@ -234,9 +446,18 @@ func createSharedMemoryHandler(def *FuncDef) api.GoModuleFunc {
 	return createSharedMemoryHandlerFromDef(def)
 }
 
+// canonicalBoundFuncDef is emitted only for canonical imports with explicit
+// memory AND realloc indices. Its handler resolves both bindings itself, so a
+// shared-memory wrapper would be completely overridden. Partial bindings keep
+// the ordinary definition and its shared-memory fallback.
+type canonicalBoundFuncDef struct{ FuncDef }
+
 // createSharedMemoryHandlerFromDef creates a handler from a HostFuncDef.
 func createSharedMemoryHandlerFromDef(def resolve.HostFuncDef) api.GoModuleFunc {
 	handler := def.GetHandler()
+	if _, bound := def.(*canonicalBoundFuncDef); bound {
+		return handler
+	}
 	return func(ctx context.Context, caller api.Module, stack []uint64) {
 		// Try caller module name first, then context (for shim modules without #instanceID)
 		inst := lookupInstanceFromCaller(caller)
@@ -265,6 +486,17 @@ func createSharedMemoryHandlerFromDef(def resolve.HostFuncDef) api.GoModuleFunc 
 
 // NewInstance creates a new live instance.
 func (pre *InstancePre) NewInstance(ctx context.Context) (*Instance, error) {
+	return pre.NewInstanceWithCoreContext(ctx, ctx)
+}
+
+// NewInstanceWithCoreContext separates shared host/bridge setup from owned core
+// instantiation and guest startup. Per-instance close hooks belong in coreCtx;
+// installing them on shared modules couples independent instance lifetimes.
+// Both contexts must describe the same startup request and cancellation budget.
+func (pre *InstancePre) NewInstanceWithCoreContext(ctx, coreCtx context.Context) (*Instance, error) {
+	if pre.closed.Load() {
+		return nil, instError("instantiate", -1, "", "compiled component is closed", nil)
+	}
 	numInst := pre.numInstances
 	if numInst == 0 {
 		numInst = 1
@@ -326,14 +558,20 @@ func (pre *InstancePre) NewInstance(ctx context.Context) (*Instance, error) {
 
 		switch parsedInst.Kind {
 		case component.CoreInstanceInstantiate:
-			mod, err := inst.instantiateModule(ctx, idx, parsedInst)
+			mod, err := inst.instantiateModule(ctx, coreCtx, idx, parsedInst)
 			if err != nil {
 				inst.Close(ctx)
 				// Error already wrapped by instantiateModule
 				return nil, err
 			}
 			inst.modules = append(inst.modules, mod)
-			inst.coreInstances[idx] = &coreInstance{module: mod}
+			isTransformed := pre.isCoreModuleTransformed(int(parsedInst.ModuleIndex))
+			asyncifyAddedMemory := int(parsedInst.ModuleIndex) < len(pre.asyncifyAddedMemory) && pre.asyncifyAddedMemory[parsedInst.ModuleIndex]
+			inst.coreInstances[idx] = &coreInstance{
+				module:              mod,
+				transformed:         isTransformed,
+				asyncifyAddedMemory: asyncifyAddedMemory,
+			}
 
 			if err := inst.createGlobalBridges(ctx, idx, int(parsedInst.ModuleIndex), mod); err != nil {
 				inst.Close(ctx)
@@ -348,7 +586,7 @@ func (pre *InstancePre) NewInstance(ctx context.Context) (*Instance, error) {
 
 	inst.buildExports()
 
-	if err := inst.callStart(ctx); err != nil {
+	if err := inst.callStart(coreCtx); err != nil {
 		inst.Close(ctx)
 		// Error already wrapped by callStart
 		return nil, err
@@ -359,7 +597,7 @@ func (pre *InstancePre) NewInstance(ctx context.Context) (*Instance, error) {
 
 // instantiateModule creates a core module instance.
 func (inst *Instance) instantiateModule(
-	ctx context.Context,
+	ctx, coreCtx context.Context,
 	instanceIdx int,
 	parsed *component.ParsedCoreInstance,
 ) (api.Module, error) {
@@ -514,7 +752,7 @@ func (inst *Instance) instantiateModule(
 		}
 	}
 
-	mod, err := inst.pre.linker.runtime.InstantiateModule(ctx, compiled, modConfig)
+	mod, err := inst.pre.linker.runtime.InstantiateModule(coreCtx, compiled, modConfig)
 	if err != nil {
 		return nil, instError("module_instantiate", instanceIdx, "", "wazero instantiation failed", err)
 	}
@@ -673,49 +911,49 @@ func (inst *Instance) createBridgeFrom(ctx context.Context, name string, source 
 
 	needsReplace := source.module != nil && inst.virtualBridges[name]
 
+	if source.virtual != nil {
+		for i := range exports {
+			expName := exportName(exports[i].Name)
+			inst.registerVirtualHostFn(name, expName, exports[i].Fn)
+		}
+	}
+
+	buildHost := func() (api.Module, error) {
+		builder := inst.pre.linker.runtime.NewHostModuleBuilder(name)
+		for i := range exports {
+			exp := exports[i]
+			expName := exportName(exp.Name)
+			fn := exp.Fn
+			if source.virtual != nil {
+				fn = dispatchVirtualHostExport(inst, name, expName, exp.Fn)
+			}
+			builder.NewFunctionBuilder().
+				WithGoModuleFunction(fn, exp.ParamTypes, exp.ResultTypes).
+				Export(expName)
+		}
+		return builder.Instantiate(ctx)
+	}
+
 	if needsReplace {
 		_, _, err := inst.pre.linker.getOrReplaceHostModule(ctx, name,
 			func(existing api.Module) bool { return existing != nil && !inst.virtualBridges[name] },
-			func() (api.Module, error) {
-				builder := inst.pre.linker.runtime.NewHostModuleBuilder(name)
-				for _, exp := range exports {
-					builder.NewFunctionBuilder().
-						WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
-						Export(exportName(exp.Name))
-				}
-				return builder.Instantiate(ctx)
-			})
+			buildHost)
 		if err != nil {
 			return false, err
 		}
 		delete(inst.virtualBridges, name)
-	} else {
-		_, _, err := inst.pre.linker.getOrCreateHostModule(ctx, name, func() (api.Module, error) {
-			builder := inst.pre.linker.runtime.NewHostModuleBuilder(name)
-			for _, exp := range exports {
-				builder.NewFunctionBuilder().
-					WithGoModuleFunction(exp.Fn, exp.ParamTypes, exp.ResultTypes).
-					Export(exportName(exp.Name))
-			}
-			return builder.Instantiate(ctx)
-		})
+	} else if source.virtual != nil {
+		// A virtual import must remain registered while this instance uses it.
+		// Acquire once per name under hostModuleMu, before a concurrent final
+		// release can close a reused module.
+		_, _, err := inst.pre.linker.getOrCreateHostModuleAndAcquire(ctx, name, inst.bridgeModules, buildHost)
 		if err != nil {
 			return false, err
 		}
-		if source.virtual != nil && !inst.bridgeModules[name] {
-			// Virtual bridges re-export functions from a core instance via
-			// ForwardingWrapper, which captures concrete, per-instance
-			// api.Function values, so a bridge is only valid while the instance
-			// it was built from is alive. Ref-count it across the instances that
-			// share it and free it when the last one closes; the next
-			// instantiation then rebuilds a fresh bridge bound to its own core
-			// instead of reusing one left bound to a previous (now-closed)
-			// instance's core, which would trap on the first call. Guard on
-			// bridgeModules so a name reached twice in one instantiation adds a
-			// single ref, balanced with the one release on Close. Stateless
-			// host-only bridges resolve memory per call and stay shared.
-			inst.bridgeModules[name] = true
-			inst.pre.linker.addBridgeRefs(map[string]bool{name: true})
+	} else {
+		_, _, err := inst.pre.linker.getOrCreateHostModule(ctx, name, buildHost)
+		if err != nil {
+			return false, err
 		}
 	}
 
@@ -990,18 +1228,8 @@ func (inst *Instance) createSynthBridgeFrom(ctx context.Context, name string, vi
 			return nil, nil
 		}
 
-		compiled, compileErr := inst.pre.linker.runtime.CompileModule(ctx, synthWasm)
-		if compileErr != nil {
-			return nil, compileErr
-		}
-
 		modConfig := wazero.NewModuleConfig().WithName(name)
-		mod, instErr := inst.pre.linker.runtime.InstantiateModule(ctx, compiled, modConfig)
-		if instErr != nil {
-			compiled.Close(ctx)
-			return nil, instErr
-		}
-		return mod, nil
+		return inst.pre.linker.runtime.InstantiateWithConfig(ctx, synthWasm, modConfig)
 	})
 	if err != nil {
 		return false, err
@@ -1045,7 +1273,9 @@ func (inst *Instance) createSynthBridgeFromModule(ctx context.Context, name stri
 		if fn == nil {
 			continue
 		}
-		wrapper := bridge.ForwardingWrapper(fn, len(def.ParamTypes()))
+		wrapper := bridge.ForwardingWrapperWithAsyncify(fn, len(def.ParamTypes()),
+			func() asyncify.RuntimeController { return inst.AsyncifyController(sourceMod) },
+			func() bool { return inst.IsModuleTransformed(sourceMod) })
 		if wrapper == nil {
 			continue
 		}
@@ -1130,18 +1360,8 @@ func (inst *Instance) createSynthBridgeFromModule(ctx context.Context, name stri
 			return nil, nil
 		}
 
-		compiled, compileErr := inst.pre.linker.runtime.CompileModule(ctx, synthWasm)
-		if compileErr != nil {
-			return nil, compileErr
-		}
-
 		modConfig := wazero.NewModuleConfig().WithName(name)
-		mod, instErr := inst.pre.linker.runtime.InstantiateModule(ctx, compiled, modConfig)
-		if instErr != nil {
-			compiled.Close(ctx)
-			return nil, instErr
-		}
-		return mod, nil
+		return inst.pre.linker.runtime.InstantiateWithConfig(ctx, synthWasm, modConfig)
 	})
 	if err != nil {
 		// Clean up host module if we created it but synth module failed
@@ -1155,6 +1375,14 @@ func (inst *Instance) createSynthBridgeFromModule(ctx context.Context, name stri
 			}
 		}
 		return false, err
+	}
+
+	// These closures capture source functions from this instance. Keeping the
+	// host module after instance close would bind a later instance to that stale
+	// source, even when its synthetic WASM bridge is rebuilt.
+	if hostModCreated {
+		inst.bridgeModules[hostModName] = true
+		inst.pre.linker.addBridgeRefs(map[string]bool{hostModName: true})
 	}
 
 	// Track only if we created the synth module
@@ -1347,18 +1575,8 @@ func (inst *Instance) createGlobalBridges(ctx context.Context, instanceIdx, modu
 				return nil, nil
 			}
 
-			compiled, compileErr := inst.pre.linker.runtime.CompileModule(ctx, synthWasm)
-			if compileErr != nil {
-				return nil, compileErr
-			}
-
 			modConfig := wazero.NewModuleConfig().WithName(importModName)
-			bridgeMod, instErr := inst.pre.linker.runtime.InstantiateModule(ctx, compiled, modConfig)
-			if instErr != nil {
-				compiled.Close(ctx)
-				return nil, instErr
-			}
-			return bridgeMod, nil
+			return inst.pre.linker.runtime.InstantiateWithConfig(ctx, synthWasm, modConfig)
 		})
 		if err != nil {
 			return instError("global_bridge", instanceIdx, importModName, "synthetic bridge creation failed", err)
@@ -1469,7 +1687,9 @@ func (inst *Instance) collectVirtualExports(virt *VirtualInstance, namespace str
 			// Get function - may panic for re-exported imports with wazevo engine
 			fn := inst.safeGetExportedFunction(src.Module, src.ExportName)
 			if fn != nil {
-				wrapper := bridge.ForwardingWrapper(fn, len(def.ParamTypes()))
+				wrapper := bridge.ForwardingWrapperWithAsyncify(fn, len(def.ParamTypes()),
+					func() asyncify.RuntimeController { return inst.AsyncifyController(src.Module) },
+					func() bool { return inst.IsModuleTransformed(src.Module) })
 				if wrapper != nil {
 					exports = append(exports, bridge.Export{
 						Name:        entityName,
@@ -1619,48 +1839,62 @@ func (inst *Instance) createVirtualInstance(
 						// Canon lower - find the host function being lowered
 						compFuncIdx := coreEntry.FuncIndex
 						if def := inst.resolveCanonLowerFunc(compFuncIdx); def != nil {
-							// Get bound memory from MemoryIdx
-							var boundMem api.Memory
-							memIdx := int(coreEntry.MemoryIdx)
-							if memIdx >= 0 && memIdx < len(memSpace) {
-								entry := memSpace[memIdx]
-								if ci := inst.coreInstances[entry.instanceIdx]; ci != nil && ci.module != nil {
-									if mem := ci.module.Memory(); isValidMemory(mem) {
-										boundMem = mem
+							// The referenced core instance may not exist until after this
+							// virtual import instance. Resolve the exact canonical indices at call
+							// time; a shim's memory must never substitute for the guest memory.
+							boundDef := *def
+							original := def.Handler
+							memoryIndex := int(coreEntry.MemoryIdx)
+							reallocIndex := int(coreEntry.ReallocIdx)
+							var (
+								resolveOnce  sync.Once
+								boundMemory  api.Memory
+								allocator    api.Function
+								resolveErr   string
+								wrapperCache *canonicalBoundModuleCache
+							)
+							boundDef.Handler = func(ctx context.Context, caller api.Module, stack []uint64) {
+								resolveOnce.Do(func() {
+									if memoryIndex >= 0 {
+										if memoryIndex < len(memSpace) {
+											entry := memSpace[memoryIndex]
+											if ci := inst.coreInstances[entry.instanceIdx]; ci != nil && ci.module != nil {
+												boundMemory = ci.module.ExportedMemory(entry.exportName)
+											}
+										}
+										if !isValidMemory(boundMemory) {
+											resolveErr = "canonical import memory unavailable"
+											return
+										}
 									}
+									if reallocIndex >= 0 {
+										allocator = inst.getCoreFunc(comp, reallocIndex)
+										if allocator == nil {
+											resolveErr = "canonical import allocator unavailable"
+											return
+										}
+									}
+									// A cache is sound only when canonical ABI resolved both
+									// bindings. Partial bindings delegate the missing half
+									// through the caller wrapper, whose value can depend on
+									// the active instance for this call.
+									if memoryIndex >= 0 && reallocIndex >= 0 {
+										wrapperCache = newCanonicalBoundModuleCache(boundMemory, allocator)
+									}
+								})
+								if resolveErr != "" {
+									panic(resolveErr)
+								}
+								if wrapperCache != nil {
+									original(ctx, wrapperCache.wrap(caller), stack)
+								} else {
+									original(ctx, &boundModuleWrapper{Module: caller, boundMem: boundMemory, boundAlloc: allocator, allocName: "cabi_realloc"}, stack)
 								}
 							}
-							// Fallback: first module with memory
-							if !isValidMemory(boundMem) {
-								for _, mod := range inst.modules {
-									if mem := mod.Memory(); isValidMemory(mem) {
-										boundMem = mem
-										break
-									}
-								}
-							}
-
-							// Get bound realloc function from ReallocIdx
-							var boundRealloc api.Function
-							reallocIdx := int(coreEntry.ReallocIdx)
-							if reallocIdx >= 0 && reallocIdx < len(comp.CoreFuncIndexSpace) {
-								reallocEntry := comp.CoreFuncIndexSpace[reallocIdx]
-								if reallocEntry.Kind == component.CoreFuncAliasExport && reallocEntry.InstanceIdx < len(inst.coreInstances) {
-									ci := inst.coreInstances[reallocEntry.InstanceIdx]
-									if ci != nil && ci.module != nil {
-										boundRealloc = ci.module.ExportedFunction(reallocEntry.ExportName)
-									}
-								}
-							}
-
-							if isValidMemory(boundMem) {
-								entity.Source = BoundHostFunc{
-									Def:       def,
-									Memory:    boundMem,
-									Allocator: boundRealloc,
-								}
+							if memoryIndex >= 0 && reallocIndex >= 0 {
+								entity.Source = HostFunc{Def: &canonicalBoundFuncDef{FuncDef: boundDef}}
 							} else {
-								entity.Source = HostFunc{Def: def}
+								entity.Source = HostFunc{Def: &boundDef}
 							}
 						} else {
 							// Build descriptive path for error reporting
@@ -2079,15 +2313,34 @@ func (inst *Instance) resolveCanon(funcIdx uint32) *CanonExport {
 		Encoding:    info.Encoding,
 	}
 
-	// Resolve memory
-	canon.Memory = inst.Memory()
+	// Resolve the memory option belonging to this exact canonical lift.
+	if info.HasMemory {
+		memSpace := buildCoreEntitySpace(comp, 0x02)
+		if int(info.MemoryIndex) < len(memSpace) {
+			entry := memSpace[info.MemoryIndex]
+			if ci := inst.coreInstances[entry.instanceIdx]; ci != nil && ci.module != nil {
+				canon.Memory = ci.module.ExportedMemory(entry.exportName)
+			}
+		}
+	}
 
 	// Resolve realloc
 	if info.ReallocIndex >= 0 {
 		canon.Realloc = inst.getCoreFunc(comp, int(info.ReallocIndex))
-	} else {
-		// Fall back to searching for common allocator names
-		canon.Realloc = inst.Allocator()
+		if int(info.ReallocIndex) < len(comp.CoreFuncIndexSpace) {
+			entry := comp.CoreFuncIndexSpace[info.ReallocIndex]
+			if entry.Kind == component.CoreFuncAliasExport {
+				owner := inst.GetModule(entry.InstanceIdx)
+				if owner != nil {
+					def := owner.ExportedFunctionDefinitions()[entry.ExportName]
+					if def != nil {
+						if _, _, imported := def.Import(); !imported {
+							canon.ReallocMod = owner
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Resolve post-return
@@ -2450,6 +2703,45 @@ func (inst *Instance) GetModule(instanceIndex int) api.Module {
 	return nil
 }
 
+// IsInstanceTransformed reports whether the core instance at the given index
+// was proven by trusted linker metadata to have been transformed by our
+// embedded transformer in this load.
+func (inst *Instance) IsInstanceTransformed(instanceIndex int) bool {
+	if ci := inst.coreInstances[instanceIndex]; ci != nil {
+		return ci.transformed
+	}
+	return false
+}
+
+// IsModuleTransformed reports exact embedded-transform provenance for mod.
+// It never infers trust from a selected sibling core.
+func (inst *Instance) IsModuleTransformed(mod api.Module) bool {
+	if inst == nil || mod == nil {
+		return false
+	}
+	for _, ci := range inst.coreInstances {
+		if ci != nil && ci.module == mod {
+			return ci.transformed
+		}
+	}
+	return false
+}
+
+// IsModuleAsyncifyMemoryAdded reports whether mod's only linear memory was
+// introduced by this linker's embedded Asyncify transform from a memoryless
+// source core. The marker is provenance, not an export-name heuristic.
+func (inst *Instance) IsModuleAsyncifyMemoryAdded(mod api.Module) bool {
+	if inst == nil || mod == nil {
+		return false
+	}
+	for _, ci := range inst.coreInstances {
+		if ci != nil && ci.module == mod {
+			return ci.asyncifyAddedMemory
+		}
+	}
+	return false
+}
+
 // Graph returns the instance graph for inspection.
 // Graph may be nil for simple components.
 func (inst *Instance) Graph() *component.InstanceGraph {
@@ -2461,6 +2753,8 @@ func (inst *Instance) Graph() *component.InstanceGraph {
 
 // Close releases all instance resources
 func (inst *Instance) Close(ctx context.Context) error {
+	// Stop bridge lookups before releasing the modules their controllers own.
+	inst.SetAsyncifyControllers(nil)
 	// Unregister from instance registry
 	instanceRegistry.Delete(inst.instanceID)
 	if inst.resources != nil {
@@ -2486,6 +2780,7 @@ func (inst *Instance) Close(ctx context.Context) error {
 	inst.exports = nil
 	inst.bridgeModules = nil
 	inst.coreInstances = nil
+	clearVirtualHostFns(inst)
 	return firstErr
 }
 

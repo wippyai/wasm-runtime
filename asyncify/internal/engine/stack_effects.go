@@ -2,6 +2,7 @@ package engine
 
 import (
 	"github.com/wippyai/wasm-runtime/asyncify/internal/handler"
+	"github.com/wippyai/wasm-runtime/asyncify/internal/semantics"
 	"github.com/wippyai/wasm-runtime/wasm"
 )
 
@@ -30,9 +31,11 @@ func GetStackEffectFromRegistry(reg *handler.Registry, op byte, instr wasm.Instr
 
 // GetStackEffect returns the stack effect for a given opcode using the static table.
 // Returns nil for instructions with complex/dynamic stack effects (calls, control flow).
-// NOTE: Arithmetic/comparison/unary ops are NOT here - they're handled by
-// BinaryOpHandler/UnaryOpHandler which implement StackEffecter.
+// Scalar signatures are shared with source planning and handler emission.
 func GetStackEffect(op byte, instr wasm.Instruction, module *wasm.Module) *StackEffect {
+	if inputs, outputs, handled := semantics.ScalarSignature(op); handled {
+		return &StackEffect{Pops: len(inputs), Pushes: outputs}
+	}
 	switch op {
 	// Constants
 	case wasm.OpI32Const:
@@ -47,38 +50,6 @@ func GetStackEffect(op byte, instr wasm.Instruction, module *wasm.Module) *Stack
 	// Drop
 	case wasm.OpDrop:
 		return &StackEffect{Pops: 1, Pushes: nil}
-
-	// Conversions
-	case wasm.OpI32WrapI64:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValI32}}
-	case wasm.OpI64ExtendI32S, wasm.OpI64ExtendI32U:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValI64}}
-	case wasm.OpI32TruncF32S, wasm.OpI32TruncF32U, wasm.OpI32TruncF64S, wasm.OpI32TruncF64U:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValI32}}
-	case wasm.OpI64TruncF32S, wasm.OpI64TruncF32U, wasm.OpI64TruncF64S, wasm.OpI64TruncF64U:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValI64}}
-	case wasm.OpF32ConvertI32S, wasm.OpF32ConvertI32U, wasm.OpF32ConvertI64S, wasm.OpF32ConvertI64U:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValF32}}
-	case wasm.OpF64ConvertI32S, wasm.OpF64ConvertI32U, wasm.OpF64ConvertI64S, wasm.OpF64ConvertI64U:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValF64}}
-	case wasm.OpF32DemoteF64:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValF32}}
-	case wasm.OpF64PromoteF32:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValF64}}
-	case wasm.OpI32ReinterpretF32:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValI32}}
-	case wasm.OpI64ReinterpretF64:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValI64}}
-	case wasm.OpF32ReinterpretI32:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValF32}}
-	case wasm.OpF64ReinterpretI64:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValF64}}
-
-	// Sign extension
-	case wasm.OpI32Extend8S, wasm.OpI32Extend16S:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValI32}}
-	case wasm.OpI64Extend8S, wasm.OpI64Extend16S, wasm.OpI64Extend32S:
-		return &StackEffect{Pops: 1, Pushes: []wasm.ValType{wasm.ValI64}}
 
 	// Memory loads
 	case wasm.OpI32Load, wasm.OpI32Load8S, wasm.OpI32Load8U, wasm.OpI32Load16S, wasm.OpI32Load16U:

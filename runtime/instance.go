@@ -88,6 +88,16 @@ func (i *Instance) MemorySize() uint32 {
 	return i.wazeroInstance.MemorySize()
 }
 
+// LinearMemoryUsage reports bytes across all distinct core linear memories and
+// whether any exist, including zero-page memories. It excludes host resources
+// and compiled code, and is independent of the selected canonical ABI memory.
+func (i *Instance) LinearMemoryUsage() (uint64, bool) {
+	if i == nil || i.wazeroInstance == nil {
+		return 0, false
+	}
+	return i.wazeroInstance.LinearMemoryUsage()
+}
+
 // HasMemory reports whether the instance has linear memory.
 func (i *Instance) HasMemory() bool {
 	return i != nil && i.wazeroInstance != nil && i.wazeroInstance.HasMemory()

@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/wippyai/wasm-runtime/component"
@@ -74,4 +76,48 @@ func TestLowerWrapperFixedResultWithoutAllocator(t *testing.T) {
 			t.Fatalf("result = (%d,%d), want (%d,%d)", tag, value, wantTag, wantValue)
 		}
 	}
+}
+
+// Allocation-free calls may omit realloc, but allocating results still trap.
+func TestLowerWrapperAllocatingResultWithoutAllocatorTraps(t *testing.T) {
+	ctx := context.Background()
+	data, err := wat.Compile(`(module (memory (export "memory") 1))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := NewWazeroEngine(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close(ctx)
+	mod, err := eng.LoadModule(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mod.Close(ctx)
+	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inst.Close(ctx)
+	called := false
+	wrapper, err := NewLowerWrapper(&component.LowerDef{
+		Name: "test:fs/types#allocating-result", Results: []wit.Type{wit.String{}},
+	}, func() string { called = true; return "must allocate" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapper.ValidateHandler(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		recovered := recover()
+		if recovered == nil || !strings.Contains(fmt.Sprint(recovered), "no allocator available") {
+			t.Errorf("expected missing allocation trap, got %v", recovered)
+		}
+		if !called {
+			t.Error("handler was skipped before result allocation")
+		}
+	}()
+	wrapper.BuildRawFunc()(ctx, inst.instance, []uint64{32})
 }

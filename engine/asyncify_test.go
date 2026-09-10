@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/tetratelabs/wazero/api"
+	asyncifyprotocol "github.com/wippyai/wasm-runtime/asyncify"
+	"github.com/wippyai/wasm-runtime/wat"
 )
 
 func TestAsyncify_NewAndDefaults(t *testing.T) {
@@ -14,8 +16,8 @@ func TestAsyncify_NewAndDefaults(t *testing.T) {
 	if a.state != 0 {
 		t.Errorf("expected initial state 0, got %d", a.state)
 	}
-	if a.dataAddr != AsyncifyDataAddr {
-		t.Errorf("expected dataAddr %d, got %d", AsyncifyDataAddr, a.dataAddr)
+	if a.dataAddrSet || a.dataAddr != 0 {
+		t.Error("new controller must have no implicit storage reservation")
 	}
 	if a.stackSize != AsyncifyDefaultStackSize {
 		t.Errorf("expected stackSize %d, got %d", AsyncifyDefaultStackSize, a.stackSize)
@@ -51,11 +53,38 @@ func TestIsAsyncified(t *testing.T) {
 		t.Error("expected non-asyncified module to return false")
 	}
 
-	// Fake asyncified WASM (contains export name)
-	asyncified := append(append([]byte{}, nonAsync...), []byte("asyncify_start_unwind")...)
+	// Fake asyncified WASM (contains export name bytes in invalid section/trailing data).
+	// Detection must NOT be fooled by raw string bytes.
+	fakeAsync := append(append([]byte{}, nonAsync...), []byte("asyncify_start_unwind")...)
+	if IsAsyncified(fakeAsync) {
+		t.Error("expected fake asyncified module with raw bytes to return false")
+	}
 
-	if !IsAsyncified(asyncified) {
-		t.Error("expected asyncified module to return true")
+	// Valid module with passive data segment containing helper names must NOT be detected as asyncified.
+	withData, err := wat.Compile(`(module
+		(memory 1)
+		(data (i32.const 0) "asyncify_start_unwind asyncify_stop_unwind asyncify_start_rewind asyncify_stop_rewind asyncify_get_state")
+	)`)
+	if err != nil {
+		t.Fatalf("wat.Compile with data: %v", err)
+	}
+	if IsAsyncified(withData) {
+		t.Error("expected module with helper text in data to return false")
+	}
+
+	// Valid asyncified module (exports all 5 required helpers with proper signatures)
+	validAsync, err := wat.Compile(`(module
+		(func (export "asyncify_start_unwind") (param i32))
+		(func (export "asyncify_stop_unwind"))
+		(func (export "asyncify_start_rewind") (param i32))
+		(func (export "asyncify_stop_rewind"))
+		(func (export "asyncify_get_state") (result i32) i32.const 0)
+	)`)
+	if err != nil {
+		t.Fatalf("wat.Compile valid asyncified: %v", err)
+	}
+	if !IsAsyncified(validAsync) {
+		t.Error("expected valid asyncified module to return true")
 	}
 }
 
@@ -127,6 +156,13 @@ func TestContextHelpers(t *testing.T) {
 	}
 	if GetScheduler(context.Background()) != nil {
 		t.Error("should return nil for empty context")
+	}
+
+	// An untracked core receives an explicit empty selection from its bridge.
+	// It must mask the legacy root controller instead of borrowing it.
+	masked := asyncifyprotocol.WithRuntimeController(ctx, nil)
+	if GetAsyncify(masked) != nil {
+		t.Error("explicit empty controller selection borrowed legacy root controller")
 	}
 }
 
@@ -461,6 +497,7 @@ func TestResume(t *testing.T) {
 		testErr := context.Canceled
 		s.result = 0
 		s.err = testErr
+		a.state = 2
 
 		ctx = WithAsyncify(ctx, a)
 		ctx = WithScheduler(ctx, s)
@@ -470,6 +507,56 @@ func TestResume(t *testing.T) {
 			t.Errorf("expected context.Canceled, got %v", err)
 		}
 	})
+
+	t.Run("RejectsNormalSelectedController", func(t *testing.T) {
+		a := NewAsyncify()
+		s := NewScheduler(a)
+		s.result = 1
+		ctx := WithScheduler(WithAsyncify(context.Background(), a), s)
+		if _, err := Resume(ctx); err == nil {
+			t.Fatal("Resume accepted a controller that was not rewinding")
+		}
+	})
+
+	t.Run("StopsEntireCrossCorePathBeforeResultEncoding", func(t *testing.T) {
+		root := NewAsyncify()
+		child := NewAsyncify()
+		// The real transformed helper validates these state transitions. The
+		// standalone controllers exercise the protocol ordering here.
+		root.state = 2
+		child.state = 2
+		s := NewScheduler(root)
+		s.result = 77
+		ctx := WithScheduler(WithAsyncify(context.Background(), root), s)
+		ctx = asyncifyprotocol.WithRuntimeController(ctx, child)
+
+		result, err := Resume(ctx)
+		if err != nil || result != 77 {
+			t.Fatalf("Resume = %d, %v", result, err)
+		}
+		if !root.IsNormal(ctx) || !child.IsNormal(ctx) {
+			t.Fatalf("resume left controllers active: root=%d child=%d", root.GetState(ctx), child.GetState(ctx))
+		}
+	})
+}
+
+func TestSuspendDoesNotPublishBeforeTransition(t *testing.T) {
+	a := NewAsyncify()
+	s := NewScheduler(a)
+	ctx := WithScheduler(WithAsyncify(context.Background(), a), s)
+
+	if err := Suspend(ctx, nil); err == nil {
+		t.Fatal("Suspend accepted nil operation")
+	}
+	if s.pendingOp != nil {
+		t.Fatal("nil suspend published pending operation")
+	}
+
+	// A second suspend cannot overwrite an operation waiting to be reported.
+	s.SetPending(&mockPendingOp{})
+	if err := Suspend(ctx, &mockPendingOp{}); err == nil {
+		t.Fatal("Suspend overwrote an existing pending operation")
+	}
 }
 
 func TestMakeAsyncHandler(t *testing.T) {
@@ -480,9 +567,12 @@ func TestMakeAsyncHandler(t *testing.T) {
 
 		ctx := context.Background()
 
-		// Without asyncify in context, handler should return immediately
+		defer func() {
+			if recover() == nil {
+				t.Fatal("async host handler continued without a controller")
+			}
+		}()
 		handler(ctx, nil, nil)
-		// Should not panic
 	})
 
 	t.Run("Rewinding", func(t *testing.T) {

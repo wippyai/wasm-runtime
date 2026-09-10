@@ -1,7 +1,10 @@
 package handler
 
 import (
+	"fmt"
+
 	"github.com/wippyai/wasm-runtime/asyncify/internal/codegen"
+	"github.com/wippyai/wasm-runtime/asyncify/internal/semantics"
 	"github.com/wippyai/wasm-runtime/wasm"
 )
 
@@ -134,15 +137,12 @@ func (r *Registry) MissingHandlers(opcodes []byte) []byte {
 //
 // During asyncify transformation, we flatten the WASM stack to locals.
 // Each stack entry tracks which local holds the value and its type.
-type StackEntry struct {
-	LocalIdx uint32
-	Type     wasm.ValType
-}
+type StackEntry = semantics.Operand
 
 // Stack is a simulated value stack for flattening.
 //
 // The asyncify transformation flattens stack operations to explicit
-// local variables. Stack tracks what local holds each stack position.
+// local variables. Stack tracks the typed value read at each stack position.
 type Stack struct {
 	entries  []StackEntry
 	fallback uint32
@@ -156,34 +156,38 @@ func NewStack(fallback uint32) *Stack {
 	return &Stack{fallback: fallback}
 }
 
+// Snapshot returns a copy of the current stack entries.
+func (s *Stack) Snapshot() []StackEntry {
+	cp := make([]StackEntry, len(s.entries))
+	copy(cp, s.entries)
+	return cp
+}
+
+// Restore restores the stack entries from a snapshot.
+func (s *Stack) Restore(snapshot []StackEntry) {
+	s.entries = make([]StackEntry, len(snapshot))
+	copy(s.entries, snapshot)
+}
+
 // Push adds a value to the top of the stack.
 func (s *Stack) Push(localIdx uint32, valType wasm.ValType) {
-	s.entries = append(s.entries, StackEntry{LocalIdx: localIdx, Type: valType})
+	s.PushOperand(semantics.StoredOperand(localIdx, valType))
 }
+
+// PushOperand preserves a value read without imposing physical storage.
+func (s *Stack) PushOperand(value semantics.Operand) { s.entries = append(s.entries, value) }
 
 // PushI32 is a convenience for pushing an i32 value.
 func (s *Stack) PushI32(localIdx uint32) {
 	s.Push(localIdx, wasm.ValI32)
 }
 
-// Pop removes and returns the top local index.
-//
-// If the stack is empty, returns the fallback local.
-func (s *Stack) Pop() uint32 {
-	if len(s.entries) == 0 {
-		return s.fallback
-	}
-	e := s.entries[len(s.entries)-1]
-	s.entries = s.entries[:len(s.entries)-1]
-	return e.LocalIdx
-}
-
-// PopTyped removes and returns the top entry with type.
+// Pop removes and returns the top typed operand.
 //
 // If the stack is empty, returns (fallback, i32).
-func (s *Stack) PopTyped() StackEntry {
+func (s *Stack) Pop() StackEntry {
 	if len(s.entries) == 0 {
-		return StackEntry{LocalIdx: s.fallback, Type: wasm.ValI32}
+		return semantics.StoredOperand(s.fallback, wasm.ValI32)
 	}
 	e := s.entries[len(s.entries)-1]
 	s.entries = s.entries[:len(s.entries)-1]
@@ -195,7 +199,7 @@ func (s *Stack) PopTyped() StackEntry {
 // If the stack is empty, returns (fallback, i32).
 func (s *Stack) Peek() StackEntry {
 	if len(s.entries) == 0 {
-		return StackEntry{LocalIdx: s.fallback, Type: wasm.ValI32}
+		return semantics.StoredOperand(s.fallback, wasm.ValI32)
 	}
 	return s.entries[len(s.entries)-1]
 }
@@ -220,6 +224,7 @@ func (s *Stack) Clear() {
 // Original locals (parameters + declared locals) have known types.
 // Temp locals are allocated on demand for flattening.
 type Locals struct {
+	verifier       *materializationVerifier
 	body           *wasm.FuncBody
 	types          []wasm.ValType
 	nextIdx        uint32
@@ -241,18 +246,57 @@ func NewLocals(startIdx uint32, body *wasm.FuncBody, initialTypes []wasm.ValType
 	}
 }
 
+// SetAllocationPlan sets the pre-computed temporary allocation plan.
+func (l *Locals) SetAllocationPlan(plan map[int][]semantics.Materialization) {
+	l.verifier = nil
+	if plan != nil {
+		l.verifier = newMaterializationVerifier(plan, l.types)
+	}
+}
+
+// BeginAction binds lowering's position, execution policy and independently
+// resolved local-knowledge effect before emission.
+func (l *Locals) BeginAction(index int, domain semantics.ExecutionDomain, effect semantics.KnowledgeEffect) {
+	if l.verifier != nil {
+		l.verifier.beginInDomain(index, domain, effect)
+	}
+}
+
 // Alloc allocates a new local of the specified type.
 //
 // Returns the local index. For pre-declared locals, only returns the index
 // without adding to body.Locals. For new locals, also adds to body.
 func (l *Locals) Alloc(valType wasm.ValType) uint32 {
+	idx, _ := l.materialize(valType, nil)
+	return idx
+}
+
+// SnapshotLocal consumes a planned cell snapshot definition or immutable reuse.
+func (l *Locals) SnapshotLocal(source uint32, vt wasm.ValType) (uint32, bool) {
+	return l.materialize(vt, &source)
+}
+
+func (l *Locals) materialize(valType wasm.ValType, source *uint32) (uint32, bool) {
+	if l.verifier != nil {
+		if entry, ok := l.verifier.consume(valType, source); ok {
+			return entry.LocalIdx, entry.Reuse
+		}
+		// Keep emission safe while recording the failure. This artifact must
+		// never be returned successfully: transformLinear checks FinishPlan.
+		idx := uint32(len(l.types))
+		l.types = append(l.types, valType)
+		l.body.Locals = append(l.body.Locals, wasm.LocalEntry{Count: 1, ValType: valType})
+		l.nextIdx = idx + 1
+		return idx, false
+	}
+
 	idx := l.nextIdx
 	l.nextIdx++
 
 	// Fast path: use pre-declared locals only when the predicted type matches.
 	if idx < l.preDeclaredMax {
 		if int(idx) < len(l.types) && l.types[idx] == valType {
-			return idx
+			return idx, false
 		}
 		// Dry-run stack simulation can diverge from real emission around complex
 		// control flow. Never reuse a pre-declared slot with a mismatched type.
@@ -267,9 +311,17 @@ func (l *Locals) Alloc(valType wasm.ValType) uint32 {
 	l.types = append(l.types, valType)
 
 	if idx >= l.preDeclaredMax {
-		return idx
+		return idx, false
 	}
-	return idx
+	return idx, false
+}
+
+// FinishPlan verifies that emission consumed the simulated allocation plan.
+func (l *Locals) FinishPlan() error {
+	if l.verifier == nil {
+		return nil
+	}
+	return l.verifier.finish()
 }
 
 // AllocI32 allocates a new i32 local.
@@ -346,6 +398,73 @@ func (c *Context) PushResult(valType wasm.ValType, localIdx uint32) {
 // PopArg pops a value from the stack for use as an argument.
 //
 // Returns the local index holding the value.
-func (c *Context) PopArg() uint32 {
+func (c *Context) PopArg() StackEntry {
 	return c.Stack.Pop()
+}
+
+// BeginCapture requires zero temporary definitions for this composite action.
+// It has mixed normal/rewind behavior rather than a primitive execution domain.
+func (l *Locals) BeginCapture(index int) {
+	if l.verifier != nil {
+		l.verifier.beginNoMaterialization(index)
+	}
+}
+
+// BeginTransfer rejects temporary definitions in a source port transfer.
+func (l *Locals) BeginTransfer(index int) {
+	if l.verifier != nil {
+		l.verifier.beginNoMaterialization(index)
+	}
+}
+
+// BeginReturn declares a source control exit that cannot materialize storage.
+func (l *Locals) BeginReturn(index int) {
+	if l.verifier != nil {
+		l.verifier.beginNoMaterialization(index)
+	}
+}
+
+// BeginBranch binds a control action without temporary materialization.
+func (l *Locals) BeginBranch(index int) {
+	if l.verifier != nil {
+		l.verifier.beginNoMaterialization(index)
+	}
+}
+
+// BeginTrap forbids temporary definitions in a source trap action.
+func (l *Locals) BeginTrap(index int) {
+	if l.verifier != nil {
+		l.verifier.beginNoMaterialization(index)
+	}
+}
+
+// At reads a stack entry without allocating a snapshot or invoking fallback.
+func (s *Stack) At(index int) (StackEntry, bool) {
+	if index < 0 || index >= len(s.entries) {
+		return StackEntry{}, false
+	}
+	return s.entries[index], true
+}
+
+// BindAt attaches an opaque source token to an already produced operand.
+func (s *Stack) BindAt(index int, token uint64) error {
+	if index < 0 || index >= len(s.entries) {
+		return fmt.Errorf("asyncify: binding index outside stack")
+	}
+	s.entries[index] = s.entries[index].WithBinding(token)
+	return nil
+}
+
+// InvalidateLocal ends the snapshot fact for a resolved guest-cell assignment.
+func (l *Locals) InvalidateLocal(source uint32) {
+	if l.verifier != nil {
+		l.verifier.knowledge.Invalidate(source)
+	}
+}
+
+// BeginClosedRegion invalidates cell knowledge across a copied guest region.
+func (l *Locals) BeginClosedRegion(index int) {
+	if l.verifier != nil {
+		l.verifier.beginNoMaterialization(index)
+	}
 }

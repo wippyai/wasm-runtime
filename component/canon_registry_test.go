@@ -239,8 +239,10 @@ func TestCanonRegistry_findFuncInInstanceType_TypeExport(t *testing.T) {
 					Export: exportDecl{
 						Name: "my-type",
 						externDesc: externDesc{
-							Kind:      0x03, // Type
+							Kind:      ExternType,
 							TypeIndex: 0,
+							BoundKind: 0x00,
+							HasBound:  true,
 						},
 					},
 				},

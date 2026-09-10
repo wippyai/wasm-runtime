@@ -11,6 +11,10 @@ import (
 type Instruction struct {
 	Imm    interface{}
 	Opcode byte
+	// Synthetic is a legacy projection marker for transformer routing. Asyncify
+	// execution ownership comes from checked lowering actions, not this flag.
+	// It is internal metadata and is never encoded into the binary.
+	Synthetic bool
 }
 
 // BlockImm holds the block type for block, loop, if, and try instructions.

@@ -170,19 +170,45 @@ func (b *HostModuleBuilder) Build(ctx context.Context) (api.Module, error) {
 	return builder.Instantiate(ctx)
 }
 
-// getOrCreateHostModule atomically gets or creates a host module.
-func (l *Linker) getOrCreateHostModule(ctx context.Context, name string, builder func() (api.Module, error)) (api.Module, bool, error) {
-	l.hostModuleMu.Lock()
-	defer l.hostModuleMu.Unlock()
-
-	// Check if already exists (under lock)
+// lookupOrBuildHostModule gets an existing host module or invokes builder.
+// Caller must hold hostModuleMu.
+func (l *Linker) lookupOrBuildHostModule(name string, builder func() (api.Module, error)) (api.Module, bool, error) {
 	if mod := l.runtime.Module(name); mod != nil {
 		return mod, false, nil
 	}
 
-	// Create the module (under lock to prevent races)
 	mod, err := builder()
 	return mod, mod != nil && err == nil, err
+}
+
+// getOrCreateHostModule atomically gets or creates a host module without taking
+// a bridge reference. Callers that must keep a reused module instantiated
+// across a concurrent final release use getOrCreateHostModuleAndAcquire.
+func (l *Linker) getOrCreateHostModule(ctx context.Context, name string, builder func() (api.Module, error)) (api.Module, bool, error) {
+	l.hostModuleMu.Lock()
+	defer l.hostModuleMu.Unlock()
+	return l.lookupOrBuildHostModule(name, builder)
+}
+
+// getOrCreateHostModuleAndAcquire gets or creates a host module and takes one
+// bridge reference for name before releasing hostModuleMu. A name already in
+// owned is not acquired again. Builder failure takes no lease. owned records
+// the lease for Close and error rollback.
+func (l *Linker) getOrCreateHostModuleAndAcquire(ctx context.Context, name string, owned map[string]bool, builder func() (api.Module, error)) (api.Module, bool, error) {
+	l.hostModuleMu.Lock()
+	defer l.hostModuleMu.Unlock()
+
+	if owned == nil {
+		return nil, false, fmt.Errorf("bridge reference owner is nil")
+	}
+
+	mod, created, err := l.lookupOrBuildHostModule(name, builder)
+	if err != nil || mod == nil || owned[name] {
+		return mod, created, err
+	}
+	l.bridgeRefCount[name]++
+	owned[name] = true
+	return mod, created, nil
 }
 
 // getOrReplaceHostModule atomically gets, validates, or replaces a host module.

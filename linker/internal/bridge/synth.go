@@ -94,19 +94,10 @@ func (s *SynthBuilder) Build(ctx context.Context, spec *SynthSpec) (api.Module, 
 		return nil, nil
 	}
 
-	compiled, err := s.runtime.CompileModule(ctx, synthWasm)
-	if err != nil {
-		return nil, err
-	}
-
 	modConfig := wazero.NewModuleConfig().WithName(spec.Name)
-	mod, err := s.runtime.InstantiateModule(ctx, compiled, modConfig)
-	if err != nil {
-		compiled.Close(ctx)
-		return nil, err
-	}
-
-	return mod, nil
+	// The runtime ties the implicitly compiled code to this module's lifetime.
+	// CompileModule + InstantiateModule leaves code cached after the bridge closes.
+	return s.runtime.InstantiateWithConfig(ctx, synthWasm, modConfig)
 }
 
 // BuildHostModule creates the companion host module for a synthetic bridge.

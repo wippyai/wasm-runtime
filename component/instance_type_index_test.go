@@ -112,8 +112,12 @@ func TestInstanceTypeTypeExportsAddToTypeIndex(t *testing.T) {
 				Name:       "pollable",
 				ExternKind: 0x04,
 				DeclType: InstanceDeclExport{Export: exportDecl{
-					Name:       "pollable",
-					externDesc: externDesc{Kind: 0x03, TypeIndex: 0}, // type export
+					Name: "pollable",
+					externDesc: externDesc{
+						Kind:      ExternType,
+						BoundKind: 0x01,
+						HasBound:  true,
+					},
 				}},
 			},
 			// Type declaration - at index 1 (after the type export)

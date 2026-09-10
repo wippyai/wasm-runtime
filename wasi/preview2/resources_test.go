@@ -95,16 +95,65 @@ func TestPollableResource(t *testing.T) {
 		t.Error("should be ready after SetReady(true)")
 	}
 
-	// Block makes it ready
+	// Reset to not ready
 	p.SetReady(false)
-	ctx := context.Background()
-	p.Block(ctx)
-	if !p.Ready() {
-		t.Error("should be ready after Block")
+	if p.Ready() {
+		t.Error("should not be ready after SetReady(false)")
 	}
 
-	// Drop should not panic
+	// Block does not fabricate readiness when canceled
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.Block(ctx)
+	if p.Ready() {
+		t.Error("Block should not fabricate readiness on canceled context")
+	}
+
+	// Block unblocks when made ready concurrently
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.Block(context.Background())
+	}()
+
+	p.SetReady(true)
+	select {
+	case <-done:
+		if !p.Ready() {
+			t.Error("should be ready after SetReady(true)")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Block to unblock after SetReady")
+	}
+
+	// Reset again
+	p.SetReady(false)
+	if p.Ready() {
+		t.Error("should not be ready after reset")
+	}
+
+	// Drop terminal marks ready, unblocks waiters, and cannot be revived
+	dropDone := make(chan struct{})
+	go func() {
+		defer close(dropDone)
+		p.Block(context.Background())
+	}()
+
 	p.Drop()
+	select {
+	case <-dropDone:
+		if !p.Ready() {
+			t.Error("should be ready after Drop")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Block to unblock after Drop")
+	}
+
+	// SetReady after Drop cannot revive / alter state
+	p.SetReady(false)
+	if !p.Ready() {
+		t.Error("SetReady(false) after Drop cannot revive or make unready")
+	}
 }
 
 func TestTimerPollable(t *testing.T) {

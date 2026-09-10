@@ -23,20 +23,7 @@ import (
 // Reinterpret operations (like i32.reinterpret_f32) are special: they don't
 // change the bit pattern at all, just the type interpretation. A float's
 // bits become an integer's bits. These never trap.
-type ConversionHandler struct {
-	Opcode     byte
-	ResultType wasm.ValType
-}
-
-func (h ConversionHandler) Handle(ctx *Context, instr wasm.Instruction) error {
-	operand := ctx.Stack.Pop()
-	tmp := ctx.AllocTemp(h.ResultType)
-
-	ctx.Emit.LocalGet(operand).EmitRawOpcode(h.Opcode).LocalSet(tmp)
-	ctx.Stack.Push(tmp, h.ResultType)
-
-	return nil
-}
+type ConversionHandler = UnaryOpHandler
 
 // RegisterConversionHandlers adds handlers for all type conversion operations.
 // These bridge between WebAssembly's type system, enabling operations like

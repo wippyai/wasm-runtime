@@ -8,8 +8,8 @@ import (
 	"github.com/wippyai/wasm-runtime/wat/internal/token"
 )
 
-func (p *Parser) parseOffsetExpr() ([]ast.Instr, error) {
-	offset, err := p.parseInstrs(nil)
+func (p *Parser) parseOffsetExpr(folded bool) ([]ast.Instr, error) {
+	offset, err := p.parseInstructionSequence(nil, folded)
 	if err != nil {
 		return nil, err
 	}
@@ -220,10 +220,12 @@ func (p *Parser) parseElem() error {
 				}
 				if nextTok := p.peek(); nextTok != nil && nextTok.Type == token.LParen {
 					p.next()
+					folded := true
 					if nextTok2 := p.peek(); nextTok2 != nil && nextTok2.Type == token.Ident && nextTok2.Value == "offset" {
+						folded = false
 						p.next()
 					}
-					offset, err := p.parseOffsetExpr()
+					offset, err := p.parseOffsetExpr(folded)
 					if err != nil {
 						return err
 					}
@@ -231,7 +233,7 @@ func (p *Parser) parseElem() error {
 				}
 			case "offset":
 				p.next()
-				offset, err := p.parseOffsetExpr()
+				offset, err := p.parseOffsetExpr(false)
 				if err != nil {
 					return err
 				}
@@ -239,7 +241,7 @@ func (p *Parser) parseElem() error {
 			default:
 				p.pos = saved
 				p.next()
-				offset, err := p.parseOffsetExpr()
+				offset, err := p.parseOffsetExpr(true)
 				if err != nil {
 					return err
 				}
@@ -339,12 +341,14 @@ func (p *Parser) parseData() error {
 		}
 	}
 
+	folded := true
 	t = p.peek()
 	if t != nil && t.Type == token.Ident && t.Value == "offset" {
+		folded = false
 		p.next()
 	}
 
-	offset, err := p.parseInstrs(nil)
+	offset, err := p.parseInstructionSequence(nil, folded)
 	if err != nil {
 		return err
 	}

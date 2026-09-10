@@ -955,13 +955,9 @@ func TestStack_Primitives(t *testing.T) {
 	}
 }
 
-// Test large flags (> 32 flags)
+// Test unsupported flags (> 32 flags) are rejected before encoding.
 func TestEncodeDecode_LargeFlags(t *testing.T) {
 	enc := NewEncoder()
-	dec := NewDecoder()
-	mem := newMockMemory(4096)
-	alloc := newMockAllocator(mem)
-	allocList := NewAllocationList()
 
 	// Create 40 flags
 	flags := make([]wit.Flag, 40)
@@ -973,27 +969,8 @@ func TestEncodeDecode_LargeFlags(t *testing.T) {
 		Kind: &wit.Flags{Flags: flags},
 	}
 
-	// Set every other flag (bits 0, 2, 4, etc.)
-	var input uint64
-	for i := range flags {
-		if i%2 == 0 {
-			input |= 1 << i
-		}
-	}
-
-	flat, err := enc.EncodeParams([]wit.Type{flagsType}, []any{input}, mem, alloc, allocList)
-	if err != nil {
-		t.Fatalf("EncodeParams failed: %v", err)
-	}
-
-	results, err := dec.DecodeResults([]wit.Type{flagsType}, flat, mem)
-	if err != nil {
-		t.Fatalf("DecodeResults failed: %v", err)
-	}
-
-	result := results[0].(uint64)
-	if result != input {
-		t.Errorf("got %b, want %b", result, input)
+	if _, err := enc.compiler.Compile(flagsType, reflect.TypeOf(uint64(0))); err == nil {
+		t.Fatal("expected compiler to reject flags with more than 32 labels")
 	}
 }
 
@@ -2880,29 +2857,18 @@ func TestDecoder_FlagsFromMemory_AllWidths(t *testing.T) {
 		}
 	})
 
-	t.Run("33-64 flags (u64)", func(t *testing.T) {
-		mem := newMockMemory(4096)
-		mem.WriteU64(0, 0xDEADBEEFCAFEBABE)
-
-		flags := make([]wit.Flag, 64)
-		for i := 0; i < 64; i++ {
+	t.Run("33 flags rejected by compiler", func(t *testing.T) {
+		flags := make([]wit.Flag, 33)
+		for i := range flags {
 			flags[i] = wit.Flag{Name: "f" + strconv.Itoa(i)}
 		}
 		flagsType := &wit.TypeDef{Kind: &wit.Flags{Flags: flags}}
-		compiled, _ := dec.compiler.Compile(flagsType, reflect.TypeOf(uint64(0)))
-
-		var result uint64
-		err := dec.decodeFieldFromMemory(0, compiled, unsafe.Pointer(&result), mem, nil)
-		if err != nil {
-			t.Fatalf("decode failed: %v", err)
-		}
-		if result != 0xDEADBEEFCAFEBABE {
-			t.Errorf("got %016x", result)
+		if _, err := dec.compiler.Compile(flagsType, reflect.TypeOf(uint64(0))); err == nil {
+			t.Fatal("expected compiler to reject flags with more than 32 labels")
 		}
 	})
 
-	t.Run(">64 flags rejected by compiler", func(t *testing.T) {
-		// Compiler explicitly rejects >64 flags
+	t.Run("many flags rejected by compiler", func(t *testing.T) {
 		flags := make([]wit.Flag, 96)
 		for i := 0; i < 96; i++ {
 			flags[i] = wit.Flag{Name: "f" + strconv.Itoa(i)}
@@ -2910,7 +2876,7 @@ func TestDecoder_FlagsFromMemory_AllWidths(t *testing.T) {
 		flagsType := &wit.TypeDef{Kind: &wit.Flags{Flags: flags}}
 		_, err := dec.compiler.Compile(flagsType, reflect.TypeOf([3]uint32{}))
 		if err == nil {
-			t.Fatal("expected compiler to reject >64 flags")
+			t.Fatal("expected compiler to reject flags with more than 32 labels")
 		}
 	})
 }
@@ -3629,8 +3595,9 @@ func TestEncoder_EncodeFlagsToMemory(t *testing.T) {
 			t.Fatalf("encode failed: %v", err)
 		}
 		v, _ := mem.ReadU16(0)
-		if v != 0xABCD {
-			t.Errorf("got %x, want 0xABCD", v)
+		const want uint16 = 0x0BCD // 12 declared labels
+		if v != want {
+			t.Errorf("got %x, want %#x", v, want)
 		}
 	})
 
@@ -3650,29 +3617,32 @@ func TestEncoder_EncodeFlagsToMemory(t *testing.T) {
 			t.Fatalf("encode failed: %v", err)
 		}
 		v, _ := mem.ReadU32(0)
-		if v != 0xDEADBEEF {
-			t.Errorf("got %x, want 0xDEADBEEF", v)
+		const want uint32 = 0x00ADBEEF // 25 declared labels
+		if v != want {
+			t.Errorf("got %x, want %#x", v, want)
 		}
 	})
 
-	t.Run("64-bit flags", func(t *testing.T) {
-		flags := make([]wit.Flag, 50)
+	t.Run("33 flags rejected before encoding", func(t *testing.T) {
+		flags := make([]wit.Flag, 33)
 		for i := range flags {
 			flags[i] = wit.Flag{Name: "f" + strconv.Itoa(i)}
 		}
 		flagsType := &wit.TypeDef{
 			Kind: &wit.Flags{Flags: flags},
 		}
-		compiled, _ := enc.compiler.Compile(flagsType, reflect.TypeOf(uint64(0)))
-
-		var val uint64 = 0xCAFEBABEDEADBEEF
-		err := enc.encodeFlagsToMemory(0, compiled, unsafe.Pointer(&val), mem)
-		if err != nil {
-			t.Fatalf("encode failed: %v", err)
+		if _, err := enc.compiler.Compile(flagsType, reflect.TypeOf(uint64(0))); err == nil {
+			t.Fatal("expected compiler to reject flags with more than 32 labels")
 		}
-		v, _ := mem.ReadU64(0)
-		if v != 0xCAFEBABEDEADBEEF {
-			t.Errorf("got %x, want 0xCAFEBABEDEADBEEF", v)
+	})
+
+	t.Run("64 flags rejected before encoding", func(t *testing.T) {
+		flags := make([]wit.Flag, 64)
+		for i := range flags {
+			flags[i] = wit.Flag{Name: "f" + strconv.Itoa(i)}
+		}
+		if _, err := enc.compiler.Compile(&wit.TypeDef{Kind: &wit.Flags{Flags: flags}}, reflect.TypeOf(uint64(0))); err == nil {
+			t.Fatal("expected compiler to reject flags with more than 32 labels")
 		}
 	})
 }

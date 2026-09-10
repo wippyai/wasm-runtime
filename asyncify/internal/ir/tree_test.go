@@ -3,6 +3,8 @@ package ir
 import (
 	"testing"
 
+	"github.com/wippyai/wasm-runtime/asyncify/internal/semantics"
+
 	"github.com/wippyai/wasm-runtime/wasm"
 )
 
@@ -14,7 +16,7 @@ func TestParse_SimpleSequence(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
+	tree := mustParse(t, instrs)
 	if tree == nil {
 		t.Fatal("tree is nil")
 	}
@@ -36,7 +38,7 @@ func TestParse_Block(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
+	tree := mustParse(t, instrs)
 	seq := tree.(*SeqNode)
 	if len(seq.Children) != 1 {
 		t.Fatalf("expected 1 child, got %d", len(seq.Children))
@@ -62,7 +64,7 @@ func TestParse_Loop(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
+	tree := mustParse(t, instrs)
 	seq := tree.(*SeqNode)
 	if len(seq.Children) != 1 {
 		t.Fatalf("expected 1 child, got %d", len(seq.Children))
@@ -88,7 +90,7 @@ func TestParse_IfElse(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
+	tree := mustParse(t, instrs)
 	seq := tree.(*SeqNode)
 	if len(seq.Children) != 2 {
 		t.Fatalf("expected 2 children, got %d", len(seq.Children))
@@ -118,7 +120,7 @@ func TestParse_IfWithoutElse(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
+	tree := mustParse(t, instrs)
 	seq := tree.(*SeqNode)
 	if len(seq.Children) != 2 {
 		t.Fatalf("expected 2 children, got %d", len(seq.Children))
@@ -143,7 +145,7 @@ func TestParse_NestedBlocks(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
+	tree := mustParse(t, instrs)
 	seq := tree.(*SeqNode)
 	if len(seq.Children) != 1 {
 		t.Fatalf("expected 1 child, got %d", len(seq.Children))
@@ -169,7 +171,7 @@ func TestParse_BranchInstructions(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs)
+	tree := mustParse(t, instrs)
 	seq := tree.(*SeqNode)
 	block := seq.Children[0].(*BlockNode)
 	bodySeq := block.Body.(*SeqNode)
@@ -254,7 +256,11 @@ func TestBlockTypeToResults_AllTypes(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		got := blockTypeToResults(tc.blockType, nil)
+		signature, err := semantics.ResolveBlockType(tc.blockType, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := signature.Results
 		if len(got) != len(tc.expected) {
 			t.Errorf("blockType %d: got %v, want %v", tc.blockType, got, tc.expected)
 			continue
@@ -277,7 +283,11 @@ func TestBlockTypeToParamsAndResults_TypeIndex(t *testing.T) {
 	}
 
 	// Type index 0
-	params, results := blockTypeToParamsAndResults(0, module)
+	signature, err := semantics.ResolveBlockType(0, module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params, results := signature.Params, signature.Results
 	if len(params) != 2 || params[0] != wasm.ValI32 || params[1] != wasm.ValI64 {
 		t.Errorf("type 0 params: got %v, want [i32, i64]", params)
 	}
@@ -286,7 +296,11 @@ func TestBlockTypeToParamsAndResults_TypeIndex(t *testing.T) {
 	}
 
 	// Type index 1
-	params, results = blockTypeToParamsAndResults(1, module)
+	signature, err = semantics.ResolveBlockType(1, module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params, results = signature.Params, signature.Results
 	if len(params) != 0 {
 		t.Errorf("type 1 params: got %v, want []", params)
 	}
@@ -294,16 +308,11 @@ func TestBlockTypeToParamsAndResults_TypeIndex(t *testing.T) {
 		t.Errorf("type 1 results: got %v, want [i32, i64]", results)
 	}
 
-	// Out of bounds type index
-	params, results = blockTypeToParamsAndResults(99, module)
-	if params != nil || results != nil {
-		t.Errorf("out of bounds: got params=%v results=%v, want nil", params, results)
+	if _, err := semantics.ResolveBlockType(99, module); err == nil {
+		t.Fatal("accepted unknown type index")
 	}
-
-	// Nil module with type index
-	params, results = blockTypeToParamsAndResults(0, nil)
-	if params != nil || results != nil {
-		t.Errorf("nil module: got params=%v results=%v, want nil", params, results)
+	if _, err := semantics.ResolveBlockType(0, nil); err == nil {
+		t.Fatal("accepted unresolved type index")
 	}
 }
 
@@ -322,7 +331,7 @@ func TestParse_BlockWithTypeIndex(t *testing.T) {
 		{Opcode: wasm.OpEnd},
 	}
 
-	tree := Parse(instrs, module)
+	tree := mustParse(t, instrs, module)
 	seq := tree.(*SeqNode)
 	block := seq.Children[0].(*BlockNode)
 
