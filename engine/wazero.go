@@ -37,20 +37,21 @@ func ResourcesFromContext(ctx context.Context) *resource.UnifiedTable {
 
 // WazeroEngine implements Engine using wazero runtime
 type WazeroEngine struct {
-	startups      *executionLifetime
-	instances     map[*WazeroInstance]struct{}
-	closeAttempt  chan struct{}
-	closeErr      error
-	runtime       wazero.Runtime
-	hostMods      map[string]struct{}
-	modules       []*WazeroModule
-	closeMu       sync.RWMutex
-	wasiInitMu    sync.Mutex
-	hostModsMu    sync.Mutex
-	modulesMu     sync.Mutex
-	wasiInitDone  atomic.Bool
-	closeComplete bool
-	closed        bool
+	startups       *executionLifetime
+	instances      map[*WazeroInstance]struct{}
+	closeAttempt   chan struct{}
+	closeErr       error
+	runtime        wazero.Runtime
+	transformCache asyncify.TransformCache
+	hostMods       map[string]struct{}
+	modules        []*WazeroModule
+	closeMu        sync.RWMutex
+	wasiInitMu     sync.Mutex
+	hostModsMu     sync.Mutex
+	modulesMu      sync.Mutex
+	wasiInitDone   atomic.Bool
+	closeComplete  bool
+	closed         bool
 }
 
 // Config holds configuration for engine creation
@@ -59,6 +60,12 @@ type Config struct {
 	// Guest memories, host bindings and resources remain runtime-local. The caller
 	// owns the cache and must close it only after all using runtimes have closed.
 	CompilationCache wazero.CompilationCache
+
+	// TransformCache optionally shares asyncify transform output across runtimes.
+	// Entries are keyed by the input bytes and transform configuration, so every
+	// module and runtime loading the same input reuses one transform. Nil
+	// disables caching. The caller owns the cache.
+	TransformCache asyncify.TransformCache
 
 	// MemoryLimitPages sets the maximum memory per instance in pages (64KB each).
 	// 0 means default (65536 pages = 4GB).
@@ -111,7 +118,11 @@ func NewWazeroEngineWithConfig(ctx context.Context, cfg *Config) (*WazeroEngine,
 	}
 
 	runtime := wazero.NewRuntimeWithConfig(ctx, runtimeCfg)
-	return &WazeroEngine{runtime: runtime, startups: newExecutionLifetime(), instances: make(map[*WazeroInstance]struct{})}, nil
+	engine := &WazeroEngine{runtime: runtime, startups: newExecutionLifetime(), instances: make(map[*WazeroInstance]struct{})}
+	if cfg != nil {
+		engine.transformCache = cfg.TransformCache
+	}
+	return engine, nil
 }
 
 // CompileConfig holds configuration for pre-compilation
@@ -274,15 +285,16 @@ func (e *WazeroEngine) LoadModule(ctx context.Context, wasmBytes []byte) (*Wazer
 			compiler := transcoder.NewCompiler()
 
 			mod := &WazeroModule{
-				engine:        e,
-				runtime:       e.runtime,
-				compiler:      compiler,
-				encoder:       transcoder.NewEncoderWithCompiler(compiler),
-				decoder:       transcoder.NewDecoderWithCompiler(compiler),
-				hostFuncs:     make(map[string]HostFunc),
-				canonRegistry: canonRegistry,
-				typeResolver:  typeResolver,
-				validated:     validated,
+				engine:         e,
+				runtime:        e.runtime,
+				transformCache: e.transformCache,
+				compiler:       compiler,
+				encoder:        transcoder.NewEncoderWithCompiler(compiler),
+				decoder:        transcoder.NewDecoderWithCompiler(compiler),
+				hostFuncs:      make(map[string]HostFunc),
+				canonRegistry:  canonRegistry,
+				typeResolver:   typeResolver,
+				validated:      validated,
 			}
 			if err := e.registerModule(mod); err != nil {
 				return nil, err
@@ -306,16 +318,17 @@ func (e *WazeroEngine) LoadModule(ctx context.Context, wasmBytes []byte) (*Wazer
 	compiler := transcoder.NewCompiler()
 
 	mod := &WazeroModule{
-		engine:        e,
-		runtime:       e.runtime,
-		compiled:      compiled,
-		compiler:      compiler,
-		encoder:       transcoder.NewEncoderWithCompiler(compiler),
-		decoder:       transcoder.NewDecoderWithCompiler(compiler),
-		hostFuncs:     make(map[string]HostFunc),
-		canonRegistry: canonRegistry,
-		typeResolver:  typeResolver,
-		rawBytes:      wasmBytes,
+		engine:         e,
+		runtime:        e.runtime,
+		compiled:       compiled,
+		transformCache: e.transformCache,
+		compiler:       compiler,
+		encoder:        transcoder.NewEncoderWithCompiler(compiler),
+		decoder:        transcoder.NewDecoderWithCompiler(compiler),
+		hostFuncs:      make(map[string]HostFunc),
+		canonRegistry:  canonRegistry,
+		typeResolver:   typeResolver,
+		rawBytes:       wasmBytes,
 	}
 
 	e.modulesMu.Lock()
@@ -376,6 +389,7 @@ type WazeroModule struct {
 	validated           *component.ValidatedComponent
 	cachedPre           *linker.InstancePre
 	linker              *linker.Linker
+	transformCache      asyncify.TransformCache
 	rawBytes            []byte
 	transformed         bool
 	asyncifyAddedMemory bool
@@ -673,6 +687,7 @@ func (m *WazeroModule) initRawHostModules(ctx context.Context) error {
 
 // linkerConfig holds configuration for ensureLinker
 type linkerConfig struct {
+	TransformCache    asyncify.TransformCache
 	AsyncifyImports   []string
 	AsyncifyTransform bool
 }
@@ -700,6 +715,7 @@ func (m *WazeroModule) ensureLinker(cfg linkerConfig) error {
 		SemverMatching:    true,
 		AsyncifyTransform: cfg.AsyncifyTransform,
 		AsyncifyImports:   cfg.AsyncifyImports,
+		TransformCache:    cfg.TransformCache,
 	}
 	m.linker = linker.New(m.runtime, opts)
 
@@ -853,7 +869,7 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 			if err != nil {
 				return fmt.Errorf("parse asyncify source metadata: %w", err)
 			}
-			transformed, err := asyncify.Transform(rawBytes, asyncify.Config{
+			transformed, err := asyncify.TransformCached(m.transformCache, rawBytes, asyncify.Config{
 				AsyncImports:  asyncImports,
 				ExportGlobals: true,
 			})
@@ -907,6 +923,7 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 
 	if err := m.ensureLinker(linkerConfig{
 		AsyncifyTransform: cfg.EnableAsyncify,
+		TransformCache:    m.transformCache,
 	}); err != nil {
 		return fmt.Errorf("ensure linker: %w", err)
 	}
@@ -1125,6 +1142,7 @@ func (m *WazeroModule) instantiateMultiModuleWithConfig(ctx context.Context, cfg
 	if err := m.ensureLinker(linkerConfig{
 		AsyncifyTransform: enableAsyncify,
 		AsyncifyImports:   asyncifyImports,
+		TransformCache:    m.transformCache,
 	}); err != nil {
 		m.cachedPreMu.Unlock()
 		return nil, fmt.Errorf("ensure linker: %w", err)

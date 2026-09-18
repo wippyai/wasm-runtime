@@ -108,7 +108,7 @@ func (l *Linker) Instantiate(ctx context.Context, c *component.ValidatedComponen
 
 		// Apply asyncify transform if enabled and module isn't already asyncified
 		if l.options.AsyncifyTransform && !asyncify.IsAsyncified(modBytes) {
-			transformed, err := asyncify.Transform(modBytes, asyncify.Config{
+			transformed, err := asyncify.TransformCached(l.options.TransformCache, modBytes, asyncify.Config{
 				AsyncImports:  l.options.AsyncifyImports,
 				ExportGlobals: true,
 			})

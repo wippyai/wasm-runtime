@@ -7,10 +7,13 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+
+	"github.com/wippyai/wasm-runtime/asyncify"
 )
 
 // Options configures linker behavior.
 type Options struct {
+	TransformCache    asyncify.TransformCache
 	AsyncifyImports   []string
 	SemverMatching    bool
 	AsyncifyTransform bool
