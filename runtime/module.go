@@ -42,6 +42,17 @@ func (m *Module) Close(ctx context.Context) error {
 	return m.runtime.Close(ctx)
 }
 
+// Release frees this module's compiled resources without closing its backing
+// runtime or sibling modules. The caller must first close all instances of this
+// module. Release is idempotent and is suitable for retiring a generation loaded
+// from a shared Runtime. Close retains its isolated-runtime shutdown semantics.
+func (m *Module) Release(ctx context.Context) error {
+	if m == nil || m.wazeroModule == nil {
+		return nil
+	}
+	return m.wazeroModule.Close(ctx)
+}
+
 func (m *Module) Instantiate(ctx context.Context) (*Instance, error) {
 	return m.InstantiateWithConfig(ctx, &engine.InstanceConfig{})
 }

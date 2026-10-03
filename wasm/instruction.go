@@ -182,9 +182,23 @@ func (i Instruction) IsIndirectCall() bool {
 
 // DecodeInstructions decodes a sequence of instructions from raw bytes
 func DecodeInstructions(code []byte) ([]Instruction, error) {
-	r := bytes.NewReader(code)
-	// Pre-allocate based on estimation: roughly 2 bytes per instruction on average
+	// Pre-allocate based on estimation: roughly 2 bytes per instruction on average.
 	instrs := make([]Instruction, 0, len(code)/2)
+	if err := WalkInstructions(code, func(instr Instruction) error {
+		instrs = append(instrs, instr)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return instrs, nil
+}
+
+// WalkInstructions decodes and visits instructions in byte order without retaining
+// the instruction sequence. It uses the same decoder as DecodeInstructions and
+// stops on a decoding error or the first error returned by visit. Instructions
+// preceding a decoding error may already have been visited.
+func WalkInstructions(code []byte, visit func(Instruction) error) error {
+	r := bytes.NewReader(code)
 
 	for r.Len() > 0 {
 		op, err := r.ReadByte()
@@ -198,56 +212,56 @@ func DecodeInstructions(code []byte) ([]Instruction, error) {
 		case OpBlock, OpLoop, OpIf, OpTry:
 			bt, err := ReadLEB128s(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = BlockImm{Type: bt}
 
 		case OpCatch:
 			tagIdx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = ThrowImm{TagIdx: tagIdx}
 
 		case OpThrow:
 			tagIdx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = ThrowImm{TagIdx: tagIdx}
 
 		case OpRethrow, OpDelegate:
 			labelIdx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = BranchImm{LabelIdx: labelIdx}
 
 		case OpTryTable:
 			bt, err := ReadLEB128s(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			catchCount, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			catches := make([]CatchClause, catchCount)
 			for i := uint32(0); i < catchCount; i++ {
 				kind, err := r.ReadByte()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				var tagIdx uint32
 				if kind == CatchKindCatch || kind == CatchKindCatchRef {
 					tagIdx, err = ReadLEB128u(r)
 					if err != nil {
-						return nil, err
+						return err
 					}
 				}
 				labelIdx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				catches[i] = CatchClause{Kind: kind, TagIdx: tagIdx, LabelIdx: labelIdx}
 			}
@@ -256,71 +270,71 @@ func DecodeInstructions(code []byte) ([]Instruction, error) {
 		case OpBr, OpBrIf:
 			idx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = BranchImm{LabelIdx: idx}
 
 		case OpBrTable:
 			count, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			labels := make([]uint32, count)
 			for i := uint32(0); i < count; i++ {
 				labels[i], err = ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 			}
 			def, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = BrTableImm{Labels: labels, Default: def}
 
 		case OpCall, OpReturnCall:
 			idx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = CallImm{FuncIdx: idx}
 
 		case OpCallIndirect, OpReturnCallIndirect:
 			typeIdx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			tableIdx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = CallIndirectImm{TypeIdx: typeIdx, TableIdx: tableIdx}
 
 		case OpCallRef, OpReturnCallRef:
 			typeIdx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = CallRefImm{TypeIdx: typeIdx}
 
 		case OpLocalGet, OpLocalSet, OpLocalTee:
 			idx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = LocalImm{LocalIdx: idx}
 
 		case OpGlobalGet, OpGlobalSet:
 			idx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = GlobalImm{GlobalIdx: idx}
 
 		case OpTableGet, OpTableSet:
 			idx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = TableImm{TableIdx: idx}
 
@@ -331,7 +345,7 @@ func DecodeInstructions(code []byte) ([]Instruction, error) {
 			OpI32Store8, OpI32Store16, OpI64Store8, OpI64Store16, OpI64Store32:
 			memImm, err := readMemArg(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = memImm
 
@@ -339,63 +353,63 @@ func DecodeInstructions(code []byte) ([]Instruction, error) {
 			// Memory index (0 for single memory, can be non-zero for multi-memory)
 			memIdx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = MemoryIdxImm{MemIdx: memIdx}
 
 		case OpI32Const:
 			val, err := ReadLEB128s(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = I32Imm{Value: val}
 
 		case OpI64Const:
 			val, err := ReadLEB128s64(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = I64Imm{Value: val}
 
 		case OpF32Const:
 			val, err := ReadFloat32(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = F32Imm{Value: val}
 
 		case OpF64Const:
 			val, err := ReadFloat64(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = F64Imm{Value: val}
 
 		case OpRefNull:
 			heapType, err := ReadLEB128s64(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = RefNullImm{HeapType: heapType}
 
 		case OpRefFunc:
 			funcIdx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = RefFuncImm{FuncIdx: funcIdx}
 
 		case OpBrOnNull, OpBrOnNonNull:
 			labelIdx, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = BranchImm{LabelIdx: labelIdx}
 
 		case OpSelectType:
 			count, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			types := make([]ValType, count)
 			extTypes := make([]ExtValType, count)
@@ -403,13 +417,13 @@ func DecodeInstructions(code []byte) ([]Instruction, error) {
 			for i := uint32(0); i < count; i++ {
 				t, err := r.ReadByte()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				types[i] = ValType(t)
 				if t == byte(ValRefNull) || t == byte(ValRef) {
 					heapType, err := ReadLEB128s64(r)
 					if err != nil {
-						return nil, err
+						return err
 					}
 					extTypes[i] = ExtValType{
 						Kind:    ExtValKindRef,
@@ -458,7 +472,7 @@ func DecodeInstructions(code []byte) ([]Instruction, error) {
 		case OpPrefixMisc:
 			subOp, err := ReadLEB128u(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			imm := MiscImm{SubOpcode: subOp}
 			switch subOp {
@@ -470,107 +484,109 @@ func DecodeInstructions(code []byte) ([]Instruction, error) {
 			case MiscMemoryInit:
 				dataidx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				memidx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				imm.Operands = []uint32{dataidx, memidx}
 			case MiscDataDrop:
 				dataidx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				imm.Operands = []uint32{dataidx}
 			case MiscMemoryCopy:
 				dstMem, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				srcMem, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				imm.Operands = []uint32{dstMem, srcMem}
 			case MiscMemoryFill:
 				memIdx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				imm.Operands = []uint32{memIdx}
 			case MiscTableInit:
 				elemidx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				tableidx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				imm.Operands = []uint32{elemidx, tableidx}
 			case MiscElemDrop:
 				elemidx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				imm.Operands = []uint32{elemidx}
 			case MiscTableCopy:
 				dst, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				src, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				imm.Operands = []uint32{dst, src}
 			case MiscTableGrow, MiscTableSize, MiscTableFill:
 				tableidx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				imm.Operands = []uint32{tableidx}
 			case MiscMemoryDiscard:
 				memidx, err := ReadLEB128u(r)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				imm.Operands = []uint32{memidx}
 			default:
-				return nil, fmt.Errorf("unknown 0xFC sub-opcode: 0x%02x", subOp)
+				return fmt.Errorf("unknown 0xFC sub-opcode: 0x%02x", subOp)
 			}
 			instr.Imm = imm
 
 		case OpPrefixSIMD:
 			imm, err := decodeSIMDImmediate(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = imm
 
 		case OpPrefixAtomic:
 			imm, err := decodeAtomicImmediate(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = imm
 
 		case OpPrefixGC:
 			imm, err := decodeGCImmediate(r)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			instr.Imm = imm
 
 		default:
-			return nil, fmt.Errorf("unknown opcode: 0x%02x", op)
+			return fmt.Errorf("unknown opcode: 0x%02x", op)
 		}
 
-		instrs = append(instrs, instr)
+		if err := visit(instr); err != nil {
+			return err
+		}
 	}
 
-	return instrs, nil
+	return nil
 }
 
 // EncodeInstructionTo writes a single instruction to the provided buffer.

@@ -57,17 +57,19 @@ func parseCoreModuleMeta(i int, modBytes []byte) (*coreModuleMeta, error) {
 
 	for codeIdx, body := range mod.Code {
 		callerIdx := uint32(meta.numImported + codeIdx)
-		instrs, err := wasm.DecodeInstructions(body.Code)
-		if err != nil {
-			return nil, fmt.Errorf("decode instructions in core module %d func %d: %w", i, callerIdx, err)
-		}
 		calleeSeen := make(map[uint32]bool)
-		for _, instr := range instrs {
+		var callErr error
+		// Finish decoding even after an invalid call index, so malformed bytecode
+		// retains the same error precedence as the materializing decoder.
+		err := wasm.WalkInstructions(body.Code, func(instr wasm.Instruction) error {
 			switch instr.Opcode {
 			case wasm.OpCall, wasm.OpReturnCall:
 				if imm, ok := instr.Imm.(wasm.CallImm); ok {
 					if uint64(imm.FuncIdx) >= totalFuncs {
-						return nil, fmt.Errorf("core module %d func %d call index %d out of bounds", i, callerIdx, imm.FuncIdx)
+						if callErr == nil {
+							callErr = fmt.Errorf("core module %d func %d call index %d out of bounds", i, callerIdx, imm.FuncIdx)
+						}
+						return nil
 					}
 					if !calleeSeen[imm.FuncIdx] {
 						calleeSeen[imm.FuncIdx] = true
@@ -77,6 +79,13 @@ func parseCoreModuleMeta(i int, modBytes []byte) (*coreModuleMeta, error) {
 			case wasm.OpCallIndirect, wasm.OpReturnCallIndirect, wasm.OpCallRef, wasm.OpReturnCallRef:
 				meta.hasIndirect[callerIdx] = true
 			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("decode instructions in core module %d func %d: %w", i, callerIdx, err)
+		}
+		if callErr != nil {
+			return nil, callErr
 		}
 	}
 
