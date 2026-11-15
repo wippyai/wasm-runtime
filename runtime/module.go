@@ -134,6 +134,10 @@ var (
 // Pattern: [export] name: func(params) -> result;
 // Signatures may reference records declared as: record name { field: type, ... }
 func parseWitFunctions(witText string) (map[string]*funcSignature, error) {
+	witText, err := witDeclarationText(witText)
+	if err != nil {
+		return nil, err
+	}
 	types, err := newWitTypes(witText)
 	if err != nil {
 		return nil, err
@@ -197,6 +201,67 @@ func parseWitFunctions(witText string) (map[string]*funcSignature, error) {
 	}
 
 	return funcs, nil
+}
+
+// witDeclarationText masks comments and quoted annotation text so declaration
+// matching sees only WIT code. Token boundaries and line breaks are preserved.
+func witDeclarationText(text string) (string, error) {
+	buf := []byte(text)
+	for i := 0; i < len(text); {
+		if text[i] == '"' {
+			start := i
+			i++
+			for i < len(text) {
+				ch := text[i]
+				i++
+				if ch == '\\' && i < len(text) {
+					i++
+				} else if ch == '"' {
+					break
+				}
+			}
+			for j := start; j < i; j++ {
+				if buf[j] != '\n' && buf[j] != '\r' {
+					buf[j] = ' '
+				}
+			}
+			continue
+		}
+		if text[i] != '/' || i+1 == len(text) || (text[i+1] != '/' && text[i+1] != '*') {
+			i++
+			continue
+		}
+		start := i
+		if text[i+1] == '/' {
+			i += 2
+			for i < len(text) && text[i] != '\n' {
+				i++
+			}
+		} else {
+			i += 2
+			depth := 1
+			for i < len(text) && depth > 0 {
+				if i+1 < len(text) && text[i:i+2] == "/*" {
+					depth++
+					i += 2
+				} else if i+1 < len(text) && text[i:i+2] == "*/" {
+					depth--
+					i += 2
+				} else {
+					i++
+				}
+			}
+			if depth != 0 {
+				return "", errors.InvalidInput(errors.PhaseParse, "unterminated WIT block comment")
+			}
+		}
+		for j := start; j < i; j++ {
+			if buf[j] != '\n' && buf[j] != '\r' {
+				buf[j] = ' '
+			}
+		}
+	}
+	return string(buf), nil
 }
 
 // witTypes holds the named types declared in a WIT text. Records resolve on

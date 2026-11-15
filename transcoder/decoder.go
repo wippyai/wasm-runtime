@@ -89,13 +89,18 @@ func (d *Decoder) LoadValue(witType wit.Type, addr uint32, mem Memory) (any, err
 // LoadResults loads function results from the canonical return area at addr,
 // where the results are laid out as the elements of a tuple.
 func (d *Decoder) LoadResults(resultTypes []wit.Type, addr uint32, mem Memory) ([]any, error) {
-	offsets, _ := d.compiler.layout.Sequence(resultTypes)
+	for i, resultType := range resultTypes {
+		if err := d.schemas.validate(resultType, errors.PhaseDecode, "result", i); err != nil {
+			return nil, err
+		}
+	}
+	offsets, area := d.compiler.layout.Sequence(resultTypes)
+	if err := validateReturnArea(addr, area.Size); err != nil {
+		return nil, err
+	}
 	results := make([]any, len(resultTypes))
 	for i, resultType := range resultTypes {
 		resultPath := []string{"result[" + strconv.Itoa(i) + "]"}
-		if err := validateWITSchema(resultType, errors.PhaseDecode, resultPath); err != nil {
-			return nil, err
-		}
 		val, err := d.loadValue(resultType, addr+offsets[i], mem, resultPath)
 		if err != nil {
 			return nil, err
@@ -128,6 +133,9 @@ func (d *Decoder) LoadResultsInto(resultTypes []wit.Type, addr uint32, mem Memor
 		if err != nil {
 			return err
 		}
+		if err := validateReturnArea(addr, ct.WitSize); err != nil {
+			return err
+		}
 		return d.decodeFieldFromMemory(addr, ct, rv.UnsafePointer(), mem, []string{"result[0]"})
 	}
 
@@ -136,7 +144,15 @@ func (d *Decoder) LoadResultsInto(resultTypes []wit.Type, addr uint32, mem Memor
 			Detail("%d results require a struct pointer with at least %d fields, got %T", len(resultTypes), len(resultTypes), result).
 			Build()
 	}
-	offsets, _ := d.compiler.layout.Sequence(resultTypes)
+	for i, resultType := range resultTypes {
+		if err := d.schemas.validate(resultType, errors.PhaseDecode, "result", i); err != nil {
+			return err
+		}
+	}
+	offsets, area := d.compiler.layout.Sequence(resultTypes)
+	if err := validateReturnArea(addr, area.Size); err != nil {
+		return err
+	}
 	for i, resultType := range resultTypes {
 		field := elem.Field(i)
 		ct, err := d.compiler.Compile(resultType, field.Type())
@@ -153,7 +169,22 @@ func (d *Decoder) LoadResultsInto(resultTypes []wit.Type, addr uint32, mem Memor
 
 // LoadInto decodes the compiled value stored at addr into ptr.
 func (d *Decoder) LoadInto(ct *CompiledType, addr uint32, ptr unsafe.Pointer, mem Memory) error {
+	if ct == nil || ptr == nil {
+		return errors.New(errors.PhaseDecode, errors.KindNilPointer).
+			Detail("compiled result type and destination must be non-nil").Build()
+	}
+	if err := validateReturnArea(addr, ct.WitSize); err != nil {
+		return err
+	}
 	return d.decodeFieldFromMemory(addr, ct, ptr, mem, nil)
+}
+
+func validateReturnArea(addr, size uint32) error {
+	if uint64(addr)+uint64(size) > 1<<32 {
+		return errors.New(errors.PhaseDecode, errors.KindOverflow).
+			Detail("return area address range overflow").Build()
+	}
+	return nil
 }
 
 func (d *Decoder) decodeFieldFromMemory(addr uint32, ct *CompiledType, ptr unsafe.Pointer, mem Memory, path []string) error {

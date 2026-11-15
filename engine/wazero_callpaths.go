@@ -500,8 +500,11 @@ func (i *WazeroInstance) callGeneralInto(ctx context.Context, b *exportBinding, 
 		return nil
 	}
 
-	rawResults := make([]uint64, flatResultCount(resultTypes))
-	copy(rawResults, i.stackBuf)
+	var rawResults []uint64
+	if b.postReturn != nil {
+		rawResults = make([]uint64, flatResultCount(resultTypes))
+		copy(rawResults, i.stackBuf)
+	}
 
 	if err := i.liftFlatInto(resultTypes, result, memInterface); err != nil {
 		return err
