@@ -74,3 +74,68 @@ func TestTransformKeepsSIMDOperandsAcrossAsyncCall(t *testing.T) {
 		t.Fatalf("transformed result = %d, want %d", got, want)
 	}
 }
+
+func TestTransformKeepsSIMDOperandsAcrossSuspendResume(t *testing.T) {
+	code, err := Transform(simdAcrossAsyncModule(), Config{Matcher: NewExactMatcher([]string{"env.async"})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	rt := wazero.NewRuntime(ctx)
+	t.Cleanup(func() { _ = rt.Close(ctx) })
+	calls := 0
+	_, err = rt.NewHostModuleBuilder("env").NewFunctionBuilder().WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, module api.Module, stack []uint64) {
+		calls++
+		name := "asyncify_start_unwind"
+		var args []uint64
+		if calls == 1 {
+			if !module.Memory().WriteUint32Le(1024, 1032) || !module.Memory().WriteUint32Le(1028, 8192) {
+				t.Fatal("write stack header")
+			}
+			args = []uint64{1024}
+		} else {
+			name = "asyncify_stop_rewind"
+		}
+		if _, err := module.ExportedFunction(name).Call(ctx, args...); err != nil {
+			t.Fatal(err)
+		}
+		stack[0] = 10
+	}), nil, []api.ValueType{api.ValueTypeI32}).Export("async").Instantiate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	module, err := rt.Instantiate(ctx, code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(name string, args ...uint64) []uint64 {
+		t.Helper()
+		results, err := module.ExportedFunction(name).Call(ctx, args...)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		return results
+	}
+	call("test")
+	if state := call("asyncify_get_state"); len(state) != 1 || state[0] != 1 {
+		t.Fatalf("did not unwind: %v", state)
+	}
+	call("asyncify_stop_unwind")
+	call("asyncify_start_rewind", 1024)
+	got := call("test")
+	if len(got) != 1 || got[0] != 0 {
+		t.Fatalf("resumed SIMD result = %v, want [0]", got)
+	}
+	for lane, want := range []uint32{484, 0, 256, 0} {
+		got, ok := module.Memory().ReadUint32Le(uint32(lane * 4))
+		if !ok || got != want {
+			t.Fatalf("vector lane %d = %d, want %d", lane, got, want)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("host calls = %d, want suspend and resume", calls)
+	}
+	if state := call("asyncify_get_state"); len(state) != 1 || state[0] != 0 {
+		t.Fatalf("rewind not finished: %v", state)
+	}
+}

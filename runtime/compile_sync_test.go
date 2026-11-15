@@ -71,3 +71,41 @@ func TestCompileSynchronousSkipsAsyncifyTransform(t *testing.T) {
 		t.Fatalf("run returned %#v, want uint32(42)", got)
 	}
 }
+
+func TestCompileSynchronousComponent(t *testing.T) {
+	ctx := context.Background()
+	rt, err := New(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close(ctx) })
+	if err := rt.RegisterHost(&MinimalHost{}); err != nil {
+		t.Fatal(err)
+	}
+	code, err := os.ReadFile("../testbed/minimal.wasm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod, err := rt.LoadComponent(ctx, code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mod.CompileWithConfig(ctx, &engine.CompileConfig{Synchronous: true}); err != nil {
+		t.Fatal(err)
+	}
+	instance, err := mod.InstantiateWithConfig(ctx, &engine.InstanceConfig{EnableAsyncify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = instance.Close(ctx) })
+	if instance.Scheduler() != nil {
+		t.Fatal("synchronous component acquired an async scheduler")
+	}
+	got, err := instance.Call(ctx, "compute", uint32(5), uint32(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != uint32(15) {
+		t.Fatalf("compute = %#v, want 15", got)
+	}
+}
