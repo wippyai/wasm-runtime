@@ -2566,31 +2566,11 @@ func (cs *CallSession) LiftResult(ctx context.Context, rawResults []uint64) (any
 				cs.liftErr = fmt.Errorf("decode results: memory not available")
 				return nil, cs.liftErr
 			}
-			basePtr := uint32(rawResults[0])
-			if len(cs.resultTypes) == 1 {
-				val, err := cs.instance.decoder.LoadValue(cs.resultTypes[0], basePtr, memInterface)
-				if err != nil {
-					cs.liftErr = fmt.Errorf("decode results: %w", err)
-					return nil, cs.liftErr
-				}
-				goResults = []any{val}
-			} else {
-				offset := uint32(0)
-				lc := transcoder.NewLayoutCalculator()
-				goResults = make([]any, len(cs.resultTypes))
-				for idx, rt := range cs.resultTypes {
-					layout := lc.Calculate(rt)
-					if layout.Align > 0 {
-						offset = (offset + layout.Align - 1) &^ (layout.Align - 1)
-					}
-					val, err := cs.instance.decoder.LoadValue(rt, basePtr+offset, memInterface)
-					if err != nil {
-						cs.liftErr = fmt.Errorf("decode results: %w", err)
-						return nil, cs.liftErr
-					}
-					goResults[idx] = val
-					offset += layout.Size
-				}
+			var err error
+			goResults, err = cs.instance.decoder.LoadResults(cs.resultTypes, uint32(rawResults[0]), memInterface)
+			if err != nil {
+				cs.liftErr = fmt.Errorf("decode results: %w", err)
+				return nil, cs.liftErr
 			}
 		} else {
 			expectedFlat := flatResultCount(cs.resultTypes)

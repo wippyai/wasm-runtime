@@ -133,13 +133,9 @@ func NewLowerWrapper(def *component.LowerDef, handler any) (*LowerWrapper, error
 func (w *LowerWrapper) compileTypes() error {
 	handlerType := w.handlerTyp
 	// Result layout is required even when a parameter uses dynamic lifting.
-	w.resultOffsets = make([]uint32, len(w.def.Results))
-	var offset uint32
-	for i, witType := range w.def.Results {
-		w.resultOffsets[i] = offset
-		offset += resultSize(witType)
-	}
-	w.resultAreaSize = offset
+	offsets, area := transcoder.NewLayoutCalculator().Sequence(w.def.Results)
+	w.resultOffsets = offsets
+	w.resultAreaSize = area.Size
 	numOut := handlerType.NumOut()
 	w.resultTypes = make([]*transcoder.CompiledType, len(w.def.Results))
 	w.errorOnly = w.hasResultType() && numOut == 1 &&

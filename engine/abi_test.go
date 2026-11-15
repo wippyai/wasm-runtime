@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"go.bytecodealliance.org/wit"
+
+	"github.com/wippyai/wasm-runtime/transcoder"
 )
 
 func TestFlatCountPrimitives(t *testing.T) {
@@ -151,7 +153,7 @@ func TestUsesRetptr(t *testing.T) {
 	}
 }
 
-func TestResultSize(t *testing.T) {
+func TestResultAreaSize(t *testing.T) {
 	tests := []struct {
 		typ      wit.Type
 		name     string
@@ -172,26 +174,39 @@ func TestResultSize(t *testing.T) {
 		{wit.F64{}, "f64", 8},
 	}
 
+	lc := transcoder.NewLayoutCalculator()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := resultSize(tt.typ)
-			if got != tt.expected {
-				t.Errorf("resultSize(%s) = %d, want %d", tt.name, got, tt.expected)
+			_, area := lc.Sequence([]wit.Type{tt.typ})
+			if area.Size != tt.expected {
+				t.Errorf("result area size (%s) = %d, want %d", tt.name, area.Size, tt.expected)
 			}
 		})
 	}
 }
 
-func TestResultSizeTypeDef(t *testing.T) {
-	// Record
+func TestResultAreaSizeTypeDef(t *testing.T) {
 	recordType := &wit.TypeDef{Kind: &wit.Record{
 		Fields: []wit.Field{
 			{Name: "a", Type: wit.U32{}},
 			{Name: "b", Type: wit.U32{}},
 		},
 	}}
-	size := resultSize(recordType)
-	if size == 0 {
-		t.Error("resultSize(record) should not be 0")
+	_, area := transcoder.NewLayoutCalculator().Sequence([]wit.Type{recordType})
+	if area.Size != 8 {
+		t.Errorf("result area size (record) = %d, want 8", area.Size)
+	}
+}
+
+func TestResultAreaOffsetsAligned(t *testing.T) {
+	offsets, area := transcoder.NewLayoutCalculator().Sequence([]wit.Type{wit.U8{}, wit.U64{}, wit.U16{}})
+	want := []uint32{0, 8, 16}
+	for i := range want {
+		if offsets[i] != want[i] {
+			t.Errorf("offset[%d] = %d, want %d", i, offsets[i], want[i])
+		}
+	}
+	if area.Size != 24 || area.Align != 8 {
+		t.Errorf("result area = size %d align %d, want size 24 align 8", area.Size, area.Align)
 	}
 }
