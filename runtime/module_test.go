@@ -220,7 +220,7 @@ func TestParseWitType(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
-			_, err := parseWitType(tc.input)
+			_, err := parseWitType(tc.input, nil)
 			if tc.valid && err != nil {
 				t.Errorf("expected valid, got error: %v", err)
 			}
@@ -247,7 +247,7 @@ func TestParseWitType_Compound(t *testing.T) {
 		return l
 	}
 
-	lt, err := parseWitType("list<u8>")
+	lt, err := parseWitType("list<u8>", nil)
 	if err != nil {
 		t.Fatalf("list<u8>: %v", err)
 	}
