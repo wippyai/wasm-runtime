@@ -264,6 +264,63 @@ func TestLowerWrapper_ListU8ResultUsesRetptr(t *testing.T) {
 	}
 }
 
+// TestLowerWrapper_MultiResultRetptrAlignment verifies that multiple host results
+// are stored into the return area with canonical tuple layout.
+func TestLowerWrapper_MultiResultRetptrAlignment(t *testing.T) {
+	ctx := context.Background()
+
+	wasmBytes, err := wat.Compile(echoWAT)
+	if err != nil {
+		t.Fatalf("compile WAT: %v", err)
+	}
+	eng, err := NewWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("NewWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+	mod, err := eng.LoadModule(ctx, wasmBytes)
+	if err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	inst, err := mod.InstantiateWithConfig(ctx, &InstanceConfig{Name: ""})
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	defer inst.Close(ctx)
+
+	def := &component.LowerDef{
+		Name:    "test:pair",
+		Params:  []wit.Type{},
+		Results: []wit.Type{wit.U8{}, wit.U64{}},
+	}
+	w, err := NewLowerWrapper(def, func(_ context.Context) (uint8, uint64) {
+		return 7, 0x1122334455667788
+	})
+	if err != nil {
+		t.Fatalf("NewLowerWrapper: %v", err)
+	}
+	if err := w.ValidateHandler(); err != nil {
+		t.Fatalf("ValidateHandler: %v", err)
+	}
+	if !w.usesRetptr() {
+		t.Fatal("(u8, u64) results must use retptr")
+	}
+
+	retptr := uint32(32)
+	w.BuildRawFunc()(ctx, inst.instance, []uint64{uint64(retptr)})
+
+	area, ok := inst.instance.Memory().Read(retptr, 16)
+	if !ok {
+		t.Fatalf("failed to read return area at %d", retptr)
+	}
+	if area[0] != 7 {
+		t.Fatalf("result[0] = %d, want 7", area[0])
+	}
+	if got := binary.LittleEndian.Uint64(area[8:16]); got != 0x1122334455667788 {
+		t.Fatalf("result[1] at offset 8 = %#x, want 0x1122334455667788", got)
+	}
+}
+
 // TestLowerWrapper_StackBoundsCheck ensures stack bounds are validated
 func TestLowerWrapper_StackBoundsCheck(t *testing.T) {
 	def := &component.LowerDef{

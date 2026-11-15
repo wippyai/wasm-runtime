@@ -84,6 +84,76 @@ func (d *Decoder) LoadValue(witType wit.Type, addr uint32, mem Memory) (any, err
 	return d.loadValue(witType, addr, mem, nil)
 }
 
+// LoadResults loads function results from the canonical return area at addr,
+// where the results are laid out as the elements of a tuple.
+func (d *Decoder) LoadResults(resultTypes []wit.Type, addr uint32, mem Memory) ([]any, error) {
+	offsets, _ := d.compiler.layout.Sequence(resultTypes)
+	results := make([]any, len(resultTypes))
+	for i, resultType := range resultTypes {
+		resultPath := []string{"result[" + strconv.Itoa(i) + "]"}
+		if err := validateWITSchema(resultType, errors.PhaseDecode, resultPath); err != nil {
+			return nil, err
+		}
+		val, err := d.loadValue(resultType, addr+offsets[i], mem, resultPath)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = val
+	}
+	return results, nil
+}
+
+// LoadResultsInto loads function results from the canonical return area at
+// addr into result, which must be a pointer. A single result decodes into the
+// pointed-to value; multiple results decode positionally into struct fields.
+// Strings are copied out of guest memory.
+func (d *Decoder) LoadResultsInto(resultTypes []wit.Type, addr uint32, mem Memory, result any) error {
+	rv := reflect.ValueOf(result)
+	if rv.Kind() != reflect.Pointer {
+		return errors.New(errors.PhaseDecode, errors.KindTypeMismatch).
+			Detail("result must be a pointer, got %T", result).
+			Build()
+	}
+	if rv.IsNil() {
+		return errors.New(errors.PhaseDecode, errors.KindInvalidData).
+			Detail("result pointer is nil").
+			Build()
+	}
+	elem := rv.Elem()
+
+	if len(resultTypes) == 1 {
+		ct, err := d.compiler.Compile(resultTypes[0], elem.Type())
+		if err != nil {
+			return err
+		}
+		return d.decodeFieldFromMemory(addr, ct, rv.UnsafePointer(), mem, []string{"result[0]"})
+	}
+
+	if elem.Kind() != reflect.Struct || elem.NumField() < len(resultTypes) {
+		return errors.New(errors.PhaseDecode, errors.KindTypeMismatch).
+			Detail("%d results require a struct pointer with at least %d fields, got %T", len(resultTypes), len(resultTypes), result).
+			Build()
+	}
+	offsets, _ := d.compiler.layout.Sequence(resultTypes)
+	for i, resultType := range resultTypes {
+		field := elem.Field(i)
+		ct, err := d.compiler.Compile(resultType, field.Type())
+		if err != nil {
+			return err
+		}
+		resultPath := []string{"result[" + strconv.Itoa(i) + "]"}
+		if err := d.decodeFieldFromMemory(addr+offsets[i], ct, unsafe.Pointer(field.UnsafeAddr()), mem, resultPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LoadInto decodes the compiled value stored at addr into ptr.
+func (d *Decoder) LoadInto(ct *CompiledType, addr uint32, ptr unsafe.Pointer, mem Memory) error {
+	return d.decodeFieldFromMemory(addr, ct, ptr, mem, nil)
+}
+
 func (d *Decoder) decodeFieldFromMemory(addr uint32, ct *CompiledType, ptr unsafe.Pointer, mem Memory, path []string) error {
 	switch ct.Kind {
 	case KindBool:

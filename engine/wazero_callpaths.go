@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"reflect"
 	"unsafe"
@@ -299,25 +298,28 @@ func (i *WazeroInstance) tryCallCompiled(ctx context.Context, b *exportBinding, 
 		return nil, true, err
 	}
 
-	// Call WASM function
-	if err := b.fn.CallWithStack(ctx, i.stackBuf[:stackSize]); err != nil {
+	if err := b.fn.CallWithStack(ctx, i.stackBuf[:callStackSize(stackSize, resultTypes)]); err != nil {
 		return nil, true, err
 	}
 
-	// Lift result from stack - need pointer to the value
 	resultPtrVal := reflect.New(resultGo.Type())
 	resultPtrVal.Elem().Set(resultGo)
 	resultPtr := resultPtrVal.UnsafePointer()
 
-	_, err = i.decoder.LiftFromStack(resultCompiled, i.stackBuf, resultPtr, memInterface)
+	// The first result slot carries either the flat result or the return-area pointer.
+	rawResult := i.stackBuf[0]
+	if usesRetptr(resultTypes) {
+		err = i.decoder.LoadInto(resultCompiled, uint32(rawResult), resultPtr, memInterface)
+	} else {
+		_, err = i.decoder.LiftFromStack(resultCompiled, i.stackBuf, resultPtr, memInterface)
+	}
 	if err != nil {
 		return nil, true, err
 	}
 
 	if b.postReturn != nil {
 		callCtx := i.prepareCallContext(ctx)
-		rawResults := []uint64{i.stackBuf[0]}
-		if _, err := b.postReturn.Call(callCtx, rawResults...); err != nil {
+		if _, err := b.postReturn.Call(callCtx, rawResult); err != nil {
 			return nil, true, fmt.Errorf("post-return: %w", err)
 		}
 	}
@@ -394,41 +396,15 @@ func (i *WazeroInstance) tryCallCompiledInto(ctx context.Context, b *exportBindi
 		return true, err
 	}
 
-	// Call WASM function
-	if err := b.fn.CallWithStack(ctx, i.stackBuf[:stackSize]); err != nil {
+	if err := b.fn.CallWithStack(ctx, i.stackBuf[:callStackSize(stackSize, resultTypes)]); err != nil {
 		return true, err
 	}
 
-	// Check if result uses retptr (indirect return)
-	usesRetptr := usesRetptr(resultTypes)
-
-	// Lift result from flat values
 	resultPtr := unsafe.Pointer(rv.Pointer())
 
-	if usesRetptr {
-		// Result is returned via pointer - read actual result data from memory
+	if usesRetptr(resultTypes) {
 		retptr := uint32(i.stackBuf[0])
-		resultSize := resultSize(resultTypes[0])
-
-		if mem == nil || mem.mem == nil {
-			return true, fmt.Errorf("read retptr result: memory not available")
-		}
-		resultData, err := mem.Read(retptr, resultSize)
-		if err != nil {
-			return true, fmt.Errorf("read retptr result: %w", err)
-		}
-
-		// Convert bytes to uint64 flat values directly into stackBuf (reuse allocation)
-		flatCount := resultSize / 4
-		if uint32(len(resultData)) < flatCount*4 {
-			return true, fmt.Errorf("malformed result data: expected %d bytes, got %d", flatCount*4, len(resultData))
-		}
-		for j := uint32(0); j < flatCount; j++ {
-			offset := j * 4
-			i.stackBuf[j] = uint64(binary.LittleEndian.Uint32(resultData[offset:]))
-		}
-		_, err = i.decoder.LiftFromStack(resultCompiled, i.stackBuf[:flatCount], resultPtr, memInterface)
-		if err != nil {
+		if err := i.decoder.LoadInto(resultCompiled, retptr, resultPtr, memInterface); err != nil {
 			return true, err
 		}
 
@@ -493,9 +469,8 @@ func (i *WazeroInstance) callGeneralInto(ctx context.Context, b *exportBinding, 
 		return fmt.Errorf("encode params: %w", err)
 	}
 
-	// Call WASM function
 	copy(i.stackBuf, flatParams)
-	if err := b.fn.CallWithStack(ctx, i.stackBuf[:len(flatParams)]); err != nil {
+	if err := b.fn.CallWithStack(ctx, i.stackBuf[:callStackSize(len(flatParams), resultTypes)]); err != nil {
 		return fmt.Errorf("wasm call failed: %w", err)
 	}
 
@@ -510,87 +485,53 @@ func (i *WazeroInstance) callGeneralInto(ctx context.Context, b *exportBinding, 
 		return nil
 	}
 
-	// Check if result uses retptr (indirect return)
-	usesRetptr := usesRetptr(resultTypes)
-	var retptr uint32
-
-	// If retptr, read actual result from memory into stackBuf
-	if usesRetptr {
-		retptr = uint32(i.stackBuf[0])
-		resultSize := resultSize(resultTypes[0])
-
-		if mem == nil || mem.mem == nil {
-			return fmt.Errorf("read retptr result: memory not available")
+	// Results exceeding the flat limit are read from the callee's return area.
+	if usesRetptr(resultTypes) {
+		retptr := uint32(i.stackBuf[0])
+		if err := i.decoder.LoadResultsInto(resultTypes, retptr, memInterface, result); err != nil {
+			return err
 		}
-		resultData, err := mem.Read(retptr, resultSize)
-		if err != nil {
-			return fmt.Errorf("read retptr result: %w", err)
-		}
-
-		// Convert bytes to uint64 flat values in stackBuf
-		flatCount := resultSize / 4
-		if uint32(len(resultData)) < flatCount*4 {
-			return fmt.Errorf("malformed result data: expected %d bytes, got %d", flatCount*4, len(resultData))
-		}
-		for j := uint32(0); j < flatCount; j++ {
-			i.stackBuf[j] = uint64(binary.LittleEndian.Uint32(resultData[j*4:]))
-		}
-	}
-
-	// Lift result using compiled type if possible
-	if len(resultTypes) == 1 {
-		if typeDef, ok := resultTypes[0].(*wit.TypeDef); ok {
-			rv := reflect.ValueOf(result)
-			if rv.Kind() == reflect.Pointer {
-				// Try to compile the result type with the Go type
-				goType := rv.Elem().Type()
-				compiled, err := i.compiler.Compile(typeDef, goType)
-				if err == nil {
-					// Use compiled fast path for records, lists, etc.
-					resultPtr := unsafe.Pointer(rv.Pointer())
-					_, err = i.decoder.LiftFromStack(compiled, i.stackBuf, resultPtr, memInterface)
-					if err != nil {
-						return err
-					}
-					if b.postReturn != nil {
-						callCtx := i.prepareCallContext(ctx)
-						var raw []uint64
-						if usesRetptr {
-							raw = []uint64{uint64(retptr)}
-						} else {
-							raw = []uint64{i.stackBuf[0]}
-						}
-						if _, err := b.postReturn.Call(callCtx, raw...); err != nil {
-							return fmt.Errorf("post-return: %w", err)
-						}
-					}
-					return nil
-				}
+		if b.postReturn != nil {
+			callCtx := i.prepareCallContext(ctx)
+			if _, err := b.postReturn.Call(callCtx, uint64(retptr)); err != nil {
+				return fmt.Errorf("post-return: %w", err)
 			}
 		}
+		return nil
 	}
 
-	// Fall back to DecodeInto for other types - results are in stackBuf
-	if err := i.decoder.DecodeInto(resultTypes, i.stackBuf, memInterface, result); err != nil {
+	rawResults := make([]uint64, flatResultCount(resultTypes))
+	copy(rawResults, i.stackBuf)
+
+	if err := i.liftFlatInto(resultTypes, result, memInterface); err != nil {
 		return err
 	}
 
 	if b.postReturn != nil {
 		callCtx := i.prepareCallContext(ctx)
-		var raw []uint64
-		if usesRetptr {
-			raw = []uint64{uint64(retptr)}
-		} else {
-			count := flatResultCount(resultTypes)
-			raw = make([]uint64, count)
-			copy(raw, i.stackBuf[:count])
-		}
-		if _, err := b.postReturn.Call(callCtx, raw...); err != nil {
+		if _, err := b.postReturn.Call(callCtx, rawResults...); err != nil {
 			return fmt.Errorf("post-return: %w", err)
 		}
 	}
 
 	return nil
+}
+
+// liftFlatInto decodes flat results held in stackBuf into result, using the
+// compiled transcoder when a single TypeDef result compiles against the Go type.
+func (i *WazeroInstance) liftFlatInto(resultTypes []wit.Type, result any, mem transcoder.Memory) error {
+	if len(resultTypes) == 1 {
+		if typeDef, ok := resultTypes[0].(*wit.TypeDef); ok {
+			rv := reflect.ValueOf(result)
+			if rv.Kind() == reflect.Pointer {
+				if compiled, err := i.compiler.Compile(typeDef, rv.Elem().Type()); err == nil {
+					_, err = i.decoder.LiftFromStack(compiled, i.stackBuf, rv.UnsafePointer(), mem)
+					return err
+				}
+			}
+		}
+	}
+	return i.decoder.DecodeInto(resultTypes, i.stackBuf, mem, result)
 }
 
 // tryFastCall attempts direct call for primitive signatures
@@ -878,26 +819,12 @@ func (i *WazeroInstance) callGeneral(ctx context.Context, b *exportBinding, para
 		return nil, fmt.Errorf("encode params: %w", err)
 	}
 
-	// Call WASM function - stack needs space for max(params, results)
-	// For lifted exports: callee allocates return buffer and returns pointer
 	copy(i.stackBuf, flatParams)
-	stackSize := len(flatParams)
+	stackSize := callStackSize(len(flatParams), resultTypes)
 
-	// Check if results use indirect return (callee returns pointer to result struct)
+	// Results exceeding the flat limit are returned through a pointer to a
+	// callee-allocated return area.
 	usesIndirectReturn := usesRetptr(resultTypes)
-
-	// For direct returns, ensure stack has space for results
-	if len(resultTypes) > 0 && !usesIndirectReturn {
-		resultSlots := flatResultCount(resultTypes)
-		if resultSlots > stackSize {
-			stackSize = resultSlots
-		}
-	}
-
-	// For indirect returns, function returns 1 value (pointer)
-	if usesIndirectReturn && stackSize < 1 {
-		stackSize = 1
-	}
 
 	if err := b.fn.CallWithStack(ctx, i.stackBuf[:stackSize]); err != nil {
 		return nil, fmt.Errorf("wasm call failed: %w", err)
@@ -912,46 +839,10 @@ func (i *WazeroInstance) callGeneral(ctx context.Context, b *exportBinding, para
 		if mem == nil || mem.mem == nil {
 			return nil, fmt.Errorf("decode results: memory not available")
 		}
-		if len(resultTypes) == 1 {
-			if _, isString := resultTypes[0].(wit.String); isString {
-				// Fast path for string results
-				ptr, err := mem.ReadU32(retptr)
-				if err != nil {
-					return nil, fmt.Errorf("read string pointer at 0x%x: %w", retptr, err)
-				}
-				length, err := mem.ReadU32(retptr + 4)
-				if err != nil {
-					return nil, fmt.Errorf("read string length at 0x%x: %w", retptr+4, err)
-				}
-				if length > 0 {
-					data, err := mem.Read(ptr, length)
-					if err != nil {
-						return nil, fmt.Errorf("read string data at 0x%x (len %d): %w", ptr, length, err)
-					}
-					goResults = []any{string(data)}
-				} else {
-					goResults = []any{""}
-				}
-			} else {
-				// Load value directly from memory at retptr address
-				val, err := i.decoder.LoadValue(resultTypes[0], retptr, memInterface)
-				if err != nil {
-					return nil, fmt.Errorf("load indirect result: %w", err)
-				}
-				goResults = []any{val}
-			}
-		} else {
-			// Multiple results via retptr - load each from memory
-			goResults = make([]any, len(resultTypes))
-			offset := uint32(0)
-			for idx, rt := range resultTypes {
-				val, err := i.decoder.LoadValue(rt, retptr+offset, memInterface)
-				if err != nil {
-					return nil, fmt.Errorf("load indirect result[%d]: %w", idx, err)
-				}
-				goResults[idx] = val
-				offset += resultSize(rt)
-			}
+		var err error
+		goResults, err = i.decoder.LoadResults(resultTypes, retptr, memInterface)
+		if err != nil {
+			return nil, fmt.Errorf("load indirect results: %w", err)
 		}
 	} else if len(resultTypes) > 0 {
 		// Decode results from flat return values in stackBuf
