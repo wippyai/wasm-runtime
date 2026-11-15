@@ -3,6 +3,7 @@ package transcoder
 import (
 	"reflect"
 	"strconv"
+	"sync"
 
 	"github.com/wippyai/wasm-runtime/errors"
 	"go.bytecodealliance.org/wit"
@@ -15,6 +16,35 @@ import (
 func validateWITSchema(t wit.Type, phase errors.Phase, path []string) error {
 	v := witSchemaValidator{phase: phase, states: make(map[*wit.TypeDef]schemaVisitState)}
 	return v.visitType(t, path)
+}
+
+// schemaCache remembers TypeDefs that passed validateWITSchema. A component's
+// TypeDefs are immutable after decoding, so a call validates each signature
+// type once instead of walking it with reflection on every call.
+type schemaCache struct {
+	valid sync.Map
+}
+
+// validate runs validateWITSchema unless t is a TypeDef that already passed.
+// The error path is built only when validation runs.
+func (c *schemaCache) validate(t wit.Type, phase errors.Phase, label string, index int) error {
+	td, cacheable := t.(*wit.TypeDef)
+	if cacheable && c != nil {
+		if _, ok := c.valid.Load(td); ok {
+			return nil
+		}
+	}
+	var path []string
+	if label != "" {
+		path = []string{label + "[" + strconv.Itoa(index) + "]"}
+	}
+	if err := validateWITSchema(t, phase, path); err != nil {
+		return err
+	}
+	if cacheable && c != nil {
+		c.valid.Store(td, struct{}{})
+	}
+	return nil
 }
 
 type witSchemaValidator struct {

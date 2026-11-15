@@ -132,16 +132,18 @@ func flagsMask(count int) uint64 {
 
 type Encoder struct {
 	compiler *Compiler
+	schemas  *schemaCache
 }
 
 func NewEncoder() *Encoder {
 	return &Encoder{
 		compiler: NewCompiler(),
+		schemas:  &schemaCache{},
 	}
 }
 
 func NewEncoderWithCompiler(c *Compiler) *Encoder {
-	return &Encoder{compiler: c}
+	return &Encoder{compiler: c, schemas: &schemaCache{}}
 }
 
 // EncodeParams uses compiled fast path for structs and typed slices when possible.
@@ -156,8 +158,7 @@ func (e *Encoder) EncodeParams(paramTypes []wit.Type, values []any, mem Memory, 
 	defer putBuf64(flat)
 
 	for i, paramType := range paramTypes {
-		paramPath := []string{"param[" + strconv.Itoa(i) + "]"}
-		if err := validateWITSchema(paramType, errors.PhaseEncode, paramPath); err != nil {
+		if err := e.schemas.validate(paramType, errors.PhaseEncode, "param", i); err != nil {
 			return nil, err
 		}
 		// Try compiled fast path for typed values
@@ -1368,7 +1369,7 @@ func witFieldToGoName(witName string) string {
 // allocations). This is the memory-layout counterpart to LowerToStack and is the
 // correct primitive for retptr-style results.
 func (e *Encoder) StoreToMemory(witType wit.Type, value any, addr uint32, mem Memory, alloc Allocator, allocList *AllocationList) error {
-	if err := validateWITSchema(witType, errors.PhaseEncode, nil); err != nil {
+	if err := e.schemas.validate(witType, errors.PhaseEncode, "", 0); err != nil {
 		return err
 	}
 	return e.storeValue(witType, value, addr, mem, alloc, allocList, nil)

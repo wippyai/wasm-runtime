@@ -14,6 +14,7 @@ import (
 
 type Decoder struct {
 	compiler *Compiler
+	schemas  *schemaCache
 	options  DecodeOptions
 }
 
@@ -39,22 +40,23 @@ func (o DecodeOptions) byteListsAsBinaryString() bool {
 func NewDecoder() *Decoder {
 	return &Decoder{
 		compiler: NewCompiler(),
+		schemas:  &schemaCache{},
 	}
 }
 
 func NewDecoderWithCompiler(c *Compiler) *Decoder {
-	return &Decoder{compiler: c}
+	return &Decoder{compiler: c, schemas: &schemaCache{}}
 }
 
 func NewDecoderWithCompilerAndOptions(c *Compiler, options DecodeOptions) *Decoder {
-	return &Decoder{compiler: c, options: options}
+	return &Decoder{compiler: c, schemas: &schemaCache{}, options: options}
 }
 
 func (d *Decoder) WithOptions(options DecodeOptions) *Decoder {
 	if d == nil {
 		return NewDecoderWithCompilerAndOptions(NewCompiler(), options)
 	}
-	return &Decoder{compiler: d.compiler, options: options}
+	return &Decoder{compiler: d.compiler, schemas: d.schemas, options: options}
 }
 
 func (d *Decoder) DecodeResults(resultTypes []wit.Type, flat []uint64, mem Memory) ([]any, error) {
@@ -62,10 +64,10 @@ func (d *Decoder) DecodeResults(resultTypes []wit.Type, flat []uint64, mem Memor
 	offset := 0
 
 	for i, resultType := range resultTypes {
-		resultPath := []string{"result[" + strconv.Itoa(i) + "]"}
-		if err := validateWITSchema(resultType, errors.PhaseDecode, resultPath); err != nil {
+		if err := d.schemas.validate(resultType, errors.PhaseDecode, "result", i); err != nil {
 			return nil, err
 		}
+		resultPath := []string{"result[" + strconv.Itoa(i) + "]"}
 		result, consumed, err := d.liftValue(resultType, flat[offset:], mem, resultPath)
 		if err != nil {
 			return nil, err
@@ -78,7 +80,7 @@ func (d *Decoder) DecodeResults(resultTypes []wit.Type, flat []uint64, mem Memor
 }
 
 func (d *Decoder) LoadValue(witType wit.Type, addr uint32, mem Memory) (any, error) {
-	if err := validateWITSchema(witType, errors.PhaseDecode, nil); err != nil {
+	if err := d.schemas.validate(witType, errors.PhaseDecode, "", 0); err != nil {
 		return nil, err
 	}
 	return d.loadValue(witType, addr, mem, nil)

@@ -32,6 +32,13 @@ func (m *Module) Compile(ctx context.Context) error {
 	return m.wazeroModule.Compile(ctx, &engine.CompileConfig{})
 }
 
+// CompileWithConfig is Compile with explicit compilation options. Set
+// Synchronous for modules whose imported host functions never suspend: the
+// module then runs without Asyncify instrumentation.
+func (m *Module) CompileWithConfig(ctx context.Context, cfg *engine.CompileConfig) error {
+	return m.wazeroModule.Compile(ctx, cfg)
+}
+
 // Close releases the runtime backing this module.
 // Call this only for modules that own an isolated runtime; modules loaded from a
 // shared Runtime should be released by closing that Runtime instead.
