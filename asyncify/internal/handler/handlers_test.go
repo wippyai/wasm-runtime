@@ -1513,23 +1513,34 @@ func TestSIMDHandler_StackEffectWith_MoreOps(t *testing.T) {
 		{"f32x4.add", 0xE4, 2, 1}, // f32x4 arithmetic (0xE4-0xEF)
 		{"f64x2.add", 0xF0, 2, 1}, // f64x2 arithmetic (0xF0-0xFD)
 		// Unary operations - one from each range
-		{"v128.not", 0x4D, 1, 1},  // v128.not
-		{"i16x8.abs", 0x80, 1, 1}, // i16x8 unary (0x80-0x81)
-		{"i32x4.abs", 0xA0, 1, 1}, // i32x4 unary (0xA0-0xA1)
-		{"i64x2.abs", 0xC0, 1, 1}, // i64x2 unary (0xC0-0xC1)
-		{"f32x4.abs", 0x67, 1, 1}, // f32x4 abs/neg/sqrt (0x67-0x69)
-		{"f32x4.neg", 0x68, 1, 1},
-		{"f32x4.sqrt", 0x69, 1, 1},
-		{"f32x4.ceil", 0xE0, 1, 1}, // f32x4 rounding (0xE0-0xE3)
+		{"v128.not", 0x4D, 1, 1},   // v128.not
+		{"i16x8.abs", 0x80, 1, 1},  // i16x8 unary (0x80-0x81)
+		{"i32x4.abs", 0xA0, 1, 1},  // i32x4 unary (0xA0-0xA1)
+		{"i64x2.abs", 0xC0, 1, 1},  // i64x2 unary (0xC0-0xC1)
+		{"f32x4.ceil", 0x67, 1, 1}, // f32x4 rounding (0x67-0x6A)
+		{"f32x4.floor", 0x68, 1, 1},
+		{"f32x4.trunc", 0x69, 1, 1},
+		{"f32x4.nearest", 0x6A, 1, 1},
+		{"f32x4.abs", 0xE0, 1, 1}, // f32x4 abs/neg/sqrt (0xE0, 0xE1, 0xE3)
+		{"f32x4.neg", 0xE1, 1, 1},
+		{"f32x4.sqrt", 0xE3, 1, 1},
 		{"f64x2.ceil", 0x74, 1, 1}, // f64x2 rounding - all 4 ops
 		{"f64x2.floor", 0x75, 1, 1},
-		{"f64x2.trunc", 0x76, 1, 1},
-		{"f64x2.nearest", 0x77, 1, 1},
-		{"i16x8.extend_low", 0x5E, 1, 1},  // i16x8 extend low/high (0x5E-0x5F)
-		{"i16x8.extend_high", 0x5F, 1, 1}, // i16x8 extend high
-		{"i32x4.ext", 0x7C, 1, 1},         // i32x4 extend (0x7C-0x7F)
-		{"i64x2.ext", 0x9C, 1, 1},         // i64x2 extend (0x9C-0x9F)
-		{"f32x4.convert", 0xBC, 1, 1},     // convert ops (0xBC-0xBF) - was overlap
+		{"f64x2.trunc", 0x7A, 1, 1},
+		{"f64x2.nearest", 0x94, 1, 1},
+		{"f32x4.demote", 0x5E, 1, 1},      // f32x4.demote_f64x2_zero
+		{"f64x2.promote", 0x5F, 1, 1},     // f64x2.promote_low_f32x4
+		{"i16x8.extadd", 0x7C, 1, 1},      // extadd_pairwise (0x7C-0x7F)
+		{"i16x8.extend", 0x87, 1, 1},      // i16x8 extend (0x87-0x8A)
+		{"i32x4.extend", 0xA7, 1, 1},      // i32x4 extend (0xA7-0xAA)
+		{"i64x2.extend", 0xC7, 1, 1},      // i64x2 extend (0xC7-0xCA)
+		{"i32x4.trunc_sat", 0xF8, 1, 1},   // trunc_sat and convert (0xF8-0xFF)
+		{"f64x2.convert_low", 0xFF, 1, 1}, // f64x2.convert_low_i32x4_u
+		{"i16x8.extmul", 0x9C, 2, 1},      // i16x8 extmul (0x9C-0x9F)
+		{"i32x4.extmul", 0xBC, 2, 1},      // i32x4 extmul (0xBC-0xBF)
+		{"i8x16.shl", 0x6B, 2, 1},         // shifts take (v128, i32)
+		{"i32x4.dot", 0xBA, 2, 1},         // i32x4.dot_i16x8_s
+		{"i8x16.min_s", 0x76, 2, 1},       // i8x16 min/max (0x76-0x79)
 		{"f64x2.abs", 0xEC, 1, 1},         // f64x2 abs (0xEC) - was overlap
 		{"f64x2.neg", 0xED, 1, 1},         // f64x2 neg (0xED) - was overlap
 		{"f64x2.sqrt", 0xEF, 1, 1},        // f64x2 sqrt (0xEF) - was overlap
@@ -1627,12 +1638,8 @@ func TestStackEffectWith_FallbackChain(t *testing.T) {
 			Imm:    wasm.SIMDImm{SubOpcode: 0xFFFF}, // Unknown
 		}
 		eff := h.StackEffectWith(instr)
-		if eff == nil {
-			t.Fatal("SIMD should return default effect for unknown")
-		}
-		// Default is binary (v128, v128) -> v128
-		if eff.Pops != 2 {
-			t.Errorf("unknown SIMD: got pops=%d, want 2", eff.Pops)
+		if eff != nil {
+			t.Fatalf("unknown SIMD sub-opcode has effect %+v, want nil", eff)
 		}
 	})
 

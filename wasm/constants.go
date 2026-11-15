@@ -604,10 +604,11 @@ const (
 	SimdI8x16AllTrue uint32 = 0x63
 	SimdI8x16Bitmask uint32 = 0x64
 
-	// f32x4 unary operations
-	SimdF32x4Abs  uint32 = 0x67
-	SimdF32x4Neg  uint32 = 0x68
-	SimdF32x4Sqrt uint32 = 0x69
+	// f32x4 rounding operations
+	SimdF32x4Ceil    uint32 = 0x67
+	SimdF32x4Floor   uint32 = 0x68
+	SimdF32x4Trunc   uint32 = 0x69
+	SimdF32x4Nearest uint32 = 0x6A
 
 	// i8x16 binary arithmetic (range 0x6E-0x7B)
 	SimdI8x16NarrowI16x8S uint32 = 0x65
@@ -625,8 +626,8 @@ const (
 	// f64x2 rounding operations
 	SimdF64x2Ceil    uint32 = 0x74
 	SimdF64x2Floor   uint32 = 0x75
-	SimdF64x2Trunc   uint32 = 0x76
-	SimdF64x2Nearest uint32 = 0x77
+	SimdF64x2Trunc   uint32 = 0x7A
+	SimdF64x2Nearest uint32 = 0x94
 
 	// i16x8 operations
 	SimdI16x8ExtAddPairwiseI8x16S uint32 = 0x7C
@@ -653,11 +654,10 @@ const (
 	SimdV128Bitselect uint32 = 0x52
 	SimdV128AnyTrue   uint32 = 0x53
 
-	// f32x4 rounding operations
-	SimdF32x4Ceil    uint32 = 0xE0
-	SimdF32x4Floor   uint32 = 0xE1
-	SimdF32x4Trunc   uint32 = 0xE2
-	SimdF32x4Nearest uint32 = 0xE3
+	// f32x4 unary operations
+	SimdF32x4Abs  uint32 = 0xE0
+	SimdF32x4Neg  uint32 = 0xE1
+	SimdF32x4Sqrt uint32 = 0xE3
 
 	// f64x2 unary operations
 	SimdF64x2Abs  uint32 = 0xEC
