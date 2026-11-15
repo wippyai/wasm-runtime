@@ -129,6 +129,10 @@ func NewWazeroEngineWithConfig(ctx context.Context, cfg *Config) (*WazeroEngine,
 type CompileConfig struct {
 	// EnableAsyncify enables automatic asyncify transformation for components.
 	EnableAsyncify bool
+	// Synchronous compiles without the Asyncify transform, even when registered
+	// host functions are async. The caller guarantees that no host function
+	// suspends during a call of this module. It overrides EnableAsyncify.
+	Synchronous bool
 }
 
 // InstanceConfig holds configuration for module instantiation
@@ -690,6 +694,7 @@ type linkerConfig struct {
 	TransformCache    asyncify.TransformCache
 	AsyncifyImports   []string
 	AsyncifyTransform bool
+	Synchronous       bool
 }
 
 // ensureLinker creates the linker if needed and registers all host functions.
@@ -699,8 +704,11 @@ func (m *WazeroModule) ensureLinker(cfg linkerConfig) error {
 		return nil
 	}
 
-	// Auto-derive async imports from host registration + canon registry intersection
-	if len(cfg.AsyncifyImports) == 0 {
+	if cfg.Synchronous {
+		cfg.AsyncifyImports = nil
+		cfg.AsyncifyTransform = false
+	} else if len(cfg.AsyncifyImports) == 0 {
+		// Auto-derive async imports from host registration + canon registry intersection
 		derived, err := m.deriveAsyncifyImports()
 		if err != nil {
 			return fmt.Errorf("derive asyncify imports: %w", err)
@@ -841,6 +849,9 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 
 	// For single-module components or core modules, apply asyncify if needed
 	if m.validated == nil {
+		if cfg.Synchronous {
+			return nil
+		}
 		asyncImports, err := m.deriveAsyncifyImports()
 		if err != nil {
 			return fmt.Errorf("derive asyncify imports: %w", err)
@@ -924,6 +935,7 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 	if err := m.ensureLinker(linkerConfig{
 		AsyncifyTransform: cfg.EnableAsyncify,
 		TransformCache:    m.transformCache,
+		Synchronous:       cfg.Synchronous,
 	}); err != nil {
 		return fmt.Errorf("ensure linker: %w", err)
 	}
