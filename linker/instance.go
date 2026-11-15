@@ -276,7 +276,6 @@ type Instance struct {
 	exports             map[string]Export
 	encoder             *transcoder.Encoder
 	decoder             *transcoder.Decoder
-	layoutCalc          *transcoder.LayoutCalculator
 	modules             []api.Module
 	valueSpace          []uint64
 	virtualHostMu       sync.RWMutex
@@ -526,7 +525,6 @@ func (pre *InstancePre) NewInstanceWithCoreContext(ctx, coreCtx context.Context)
 		bridgeCollector: bridge.NewCollector(),
 		encoder:         transcoder.NewEncoderWithCompiler(compiler),
 		decoder:         transcoder.NewDecoderWithCompiler(compiler),
-		layoutCalc:      transcoder.NewLayoutCalculator(),
 	}
 
 	instanceRegistry.Store(inst.instanceID, inst)
@@ -2565,22 +2563,9 @@ func (inst *Instance) Call(ctx context.Context, name string, args ...any) ([]any
 
 		if usesRetptr && len(flatResults) == 1 {
 			// Result was returned via pointer - load from memory
-			basePtr := uint32(flatResults[0])
-			offset := uint32(0)
-			results = make([]any, len(exp.Canon.ResultTypes))
-			for i, rt := range exp.Canon.ResultTypes {
-				// Calculate layout for proper alignment
-				layout := inst.layoutCalc.Calculate(rt)
-				// Align offset to type's alignment requirement
-				if layout.Align > 0 {
-					offset = (offset + layout.Align - 1) &^ (layout.Align - 1)
-				}
-				val, err := inst.decoder.LoadValue(rt, basePtr+offset, mem)
-				if err != nil {
-					return nil, fmt.Errorf("load result[%d]: %w", i, err)
-				}
-				results[i] = val
-				offset += layout.Size
+			results, err = inst.decoder.LoadResults(exp.Canon.ResultTypes, uint32(flatResults[0]), mem)
+			if err != nil {
+				return nil, fmt.Errorf("load results: %w", err)
 			}
 		} else {
 			// Results returned as flat values

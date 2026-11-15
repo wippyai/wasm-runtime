@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -124,14 +125,27 @@ func (m *Module) GetFunctionTypes(name string) ([]wit.Type, []wit.Type, error) {
 	return sig.params, sig.results, nil
 }
 
+var (
+	witFuncPattern   = regexp.MustCompile(`(?:export\s+)?([a-zA-Z_][a-zA-Z0-9_-]*)\s*:\s*func\s*\(([^)]*)\)(?:\s*->\s*([^;]+))?`)
+	witRecordPattern = regexp.MustCompile(`\brecord\s+([a-zA-Z_][a-zA-Z0-9_-]*)\s*\{([^}]*)\}`)
+)
+
 // parseWitFunctions extracts function signatures from WIT text.
 // Pattern: [export] name: func(params) -> result;
+// Signatures may reference records declared as: record name { field: type, ... }
 func parseWitFunctions(witText string) (map[string]*funcSignature, error) {
+	witText, err := witDeclarationText(witText)
+	if err != nil {
+		return nil, err
+	}
+	types, err := newWitTypes(witText)
+	if err != nil {
+		return nil, err
+	}
+
 	funcs := make(map[string]*funcSignature)
 
-	funcPattern := regexp.MustCompile(`(?:export\s+)?([a-zA-Z_][a-zA-Z0-9_-]*)\s*:\s*func\s*\(([^)]*)\)(?:\s*->\s*([^;]+))?`)
-
-	matches := funcPattern.FindAllStringSubmatch(witText, -1)
+	matches := witFuncPattern.FindAllStringSubmatch(witText, -1)
 	for _, match := range matches {
 		name := match[1]
 		paramsStr := strings.TrimSpace(match[2])
@@ -149,7 +163,7 @@ func parseWitFunctions(witText string) (map[string]*funcSignature, error) {
 				if idx := strings.LastIndex(p, ":"); idx != -1 {
 					typStr = strings.TrimSpace(p[idx+1:])
 				}
-				t, err := parseWitType(typStr)
+				t, err := parseWitType(typStr, types)
 				if err != nil {
 					return nil, errors.Wrap(errors.PhaseParse, errors.KindInvalidData, err, "parse param type "+typStr)
 				}
@@ -163,7 +177,7 @@ func parseWitFunctions(witText string) (map[string]*funcSignature, error) {
 				if inner != "" {
 					parts := splitParams(inner)
 					for _, part := range parts {
-						t, err := parseWitType(strings.TrimSpace(part))
+						t, err := parseWitType(strings.TrimSpace(part), types)
 						if err != nil {
 							return nil, errors.Wrap(errors.PhaseParse, errors.KindInvalidData, err, "parse result type "+part)
 						}
@@ -171,7 +185,7 @@ func parseWitFunctions(witText string) (map[string]*funcSignature, error) {
 					}
 				}
 			} else {
-				t, err := parseWitType(resultStr)
+				t, err := parseWitType(resultStr, types)
 				if err != nil {
 					return nil, errors.Wrap(errors.PhaseParse, errors.KindInvalidData, err, "parse result type "+resultStr)
 				}
@@ -189,7 +203,143 @@ func parseWitFunctions(witText string) (map[string]*funcSignature, error) {
 	return funcs, nil
 }
 
-// splitParams splits parameter list, handling nested parens.
+// witDeclarationText masks comments and quoted annotation text so declaration
+// matching sees only WIT code. Token boundaries and line breaks are preserved.
+func witDeclarationText(text string) (string, error) {
+	buf := []byte(text)
+	for i := 0; i < len(text); {
+		if text[i] == '"' {
+			start := i
+			i++
+			for i < len(text) {
+				ch := text[i]
+				i++
+				if ch == '\\' && i < len(text) {
+					i++
+				} else if ch == '"' {
+					break
+				}
+			}
+			for j := start; j < i; j++ {
+				if buf[j] != '\n' && buf[j] != '\r' {
+					buf[j] = ' '
+				}
+			}
+			continue
+		}
+		if text[i] != '/' || i+1 == len(text) || (text[i+1] != '/' && text[i+1] != '*') {
+			i++
+			continue
+		}
+		start := i
+		if text[i+1] == '/' {
+			i += 2
+			for i < len(text) && text[i] != '\n' {
+				i++
+			}
+		} else {
+			i += 2
+			depth := 1
+			for i < len(text) && depth > 0 {
+				if i+1 < len(text) && text[i:i+2] == "/*" {
+					depth++
+					i += 2
+				} else if i+1 < len(text) && text[i:i+2] == "*/" {
+					depth--
+					i += 2
+				} else {
+					i++
+				}
+			}
+			if depth != 0 {
+				return "", errors.InvalidInput(errors.PhaseParse, "unterminated WIT block comment")
+			}
+		}
+		for j := start; j < i; j++ {
+			if buf[j] != '\n' && buf[j] != '\r' {
+				buf[j] = ' '
+			}
+		}
+	}
+	return string(buf), nil
+}
+
+// witTypes holds the named types declared in a WIT text. Records resolve on
+// first reference, so declarations may appear in any order.
+type witTypes struct {
+	bodies    map[string]string
+	defs      map[string]*wit.TypeDef
+	resolving map[string]bool
+}
+
+func newWitTypes(witText string) (*witTypes, error) {
+	types := &witTypes{
+		bodies:    make(map[string]string),
+		defs:      make(map[string]*wit.TypeDef),
+		resolving: make(map[string]bool),
+	}
+	for _, match := range witRecordPattern.FindAllStringSubmatch(witText, -1) {
+		name := match[1]
+		if _, dup := types.bodies[name]; dup {
+			return nil, errors.InvalidInput(errors.PhaseParse, "duplicate record "+name)
+		}
+		types.bodies[name] = match[2]
+	}
+	for name := range types.bodies {
+		if _, err := types.lookup(name); err != nil {
+			return nil, err
+		}
+	}
+	return types, nil
+}
+
+// lookup returns the named type, or nil when no type of that name is declared.
+func (w *witTypes) lookup(name string) (wit.Type, error) {
+	if w == nil {
+		return nil, nil
+	}
+	if def, ok := w.defs[name]; ok {
+		return def, nil
+	}
+	body, ok := w.bodies[name]
+	if !ok {
+		return nil, nil
+	}
+	if w.resolving[name] {
+		return nil, errors.InvalidInput(errors.PhaseParse, "record "+name+" is recursive")
+	}
+	w.resolving[name] = true
+	defer delete(w.resolving, name)
+
+	record := &wit.Record{}
+	seen := make(map[string]bool)
+	for _, field := range splitParams(body) {
+		fieldName, fieldType, ok := strings.Cut(field, ":")
+		fieldName, fieldType = strings.TrimSpace(fieldName), strings.TrimSpace(fieldType)
+		if !ok || fieldName == "" || fieldType == "" {
+			return nil, errors.InvalidInput(errors.PhaseParse, "malformed field "+strconv.Quote(field)+" in record "+name)
+		}
+		if seen[fieldName] {
+			return nil, errors.InvalidInput(errors.PhaseParse, "duplicate field "+fieldName+" in record "+name)
+		}
+		seen[fieldName] = true
+		t, err := parseWitType(fieldType, w)
+		if err != nil {
+			return nil, errors.Wrap(errors.PhaseParse, errors.KindInvalidData, err, "parse field "+fieldName+" of record "+name)
+		}
+		record.Fields = append(record.Fields, wit.Field{Name: fieldName, Type: t})
+	}
+	if len(record.Fields) == 0 {
+		return nil, errors.InvalidInput(errors.PhaseParse, "record "+name+" has no fields")
+	}
+
+	def := &wit.TypeDef{Name: &name, Kind: record}
+	w.defs[name] = def
+	return def, nil
+}
+
+// splitParams splits a comma-separated list, ignoring commas nested in
+// parentheses or angle brackets.
 func splitParams(s string) []string {
 	var result []string
 	var current strings.Builder
@@ -197,10 +347,10 @@ func splitParams(s string) []string {
 
 	for _, ch := range s {
 		switch ch {
-		case '(':
+		case '(', '<':
 			depth++
 			current.WriteRune(ch)
-		case ')':
+		case ')', '>':
 			depth--
 			current.WriteRune(ch)
 		case ',':
@@ -226,22 +376,29 @@ func splitParams(s string) []string {
 
 // parseWitType parses a WIT value type from its textual form. wit.ParseType only
 // handles primitives, so the single-element compound types (list<T>, option<T>) are
-// parsed here recursively; everything else falls through to wit.ParseType.
-func parseWitType(s string) (wit.Type, error) {
+// parsed here recursively and other names resolve against the declared types.
+func parseWitType(s string, types *witTypes) (wit.Type, error) {
 	s = strings.TrimSpace(s)
 	if inner, ok := witCompound(s, "list"); ok {
-		elem, err := parseWitType(inner)
+		elem, err := parseWitType(inner, types)
 		if err != nil {
 			return nil, err
 		}
 		return &wit.TypeDef{Kind: &wit.List{Type: elem}}, nil
 	}
 	if inner, ok := witCompound(s, "option"); ok {
-		elem, err := parseWitType(inner)
+		elem, err := parseWitType(inner, types)
 		if err != nil {
 			return nil, err
 		}
 		return &wit.TypeDef{Kind: &wit.Option{Type: elem}}, nil
+	}
+	named, err := types.lookup(s)
+	if err != nil {
+		return nil, err
+	}
+	if named != nil {
+		return named, nil
 	}
 	return wit.ParseType(s)
 }

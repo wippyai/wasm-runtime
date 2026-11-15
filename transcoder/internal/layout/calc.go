@@ -192,16 +192,21 @@ func (c *Calculator) calculateResult(r *wit.Result) Info {
 }
 
 func (c *Calculator) calculateTuple(t *wit.Tuple) Info {
-	if len(t.Types) == 0 {
-		return Info{Size: 0, Align: 1}
-	}
+	_, info := c.Sequence(t.Types)
+	return info
+}
 
+// Sequence lays out types consecutively as tuple elements and returns the
+// offset of each element with the layout of the whole sequence.
+func (c *Calculator) Sequence(types []wit.Type) ([]uint32, Info) {
+	offsets := make([]uint32, len(types))
 	maxAlign := uint32(1)
 	offset := uint32(0)
 
-	for _, typ := range t.Types {
+	for i, typ := range types {
 		elemLayout := c.Calculate(typ)
 		offset = abi.AlignTo(offset, elemLayout.Align)
+		offsets[i] = offset
 
 		if elemLayout.Align > maxAlign {
 			maxAlign = elemLayout.Align
@@ -210,10 +215,8 @@ func (c *Calculator) calculateTuple(t *wit.Tuple) Info {
 		offset += elemLayout.Size
 	}
 
-	totalSize := abi.AlignTo(offset, maxAlign)
-
-	return Info{
-		Size:  totalSize,
+	return offsets, Info{
+		Size:  abi.AlignTo(offset, maxAlign),
 		Align: maxAlign,
 	}
 }

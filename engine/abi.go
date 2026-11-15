@@ -33,23 +33,16 @@ func usesRetptr(resultTypes []wit.Type) bool {
 	return flatResultCount(resultTypes) > MaxFlatResults
 }
 
-func resultSize(t wit.Type) uint32 {
-	switch v := t.(type) {
-	case wit.String:
-		return 8 // ptr + len
-	case wit.U8, wit.S8, wit.Bool:
-		return 1
-	case wit.U16, wit.S16:
-		return 2
-	case wit.U32, wit.S32, wit.F32, wit.Char:
-		return 4
-	case wit.U64, wit.S64, wit.F64:
-		return 8
-	case *wit.TypeDef:
-		lc := transcoder.NewLayoutCalculator()
-		layout := lc.Calculate(v)
-		return layout.Size
-	default:
-		return 8
+// callStackSize returns the wazero stack length for a call with paramSlots
+// flat parameters: the stack carries the parameters in and the flat results,
+// or the return-area pointer, out.
+func callStackSize(paramSlots int, resultTypes []wit.Type) int {
+	resultSlots := 0
+	switch {
+	case usesRetptr(resultTypes):
+		resultSlots = 1
+	case len(resultTypes) > 0:
+		resultSlots = flatResultCount(resultTypes)
 	}
+	return max(paramSlots, resultSlots)
 }
