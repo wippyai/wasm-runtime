@@ -395,11 +395,11 @@ type WazeroModule struct {
 	linker              *linker.Linker
 	transformCache      asyncify.TransformCache
 	rawBytes            []byte
+	memoryPlan          []linker.OwnedMemory
 	transformed         bool
 	asyncifyAddedMemory bool
 	sourceReleased      bool
 	memoryPlanReady     bool
-	memoryPlan          []linker.OwnedMemory
 	hostFuncsMu         sync.RWMutex
 	cachedPreMu         sync.RWMutex
 
