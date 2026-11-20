@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 
+	"github.com/wippyai/wasm-runtime/asyncify"
 	"github.com/wippyai/wasm-runtime/linker"
 	"github.com/wippyai/wasm-runtime/wasm"
 )
@@ -27,19 +28,20 @@ func (m *WazeroModule) admitInstanceMemory(cfg *InstanceConfig, lifetime *execut
 // memories; imported aliases add no owner.
 func (m *WazeroModule) ownedMemoryPlan() ([]linker.OwnedMemory, error) {
 	m.closeMu.Lock()
-	plan, ready, rawBytes := m.memoryPlan, m.memoryPlanReady, m.rawBytes
+	plan, ready, rawBytes := m.memoryPlan, m.sourceReleased, m.rawBytes
 	m.closeMu.Unlock()
 	if ready {
 		return plan, nil
 	}
-	return parseOwnedMemoryPlan(rawBytes)
-}
 
-func parseOwnedMemoryPlan(rawBytes []byte) ([]linker.OwnedMemory, error) {
 	metadata, err := wasm.ParseModuleMetadata(rawBytes)
 	if err != nil {
 		return nil, err
 	}
+	return memoryPlanFromMetadata(metadata), nil
+}
+
+func memoryPlanFromMetadata(metadata *wasm.Module) []linker.OwnedMemory {
 	plan := make([]linker.OwnedMemory, 0, len(metadata.Memories))
 	for index, memory := range metadata.Memories {
 		entry := linker.OwnedMemory{DefinedMemoryIndex: uint32(index), MinimumPages: memory.Limits.Min, Shared: memory.Limits.Shared, Memory64: memory.Limits.Memory64}
@@ -49,7 +51,7 @@ func parseOwnedMemoryPlan(rawBytes []byte) ([]linker.OwnedMemory, error) {
 		}
 		plan = append(plan, entry)
 	}
-	return plan, nil
+	return plan
 }
 
 // ReleaseSource drops the module binary that a compiled core module keeps for
@@ -65,16 +67,16 @@ func (m *WazeroModule) ReleaseSource() error {
 	if m.closed {
 		return fmt.Errorf("module is closed")
 	}
-	if m.validated != nil || m.sourceReleased || m.rawBytes == nil {
+	if m.canonRegistry != nil || m.rawBytes == nil {
 		return nil
 	}
-	plan, err := parseOwnedMemoryPlan(m.rawBytes)
+	metadata, err := wasm.ParseModuleMetadata(m.rawBytes)
 	if err != nil {
 		return err
 	}
-	m.memoryPlan = plan
-	m.memoryPlanReady = true
-	m.rawBytes = nil
+	m.memoryPlan = memoryPlanFromMetadata(metadata)
 	m.sourceReleased = true
+	m.rawBytes = nil
+	m.releasedAsyncified = asyncify.HasAsyncifyProtocolExports(metadata)
 	return nil
 }

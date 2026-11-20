@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"github.com/tetratelabs/wazero/api"
 	"testing"
 
 	"github.com/wippyai/wasm-runtime/memory/budget"
@@ -207,7 +208,65 @@ func TestEngineReleaseSourceKeepsMemoryAdmission(t *testing.T) {
 		t.Fatal("instance close retained reservation")
 	}
 
-	if err := module.Compile(ctx, &CompileConfig{EnableAsyncify: true}); err == nil {
-		t.Fatal("asyncify compile after release must fail")
+	if err := module.Compile(ctx, &CompileConfig{EnableAsyncify: true}); err != nil {
+		t.Fatalf("repeat compile with no async imports: %v", err)
+	}
+}
+
+func TestReleaseSourceCompileWithAsyncImports(t *testing.T) {
+	ctx := context.Background()
+	engine, err := NewWazeroEngine(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(ctx)
+	for _, tc := range []struct {
+		name, source string
+		wantError    bool
+	}{
+		{"transform required", `(module (import "host" "wait" (func)))`, true},
+		{"already asyncified", unallocatableAsyncifyFixture, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			binary, err := wat.Compile(tc.source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			module, err := engine.LoadModule(ctx, binary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := module.RegisterHostFuncRaw("host", "wait", nil, nil, api.GoModuleFunc(func(context.Context, api.Module, []uint64) {}), true); err != nil {
+				t.Fatal(err)
+			}
+			if err := module.ReleaseSource(); err != nil {
+				t.Fatal(err)
+			}
+			err = module.Compile(ctx, &CompileConfig{EnableAsyncify: true})
+			if (err != nil) != tc.wantError {
+				t.Fatalf("compile after release: %v", err)
+			}
+		})
+	}
+}
+
+func TestReleaseSourceKeepsSingleCoreComponent(t *testing.T) {
+	ctx := context.Background()
+	eng, err := NewWazeroEngine(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close(ctx)
+	// Component header followed by one core-module section containing an empty module.
+	component := []byte{0, 'a', 's', 'm', 0x0d, 0, 1, 0, 1, 8, 0, 'a', 's', 'm', 1, 0, 0, 0}
+	mod, err := eng.LoadModule(ctx, component)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mod.ReleaseSource(); err != nil {
+		t.Fatal(err)
+	}
+	if len(mod.rawBytes) == 0 {
+		t.Fatal("single-core component lost its source")
 	}
 }

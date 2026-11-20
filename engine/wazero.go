@@ -398,8 +398,8 @@ type WazeroModule struct {
 	memoryPlan          []linker.OwnedMemory
 	transformed         bool
 	asyncifyAddedMemory bool
+	releasedAsyncified  bool
 	sourceReleased      bool
-	memoryPlanReady     bool
 	hostFuncsMu         sync.RWMutex
 	cachedPreMu         sync.RWMutex
 
@@ -859,7 +859,7 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 		if err != nil {
 			return fmt.Errorf("derive asyncify imports: %w", err)
 		}
-		if len(asyncImports) == 0 && !cfg.EnableAsyncify {
+		if len(asyncImports) == 0 {
 			return nil
 		}
 
@@ -871,19 +871,19 @@ func (m *WazeroModule) Compile(ctx context.Context, cfg *CompileConfig) error {
 			m.closeMu.Unlock()
 			return fmt.Errorf("module is closed")
 		}
-		if m.transformed {
+		if m.transformed || m.releasedAsyncified {
 			m.closeMu.Unlock()
 			return nil
 		}
 		rawBytes := m.rawBytes
-		sourceReleased := m.sourceReleased
+		released := m.sourceReleased
 		m.closeMu.Unlock()
 
-		if sourceReleased {
+		if released {
 			return fmt.Errorf("asyncify transform: module source was released")
 		}
 
-		if rawBytes != nil && !asyncify.IsAsyncified(rawBytes) && len(asyncImports) > 0 {
+		if rawBytes != nil && !asyncify.IsAsyncified(rawBytes) {
 			originalMetadata, err := wasm.ParseModuleMetadata(rawBytes)
 			if err != nil {
 				return fmt.Errorf("parse asyncify source metadata: %w", err)
