@@ -133,32 +133,28 @@ func (m *WazeroModule) deriveAsyncifyImports() ([]string, error) {
 		for _, hf := range asyncHostFuncs {
 			add(hf.Namespace, hf.Name)
 		}
-		if len(m.rawBytes) > 0 {
-			mod, err := wasm.ParseModule(m.rawBytes)
-			if err != nil {
-				// Fallback to stock Wazero reflection if compiled module is present
-				if m.compiled != nil {
-					for _, fn := range m.compiled.ImportedFunctions() {
-						modName, funcName, isImport := fn.Import()
-						if !isImport {
-							continue
-						}
-						for _, hf := range asyncHostFuncs {
-							if isCompatibleImport(hf.Namespace, hf.Name, modName, funcName) {
-								add(modName, funcName)
-							}
-						}
+		m.closeMu.Lock()
+		compiled, rawBytes := m.compiled, m.rawBytes
+		m.closeMu.Unlock()
+		if compiled != nil {
+			for _, fn := range compiled.ImportedFunctions() {
+				module, name, _ := fn.Import()
+				for _, hf := range asyncHostFuncs {
+					if isCompatibleImport(hf.Namespace, hf.Name, module, name) {
+						add(module, name)
 					}
-				} else {
-					return nil, fmt.Errorf("parse core module imports: %w", err)
 				}
-			} else {
-				for _, imp := range mod.Imports {
-					if imp.Desc.Kind == wasm.KindFunc {
-						for _, hf := range asyncHostFuncs {
-							if isCompatibleImport(hf.Namespace, hf.Name, imp.Module, imp.Name) {
-								add(imp.Module, imp.Name)
-							}
+			}
+		} else if len(rawBytes) > 0 {
+			mod, err := wasm.ParseModule(rawBytes)
+			if err != nil {
+				return nil, fmt.Errorf("parse core module imports: %w", err)
+			}
+			for _, imp := range mod.Imports {
+				if imp.Desc.Kind == wasm.KindFunc {
+					for _, hf := range asyncHostFuncs {
+						if isCompatibleImport(hf.Namespace, hf.Name, imp.Module, imp.Name) {
+							add(imp.Module, imp.Name)
 						}
 					}
 				}

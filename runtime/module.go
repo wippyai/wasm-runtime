@@ -40,6 +40,12 @@ func (m *Module) CompileWithConfig(ctx context.Context, cfg *engine.CompileConfi
 	return m.wazeroModule.Compile(ctx, cfg)
 }
 
+// ReleaseSource drops the module binary kept after Compile. Call it after the
+// last Compile; a later Compile that needs an Asyncify transform fails.
+func (m *Module) ReleaseSource() error {
+	return m.wazeroModule.ReleaseSource()
+}
+
 // Close releases the runtime backing this module.
 // Call this only for modules that own an isolated runtime; modules loaded from a
 // shared Runtime should be released by closing that Runtime instead.
