@@ -3,9 +3,9 @@ package engine
 import (
 	"context"
 	"errors"
-	"github.com/tetratelabs/wazero/api"
 	"testing"
 
+	"github.com/tetratelabs/wazero/api"
 	"github.com/wippyai/wasm-runtime/memory/budget"
 	"github.com/wippyai/wasm-runtime/wat"
 )
